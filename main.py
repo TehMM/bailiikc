@@ -2,7 +2,7 @@ import os
 import json
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
@@ -67,16 +67,26 @@ def download_cases():
 def run_download():
     try:
         new_files = download_cases()
-        return jsonify({
-            "status": "success",
-            "new_downloaded_count": len(new_files),
-            "new_files": new_files
-        })
+        if not new_files:
+            message = "<p>No new cases to download.</p>"
+        else:
+            message = "<ul>" + "".join(f"<li>{f}</li>" for f in new_files) + "</ul>"
+
+        html_template = f"""
+        <html>
+        <head>
+            <title>Bailii KY Download Status</title>
+        </head>
+        <body>
+            <h1>Download Results</h1>
+            {message}
+            <p>Total cases downloaded so far: {len(downloaded_files)}</p>
+        </body>
+        </html>
+        """
+        return html_template
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+        return f"<p style='color:red;'>Error: {e}</p>", 500
 
 
 if __name__ == "__main__":

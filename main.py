@@ -2,7 +2,7 @@ import os
 import json
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, send_from_directory
 
 app = Flask(__name__)
 
@@ -33,6 +33,7 @@ def save_state():
 
 
 def download_cases():
+    """Download new cases and return list of new downloads."""
     r = requests.get(BASE_URL, headers=HEADERS)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -41,12 +42,12 @@ def download_cases():
     new_downloads = []
     for a in links:
         href = a.get("href")
-        if href in downloaded_files:
-            continue  # Skip already downloaded
-
         case_url = BASE_URL + href
         local_path = os.path.join(DOWNLOAD_FOLDER, href)
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+        if href in downloaded_files:
+            continue  # Skip already downloaded
 
         try:
             resp = requests.get(case_url, headers=HEADERS)
@@ -63,14 +64,15 @@ def download_cases():
     return new_downloads
 
 
-@app.route("/run-download", methods=["GET"])
+@app.route("/run-download")
 def run_download():
     try:
         new_files = download_cases()
-        if not new_files:
-            message = "<p>No new cases to download.</p>"
-        else:
-            message = "<ul>" + "".join(f"<li>{f}</li>" for f in new_files) + "</ul>"
+        existing_files = sorted(downloaded_files - set(new_files))
+
+        # HTML lists
+        new_html = "<ul>" + "".join(f"<li>{f}</li>" for f in new_files) + "</ul>" if new_files else "<p>No new cases</p>"
+        existing_html = "<ul>" + "".join(f"<li><a href='/files/{f}' target='_blank'>{f}</a></li>" for f in existing_files) + "</ul>" if existing_files else "<p>No existing cases</p>"
 
         html_template = f"""
         <html>
@@ -78,15 +80,23 @@ def run_download():
             <title>Bailii KY Download Status</title>
         </head>
         <body>
-            <h1>Download Results</h1>
-            {message}
-            <p>Total cases downloaded so far: {len(downloaded_files)}</p>
+            <h1 style='color:green;'>Newly Downloaded Cases</h1>
+            {new_html}
+
+            <h2>Previously Downloaded Cases</h2>
+            {existing_html}
         </body>
         </html>
         """
         return html_template
     except Exception as e:
         return f"<p style='color:red;'>Error: {e}</p>", 500
+
+
+@app.route("/files/<path:filename>")
+def serve_file(filename):
+    """Serve downloaded case files from the volume."""
+    return send_from_directory(DOWNLOAD_FOLDER, filename, as_attachment=True)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 from zipfile import ZipFile
+from flask import Flask, jsonify
 
 # =========================
 # Configuration
@@ -20,7 +21,7 @@ HEADERS = {
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # =========================
-# Download Cases
+# Functions
 # =========================
 def download_cases():
     print("Fetching index page...")
@@ -28,9 +29,7 @@ def download_cases():
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Grab HTML + PDF links
     links = soup.select("a[href$='.html'], a[href$='.pdf']")
-
     downloaded = []
 
     for a in links:
@@ -39,7 +38,6 @@ def download_cases():
         file_path = os.path.join(DATA_DIR, filename)
         is_new = False
 
-        # Download only if file is missing
         if not os.path.exists(file_path):
             file_url = BASE_URL + href
             print(f"Downloading {filename} ...")
@@ -48,6 +46,7 @@ def download_cases():
             with open(file_path, 'wb') as f:
                 f.write(file_resp.content)
             is_new = True
+
         downloaded.append({
             "filename": filename,
             "type": "PDF" if filename.lower().endswith(".pdf") else "HTML",
@@ -57,18 +56,12 @@ def download_cases():
 
     return downloaded
 
-# =========================
-# Generate ZIP
-# =========================
 def create_zip(files):
     with ZipFile(ZIP_FILE, 'w') as zipf:
         for f in files:
             zipf.write(os.path.join(DATA_DIR, f["filename"]), arcname=f["filename"])
     print(f"ZIP created at {ZIP_FILE}")
 
-# =========================
-# Generate HTML Report
-# =========================
 def generate_html_report(files):
     html = """
 <!DOCTYPE html>
@@ -108,11 +101,30 @@ a.button { display: inline-block; padding: 8px 12px; margin-bottom: 10px; backgr
         f.write(html)
     print(f"HTML report generated at {REPORT_FILE}")
 
-# =========================
-# Main
-# =========================
-if __name__ == "__main__":
+def run_all():
     files = download_cases()
     create_zip(files)
     generate_html_report(files)
-    print("Done! Open report.html to view all cases and download links.")
+    return files
+
+# =========================
+# Flask app for webhook
+# =========================
+app = Flask(__name__)
+
+@app.route("/run-download", methods=["POST", "GET"])
+def trigger_download():
+    try:
+        files = run_all()
+        new_count = sum(1 for f in files if f["new"])
+        return jsonify({"status": "success", "total_files": len(files), "new_files": new_count})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# =========================
+# Main entry
+# =========================
+if __name__ == "__main__":
+    print("Starting manual download run...")
+    run_all()
+    print("Done! Open report.html to view all cases.")

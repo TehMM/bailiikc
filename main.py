@@ -2,118 +2,116 @@ import os
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
-from flask import Flask, send_from_directory, render_template_string, redirect, url_for
+from flask import Flask, render_template_string, send_from_directory, redirect, url_for
 from zipfile import ZipFile
 
-# --- Configuration ---
-DATA_DIR = "/app/data/bailii_ky"
+app = Flask(__name__)
+
+# Config
+DATA_DIR = "./data/pdfs"
 BASE_URL = "https://www.bailii.org/ky/cases/GCCI/FSD/2025/"
 ZIP_NAME = "all_pdfs.zip"
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-app = Flask(__name__)
-
-# --- PDF Scraper ---
 def scrape_pdfs():
+    """Scrape PDFs from Bailii and return a list of dicts with metadata."""
     results = []
-    existing_files = set(os.listdir(DATA_DIR))
-    resp = requests.get(BASE_URL)
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Step 1: get links to case HTML pages
-    case_links = [a["href"] for a in soup.select("a[href$='.html']")]
-
-    for case_html in case_links:
-        case_url = BASE_URL + case_html
-        case_resp = requests.get(case_url)
-        case_soup = BeautifulSoup(case_resp.text, "html.parser")
-
-        # Step 2: find PDF link inside the case page
-        pdf_tag = case_soup.find("a", href=lambda x: x and x.endswith(".pdf"))
-        if not pdf_tag:
-            continue
-
-        pdf_href = pdf_tag["href"]
-        pdf_filename = os.path.basename(pdf_href)
-        pdf_path = os.path.join(DATA_DIR, pdf_filename)
-        status = "EXISTING" if pdf_filename in existing_files else "NEW"
-
-        if status == "NEW":
-            pdf_url = BASE_URL + pdf_href
-            try:
-                r = requests.get(pdf_url)
-                r.raise_for_status()
-                with open(pdf_path, "wb") as f:
-                    f.write(r.content)
-            except Exception as e:
-                results.append({"file": pdf_filename, "status": "ERROR", "error": str(e)})
-                continue
-
-        results.append({
-            "file": pdf_filename,
-            "status": status,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-
+    try:
+        r = requests.get(BASE_URL)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        links = soup.find_all("a")
+        for link in links:
+            href = link.get("href", "")
+            if href.lower().endswith(".pdf"):
+                pdf_filename = os.path.basename(href)
+                pdf_path = os.path.join(DATA_DIR, pdf_filename)
+                status = "EXISTING" if os.path.exists(pdf_path) else "NEW"
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if status == "NEW":
+                    try:
+                        pdf_url = BASE_URL + href
+                        pdf_r = requests.get(pdf_url)
+                        pdf_r.raise_for_status()
+                        with open(pdf_path, "wb") as f:
+                            f.write(pdf_r.content)
+                    except Exception as e:
+                        status = f"ERROR: {e}"
+                results.append({
+                    "file": pdf_filename,
+                    "status": status,
+                    "timestamp": timestamp
+                })
+    except Exception as e:
+        results.append({"file": None, "status": f"SCRAPING ERROR: {e}", "timestamp": ""})
     return results
 
-# --- Routes ---
+def create_zip():
+    """Create a ZIP of all PDFs safely."""
+    zip_path = os.path.join(DATA_DIR, ZIP_NAME)
+    try:
+        with ZipFile(zip_path, "w") as zipf:
+            seen = set()
+            for filename in os.listdir(DATA_DIR):
+                if filename.endswith(".pdf") and filename not in seen:
+                    zipf.write(os.path.join(DATA_DIR, filename), filename)
+                    seen.add(filename)
+    except Exception as e:
+        print(f"ZIP creation error: {e}")
+    return zip_path
+
 @app.route("/run-download", methods=["GET", "POST"])
 def run_download():
-    pdfs = scrape_pdfs()
-    # After scraping, recreate ZIP
-    zip_path = os.path.join(DATA_DIR, ZIP_NAME)
-    with ZipFile(zip_path, "w") as zipf:
-        for filename in os.listdir(DATA_DIR):
-            if filename.endswith(".pdf"):
-                filepath = os.path.join(DATA_DIR, filename)
-                zipf.write(filepath, filename)
+    results = scrape_pdfs()
+    create_zip()
     return redirect(url_for("report"))
-
-@app.route("/files/<path:filename>")
-def serve_file(filename):
-    if os.path.exists(os.path.join(DATA_DIR, filename)):
-        return send_from_directory(DATA_DIR, filename)
-    return f"You selected a file which is not on our system: {filename}", 404
 
 @app.route("/report")
 def report():
-    # Build report from current PDFs
-    files = [f for f in os.listdir(DATA_DIR) if f.endswith(".pdf")]
-    report_rows = ""
-    for f in sorted(files):
-        filepath = os.path.join(DATA_DIR, f)
-        timestamp = datetime.fromtimestamp(os.path.getmtime(filepath)).strftime("%Y-%m-%d %H:%M:%S")
-        report_rows += f"""
-        <tr>
-            <td>{f}</td>
-            <td>{'EXISTING'}</td>
-            <td>{timestamp}</td>
-            <td><a href="/files/{f}" target="_blank">Open</a></td>
-        </tr>
-        """
+    files = []
+    for f in os.listdir(DATA_DIR):
+        if f.endswith(".pdf"):
+            files.append({
+                "name": f,
+                "status": "EXISTING",
+                "timestamp": datetime.fromtimestamp(os.path.getmtime(os.path.join(DATA_DIR, f))).strftime("%Y-%m-%d %H:%M:%S")
+            })
 
-    html = f"""
+    # Sort so NEW appear first
+    files.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    zip_path = ZIP_NAME
+    html = """
     <html>
     <head><title>Bailii PDF Report</title></head>
     <body>
     <h1>Bailii PDF Report</h1>
-    <p><a href="/files/{ZIP_NAME}">Download All as ZIP</a></p>
-    <table border="1" cellpadding="5">
-        <tr>
-            <th>Filename</th>
-            <th>Status</th>
-            <th>Timestamp</th>
-            <th>Open</th>
-        </tr>
-        {report_rows}
+    <a href="{{ zip_path }}">Download All as ZIP</a>
+    <table border="1" cellpadding="5" cellspacing="0">
+    <tr><th>Filename</th><th>Status</th><th>Timestamp</th><th>Open</th></tr>
+    {% for f in files %}
+    <tr>
+        <td>{{ f.name }}</td>
+        <td>{{ f.status }}</td>
+        <td>{{ f.timestamp }}</td>
+        <td><a href="{{ url_for('download_file', filename=f.name) }}">Open</a></td>
+    </tr>
+    {% endfor %}
     </table>
-    <p><a href="/run-download">Run Scraper Now</a></p>
     </body>
     </html>
     """
-    return html
+    return render_template_string(html, files=files, zip_path=zip_path)
+
+@app.route("/files/<path:filename>")
+def download_file(filename):
+    try:
+        return send_from_directory(DATA_DIR, filename, as_attachment=True)
+    except Exception as e:
+        return f"File not found: {e}", 404
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    # Railway expects 0.0.0.0 and correct port
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)

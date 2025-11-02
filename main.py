@@ -1,102 +1,118 @@
 import os
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, render_template_string, send_file
 from datetime import datetime
 from zipfile import ZipFile
-from io import BytesIO
 
-app = Flask(__name__)
-
-# Directory to store downloaded cases
+# =========================
+# Configuration
+# =========================
+BASE_URL = "https://www.bailii.org/ky/cases/GCCI/FSD/2025/"
 DATA_DIR = "/app/data/bailii_ky"
+REPORT_FILE = os.path.join(DATA_DIR, "report.html")
+ZIP_FILE = os.path.join(DATA_DIR, "all_cases.zip")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/117.0.0.0 Safari/537.36"
+}
+
 os.makedirs(DATA_DIR, exist_ok=True)
 
-BAILII_URL = "https://www.bailii.org/ky/cases/GCCI/FSD/2025/"
-
-# HTML template for display
-HTML_TEMPLATE = """
-<!doctype html>
-<html>
-<head>
-    <title>BAILII KY Cases</title>
-</head>
-<body>
-<h1>BAILII KY Cases 2025</h1>
-<p>Last run: {{ timestamp }}</p>
-<a href="/download-zip"><button>Download All as ZIP</button></a>
-<ul>
-{% for case in cases %}
-    <li>
-        <a href="{{ case.href }}" target="_blank">{{ case.name }}</a>
-        {% if case.new %}<strong>(NEW)</strong>{% else %}(EXISTING){% endif %}
-        - {{ case.time }}
-    </li>
-{% endfor %}
-</ul>
-</body>
-</html>
-"""
-
-@app.route("/run-download")
-def run_download():
-    # Use headers to avoid 403
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/117.0.0.0 Safari/537.36"
-    }
-
-    r = requests.get(BAILII_URL, headers=headers)
+# =========================
+# Download Cases
+# =========================
+def download_cases():
+    print("Fetching index page...")
+    r = requests.get(BASE_URL, headers=HEADERS)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    links = soup.select("a[href$='.html']")  # all case HTML files
+    # Grab HTML + PDF links
+    links = soup.select("a[href$='.html'], a[href$='.pdf']")
 
-    downloaded_cases = []
+    downloaded = []
 
     for a in links:
-        case_name = a.get_text(strip=True)
-        href = a.get("href")
-        local_path = os.path.join(DATA_DIR, href.split('/')[-1])
+        href = a.get('href')
+        filename = href.split('/')[-1]
+        file_path = os.path.join(DATA_DIR, filename)
+        is_new = False
 
-        if not os.path.exists(local_path):
-            # Download new case
-            case_url = f"https://www.bailii.org{href}"
-            resp = requests.get(case_url, headers=headers)
-            resp.raise_for_status()
-            with open(local_path, "wb") as f:
-                f.write(resp.content)
+        # Download only if file is missing
+        if not os.path.exists(file_path):
+            file_url = BASE_URL + href
+            print(f"Downloading {filename} ...")
+            file_resp = requests.get(file_url, headers=HEADERS)
+            file_resp.raise_for_status()
+            with open(file_path, 'wb') as f:
+                f.write(file_resp.content)
             is_new = True
-        else:
-            is_new = False
-
-        downloaded_cases.append({
-            "name": case_name,
-            "href": f"/files/{href.split('/')[-1]}",
+        downloaded.append({
+            "filename": filename,
+            "type": "PDF" if filename.lower().endswith(".pdf") else "HTML",
             "new": is_new,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "timestamp": datetime.fromtimestamp(os.path.getmtime(file_path)).strftime('%Y-%m-%d %H:%M:%S')
         })
 
-    return render_template_string(HTML_TEMPLATE, cases=downloaded_cases,
-                                  timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    return downloaded
 
-@app.route("/files/<filename>")
-def serve_file(filename):
-    return send_file(os.path.join(DATA_DIR, filename))
+# =========================
+# Generate ZIP
+# =========================
+def create_zip(files):
+    with ZipFile(ZIP_FILE, 'w') as zipf:
+        for f in files:
+            zipf.write(os.path.join(DATA_DIR, f["filename"]), arcname=f["filename"])
+    print(f"ZIP created at {ZIP_FILE}")
 
-@app.route("/download-zip")
-def download_zip():
-    memory_file = BytesIO()
-    with ZipFile(memory_file, 'w') as zf:
-        for root, dirs, files in os.walk(DATA_DIR):
-            for file in files:
-                file_path = os.path.join(root, file)
-                zf.write(file_path, arcname=file)
-    memory_file.seek(0)
-    return send_file(memory_file, download_name="bailii_cases.zip",
-                     as_attachment=True)
+# =========================
+# Generate HTML Report
+# =========================
+def generate_html_report(files):
+    html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Bailii KY Cases</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 20px; }
+.new { color: green; font-weight: bold; }
+.existing { color: gray; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+th { background-color: #f0f0f0; }
+a.button { display: inline-block; padding: 8px 12px; margin-bottom: 10px; background-color: #007BFF; color: #fff; text-decoration: none; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>Bailii KY 2025 Cases</h1>
+<a class="button" href="all_cases.zip" download>Download All as ZIP</a>
+<table>
+<tr><th>File</th><th>Type</th><th>Status</th><th>Timestamp</th></tr>
+"""
+    for f in files:
+        status_class = "new" if f["new"] else "existing"
+        html += f'<tr><td><a href="{f["filename"]}" target="_blank">{f["filename"]}</a></td>'
+        html += f'<td>{f["type"]}</td>'
+        html += f'<td class="{status_class}">{"NEW" if f["new"] else "EXISTING"}</td>'
+        html += f'<td>{f["timestamp"]}</td></tr>\n'
 
+    html += """
+</table>
+</body>
+</html>
+"""
+    with open(REPORT_FILE, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"HTML report generated at {REPORT_FILE}")
+
+# =========================
+# Main
+# =========================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    files = download_cases()
+    create_zip(files)
+    generate_html_report(files)
+    print("Done! Open report.html to view all cases and download links.")

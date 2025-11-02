@@ -1,140 +1,91 @@
+from flask import Flask, send_from_directory, render_template_string, send_file
 import os
 import json
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, send_from_directory, send_file, request
 from datetime import datetime
-from zipfile import ZipFile
 from io import BytesIO
+from zipfile import ZipFile
 
 app = Flask(__name__)
 
-# --- Configuration ---
+DATA_DIR = "/app/data/bailii_ky"
+JSON_FILE = os.path.join(DATA_DIR, "downloaded_files.json")
 BASE_URL = "https://www.bailii.org/ky/cases/GCCI/FSD/2025/"
-DOWNLOAD_FOLDER = "/app/data/bailii_ky"  # Railway volume mount
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/117.0.0.0 Safari/537.36"
-}
-STATE_FILE = os.path.join(DOWNLOAD_FOLDER, "downloaded_files.json")
 
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# Load previous state
-if os.path.exists(STATE_FILE):
-    with open(STATE_FILE, "r") as f:
-        downloaded_files = json.load(f)  # { "filename": "timestamp" }
-else:
-    downloaded_files = {}
+def load_downloaded_files():
+    if os.path.exists(JSON_FILE):
+        with open(JSON_FILE, "r") as f:
+            data = json.load(f)
+            # Auto-fix: convert list to dict if needed
+            if isinstance(data, list):
+                data = {f: "" for f in data}
+        return data
+    return {}
 
-def save_state():
-    with open(STATE_FILE, "w") as f:
+def save_downloaded_files(downloaded_files):
+    with open(JSON_FILE, "w") as f:
         json.dump(downloaded_files, f)
 
-
 def download_cases():
-    """Download new cases and return list of new downloads."""
-    r = requests.get(BASE_URL, headers=HEADERS)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/117.0.0.0 Safari/537.36"
+    }
+    r = requests.get(BASE_URL, headers=headers)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    links = soup.select("a[href$='.html']")  # All HTML case links
+    links = soup.select("a[href$='.html']")
 
-    new_downloads = []
+    downloaded_files = load_downloaded_files()
+    new_files = []
+
     for a in links:
-        href = a.get("href")
-        case_url = BASE_URL + href
-        local_path = os.path.join(DOWNLOAD_FOLDER, href)
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
-        if href in downloaded_files:
-            continue  # Skip already downloaded
-
-        try:
-            resp = requests.get(case_url, headers=HEADERS)
-            resp.raise_for_status()
-            with open(local_path, "wb") as f:
+        filename = a.get("href").split("/")[-1]
+        filepath = os.path.join(DATA_DIR, filename)
+        if not os.path.exists(filepath):
+            resp = requests.get(BASE_URL + filename, headers=headers)
+            with open(filepath, "wb") as f:
                 f.write(resp.content)
-
             timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-            downloaded_files[href] = timestamp
-            new_downloads.append(href)
-        except Exception as e:
-            print(f"Failed to download {case_url}: {e}")
+            downloaded_files[filename] = timestamp
+            new_files.append(filename)
 
-    save_state()
-    return new_downloads
-
+    save_downloaded_files(downloaded_files)
+    return downloaded_files, new_files
 
 @app.route("/run-download")
 def run_download():
     try:
-        new_files = download_cases()
-        all_files = sorted(downloaded_files.keys())
-        existing_files = [f for f in all_files if f not in new_files]
-
-        # Build HTML lists with timestamps
-        def make_list(files, color="black"):
-            if not files:
-                return "<p>None</p>"
-            html = "<ul>"
-            for f in files:
-                ts = downloaded_files.get(f, "")
-                html += f"<li><a href='/files/{f}' target='_blank'>{f}</a> - <em>{ts}</em></li>"
-            html += "</ul>"
-            return html
-
-        new_html = make_list(new_files, color="green")
-        existing_html = make_list(existing_files)
-
-        html_template = f"""
-        <html>
-        <head>
-            <title>Bailii KY Download Status</title>
-        </head>
-        <body>
-            <h1 style='color:green;'>Newly Downloaded Cases</h1>
-            {new_html}
-
-            <h2>Previously Downloaded Cases</h2>
-            {existing_html}
-
-            <form action="/download-all-zip" method="get">
-                <button type="submit">Download All Cases as ZIP</button>
-            </form>
-        </body>
-        </html>
-        """
-        return html_template
+        downloaded_files, new_files = download_cases()
     except Exception as e:
-        return f"<p style='color:red;'>Error: {e}</p>", 500
+        return f"Error: {e}"
 
+    # Generate HTML
+    html = "<h2>Downloaded Cases</h2><ul>"
+    for filename, ts in downloaded_files.items():
+        status = "NEW" if filename in new_files else "EXISTING"
+        html += f'<li><a href="/cases/{filename}" target="_blank">{filename}</a> - {ts} - {status}</li>'
+    html += "</ul>"
+    html += '<a href="/download-zip"><button>Download All as ZIP</button></a>'
+    return html
 
-@app.route("/files/<path:filename>")
-def serve_file(filename):
-    """Serve individual case files."""
-    return send_from_directory(DOWNLOAD_FOLDER, filename, as_attachment=True)
+@app.route("/cases/<path:filename>")
+def serve_case(filename):
+    return send_from_directory(DATA_DIR, filename)
 
-
-@app.route("/download-all-zip")
-def download_all_zip():
-    """Return a zip of all downloaded cases."""
-    try:
-        zip_buffer = BytesIO()
-        with ZipFile(zip_buffer, "w") as zipf:
-            for root, _, files in os.walk(DOWNLOAD_FOLDER):
-                for file in files:
-                    if file == "downloaded_files.json":
-                        continue
-                    abs_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(abs_path, DOWNLOAD_FOLDER)
-                    zipf.write(abs_path, arcname=rel_path)
-        zip_buffer.seek(0)
-        return send_file(zip_buffer, mimetype="application/zip", as_attachment=True, download_name="bailii_cases.zip")
-    except Exception as e:
-        return f"<p style='color:red;'>Error creating ZIP: {e}</p>", 500
-
+@app.route("/download-zip")
+def download_zip():
+    memory_file = BytesIO()
+    with ZipFile(memory_file, "w") as zf:
+        for filename in os.listdir(DATA_DIR):
+            filepath = os.path.join(DATA_DIR, filename)
+            zf.write(filepath, arcname=filename)
+    memory_file.seek(0)
+    return send_file(memory_file, attachment_filename="bailii_cases.zip", as_attachment=True)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)

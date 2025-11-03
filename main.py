@@ -11,10 +11,11 @@ app = Flask(__name__)
 
 # Config
 DATA_DIR = "./data/pdfs"
-BASE_URL = "https://www.bailii.org/ky/cases/GCCI/FSD/2025/"
+DEFAULT_BASE_URL = "https://www.bailii.org/ky/cases/GCCI/FSD/2025/"
 ZIP_NAME = "all_pdfs.zip"
 SCRAPE_LOG = os.path.join(DATA_DIR, "scrape_log.txt")
 SCRAPED_URLS_FILE = os.path.join(DATA_DIR, "scraped_urls.txt")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.txt")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -52,7 +53,21 @@ def save_scraped_url(url):
     with open(SCRAPED_URLS_FILE, "a") as f:
         f.write(f"{url}\n")
 
-def scrape_pdfs():
+def load_base_url():
+    """Load the configured base URL or return default."""
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            url = f.read().strip()
+            if url:
+                return url
+    return DEFAULT_BASE_URL
+
+def save_base_url(url):
+    """Save the base URL to config file."""
+    with open(CONFIG_FILE, "w") as f:
+        f.write(url.strip())
+
+def scrape_pdfs(base_url=None):
     """Scrape PDFs from Bailii and return a list of dicts with metadata."""
     results = []
     log_message("=" * 60)
@@ -81,7 +96,7 @@ def scrape_pdfs():
                 if href == "../" or href == "./":
                     continue
                 # Construct full URL
-                full_url = urljoin(BASE_URL, href)
+                full_url = urljoin(base_url, href)
                 if full_url not in case_links:
                     case_links.append(full_url)
         
@@ -221,35 +236,177 @@ def create_zip():
 
 @app.route("/")
 def index():
-    """Home page with scrape button."""
+    """Home page with scrape button and URL configuration."""
+    current_url = load_base_url()
+    
     html = """
     <html>
-    <head><title>Bailii PDF Scraper</title></head>
-    <body style="font-family: Arial, sans-serif; margin: 40px;">
-    <h1>Bailii PDF Scraper</h1>
-    <p>Target: <a href="{{ base_url }}" target="_blank">{{ base_url }}</a></p>
-    <form action="{{ url_for('run_download') }}" method="post">
-        <button type="submit" style="padding: 10px 20px; font-size: 16px;">
-            Run Scraper
-        </button>
-    </form>
-    <br>
-    <a href="{{ url_for('report') }}">View Report</a>
+    <head>
+        <title>Bailii PDF Scraper</title>
+        <style>
+            body { 
+                font-family: Arial, sans-serif; 
+                margin: 40px;
+                max-width: 800px;
+            }
+            .form-group {
+                margin-bottom: 20px;
+            }
+            label {
+                display: block;
+                font-weight: bold;
+                margin-bottom: 5px;
+            }
+            input[type="url"] {
+                width: 100%;
+                padding: 10px;
+                font-size: 14px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                box-sizing: border-box;
+            }
+            .button {
+                background-color: #4CAF50;
+                color: white;
+                padding: 12px 24px;
+                font-size: 16px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                margin-right: 10px;
+            }
+            .button:hover {
+                background-color: #45a049;
+            }
+            .button-secondary {
+                background-color: #008CBA;
+            }
+            .button-secondary:hover {
+                background-color: #007399;
+            }
+            .info-box {
+                background-color: #f0f8ff;
+                border-left: 4px solid #2196F3;
+                padding: 15px;
+                margin: 20px 0;
+            }
+            .examples {
+                background-color: #f9f9f9;
+                padding: 15px;
+                border-radius: 4px;
+                margin-top: 10px;
+            }
+            .examples ul {
+                margin: 10px 0;
+                padding-left: 20px;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>🔍 Bailii PDF Scraper</h1>
+        
+        <form action="{{ url_for('update_config') }}" method="post">
+            <div class="form-group">
+                <label for="base_url">Base URL to Scrape:</label>
+                <input 
+                    type="url" 
+                    id="base_url" 
+                    name="base_url" 
+                    value="{{ current_url }}"
+                    placeholder="https://www.bailii.org/ky/cases/GCCI/FSD/2025/"
+                    required
+                >
+            </div>
+            
+            <button type="submit" class="button">
+                💾 Save URL
+            </button>
+            <button type="button" class="button button-secondary" 
+                    onclick="document.getElementById('base_url').value='{{ default_url }}'">
+                🔄 Reset to Default
+            </button>
+        </form>
+        
+        <div class="info-box">
+            <strong>Current Target:</strong><br>
+            <a href="{{ current_url }}" target="_blank">{{ current_url }}</a>
+        </div>
+        
+        <form action="{{ url_for('run_download') }}" method="post" style="margin-top: 20px;">
+            <button type="submit" class="button" style="font-size: 18px; padding: 15px 30px;">
+                ▶️ Run Scraper Now
+            </button>
+        </form>
+        
+        <p style="margin-top: 20px;">
+            <a href="{{ url_for('report') }}">📊 View Report & Downloads</a>
+        </p>
+        
+        <div class="examples">
+            <strong>💡 Example URLs:</strong>
+            <ul>
+                <li><code>https://www.bailii.org/ky/cases/GCCI/FSD/2025/</code> - Cayman Islands 2025</li>
+                <li><code>https://www.bailii.org/ky/cases/GCCI/FSD/2024/</code> - Cayman Islands 2024</li>
+                <li><code>https://www.bailii.org/ew/cases/EWHC/</code> - England & Wales High Court</li>
+                <li><code>https://www.bailii.org/uk/cases/UKSC/</code> - UK Supreme Court</li>
+            </ul>
+            <p><small>⚠️ Make sure URL ends with a trailing slash (/) for proper scraping</small></p>
+        </div>
+        
+        <div class="info-box" style="margin-top: 30px; border-left-color: #FF9800;">
+            <strong>🔗 For changedetection.io integration:</strong><br>
+            Use this endpoint: <code>{{ url_for('run_download', _external=True) }}</code><br>
+            <small>Set up a POST request to this URL to trigger scraping automatically</small>
+        </div>
     </body>
     </html>
     """
-    return render_template_string(html, base_url=BASE_URL)
+    return render_template_string(
+        html, 
+        current_url=current_url,
+        default_url=DEFAULT_BASE_URL
+    )
+
+@app.route("/update-config", methods=["POST"])
+def update_config():
+    """Update the base URL configuration."""
+    from flask import request
+    new_url = request.form.get("base_url", "").strip()
+    
+    if new_url:
+        # Ensure URL ends with /
+        if not new_url.endswith("/"):
+            new_url += "/"
+        
+        save_base_url(new_url)
+        log_message(f"Configuration updated: Base URL changed to {new_url}")
+    
+    return redirect(url_for("index"))
 
 @app.route("/run-download", methods=["GET", "POST"])
 def run_download():
     """Run the scraper and redirect to report."""
-    results = scrape_pdfs()
+    from flask import request
+    
+    # Check if a custom URL was provided (for API/changedetection.io use)
+    custom_url = request.args.get("url") or request.form.get("url")
+    
+    if custom_url:
+        custom_url = custom_url.strip()
+        if not custom_url.endswith("/"):
+            custom_url += "/"
+        results = scrape_pdfs(base_url=custom_url)
+    else:
+        # Use saved configuration
+        results = scrape_pdfs()
+    
     create_zip()
     return redirect(url_for("report"))
 
 @app.route("/report")
 def report():
     """Display report of all PDFs with download links."""
+    current_url = load_base_url()
     files = []
     
     # Get all PDFs in directory
@@ -312,6 +469,7 @@ def report():
     </head>
     <body>
         <h1>Bailii PDF Report</h1>
+        <p><strong>Current Target:</strong> <a href="{{ current_url }}" target="_blank">{{ current_url }}</a></p>
         <p><strong>Total PDFs:</strong> {{ files|length }}</p>
         
         <div>

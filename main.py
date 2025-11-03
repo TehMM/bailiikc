@@ -17,6 +17,20 @@ SCRAPE_LOG = os.path.join(DATA_DIR, "scrape_log.txt")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Headers to mimic a real browser and avoid 403 errors
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Cache-Control': 'max-age=0'
+}
+
 def log_message(message):
     """Log scraping messages to file and console."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -34,7 +48,7 @@ def scrape_pdfs():
     try:
         # Get the main page
         log_message(f"Fetching main page: {BASE_URL}")
-        r = requests.get(BASE_URL, timeout=10)
+        r = requests.get(BASE_URL, headers=HEADERS, timeout=10)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         
@@ -62,7 +76,7 @@ def scrape_pdfs():
                 log_message(f"[{idx}/{len(case_links)}] Checking: {case_url}")
                 time.sleep(0.5)  # Be polite to the server
                 
-                case_r = requests.get(case_url, timeout=10)
+                case_r = requests.get(case_url, headers=HEADERS, timeout=10)
                 case_r.raise_for_status()
                 case_soup = BeautifulSoup(case_r.text, "html.parser")
                 
@@ -113,7 +127,7 @@ def scrape_pdfs():
                         status = "NEW"
                         try:
                             log_message(f"  ↓ Downloading: {pdf_filename}")
-                            pdf_r = requests.get(pdf_url, timeout=30)
+                            pdf_r = requests.get(pdf_url, headers=HEADERS, timeout=30)
                             pdf_r.raise_for_status()
                             
                             # Verify it's actually a PDF

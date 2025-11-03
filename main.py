@@ -77,10 +77,14 @@ def scrape_pdfs(base_url=None):
     scraped_urls = load_scraped_urls()
     log_message(f"Loaded {len(scraped_urls)} previously scraped URLs")
     
+    # Determine which base URL to use
+    if not base_url:
+        base_url = load_base_url()
+    log_message(f"Fetching main page: {base_url}")
+    
     try:
         # Get the main page
-        log_message(f"Fetching main page: {BASE_URL}")
-        r = requests.get(BASE_URL, headers=HEADERS, timeout=10)
+        r = requests.get(base_url, headers=HEADERS, timeout=10)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         

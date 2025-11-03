@@ -14,6 +14,7 @@ DATA_DIR = "./data/pdfs"
 BASE_URL = "https://www.bailii.org/ky/cases/GCCI/FSD/2025/"
 ZIP_NAME = "all_pdfs.zip"
 SCRAPE_LOG = os.path.join(DATA_DIR, "scrape_log.txt")
+SCRAPED_URLS_FILE = os.path.join(DATA_DIR, "scraped_urls.txt")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -39,11 +40,27 @@ def log_message(message):
     with open(SCRAPE_LOG, "a") as f:
         f.write(log_entry)
 
+def load_scraped_urls():
+    """Load the set of previously scraped URLs."""
+    if os.path.exists(SCRAPED_URLS_FILE):
+        with open(SCRAPED_URLS_FILE, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+def save_scraped_url(url):
+    """Save a successfully scraped URL to the tracking file."""
+    with open(SCRAPED_URLS_FILE, "a") as f:
+        f.write(f"{url}\n")
+
 def scrape_pdfs():
     """Scrape PDFs from Bailii and return a list of dicts with metadata."""
     results = []
     log_message("=" * 60)
     log_message("Starting new scrape session")
+    
+    # Load previously scraped URLs
+    scraped_urls = load_scraped_urls()
+    log_message(f"Loaded {len(scraped_urls)} previously scraped URLs")
     
     try:
         # Get the main page
@@ -70,15 +87,26 @@ def scrape_pdfs():
         
         log_message(f"Found {len(case_links)} potential case pages")
         
+        # Filter out already scraped URLs
+        new_case_links = [url for url in case_links if url not in scraped_urls]
+        skipped_count = len(case_links) - len(new_case_links)
+        
+        if skipped_count > 0:
+            log_message(f"Skipping {skipped_count} previously scraped pages")
+        log_message(f"Will check {len(new_case_links)} new/unscraped pages")
+        
         # Visit each case page to find PDF links
-        for idx, case_url in enumerate(case_links, 1):
+        for idx, case_url in enumerate(new_case_links, 1):
             try:
-                log_message(f"[{idx}/{len(case_links)}] Checking: {case_url}")
+                log_message(f"[{idx}/{len(new_case_links)}] Checking: {case_url}")
                 time.sleep(0.5)  # Be polite to the server
                 
                 case_r = requests.get(case_url, headers=HEADERS, timeout=10)
                 case_r.raise_for_status()
                 case_soup = BeautifulSoup(case_r.text, "html.parser")
+                
+                # Track if we found any PDFs on this page
+                pdfs_found_on_page = 0
                 
                 # Look for PDF links on the case page (both <a> tags and <object> tags)
                 pdf_sources = []
@@ -149,6 +177,14 @@ def scrape_pdfs():
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "url": pdf_url
                     })
+                    pdfs_found_on_page += 1
+                
+                # Mark this URL as successfully scraped (even if no PDFs found)
+                save_scraped_url(case_url)
+                if pdfs_found_on_page > 0:
+                    log_message(f"  Found {pdfs_found_on_page} PDF(s) on this page")
+                else:
+                    log_message(f"  No PDFs found on this page")
                 
             except Exception as e:
                 log_message(f"  ✗ Error accessing case page: {e}")

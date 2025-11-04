@@ -2,16 +2,20 @@ import os
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
-from flask import Flask, render_template_string, send_from_directory, redirect, url_for
+from flask import Flask, render_template_string, send_from_directory, redirect, url_for, jsonify, make_response
 from zipfile import ZipFile
 from urllib.parse import urljoin, urlparse
 import time
+import re
+import json
+import csv
+from io import StringIO
 
 app = Flask(__name__)
 
 # Config
 DATA_DIR = "./data/pdfs"
-DEFAULT_BASE_URL = "https://www.bailii.org/ky/cases/GCCI/FSD/2025/"
+DEFAULT_BASE_URL = "https://judicial.ky/judgments/unreported-judgments/"
 ZIP_NAME = "all_pdfs.zip"
 SCRAPE_LOG = os.path.join(DATA_DIR, "scrape_log.txt")
 SCRAPED_URLS_FILE = os.path.join(DATA_DIR, "scraped_urls.txt")
@@ -19,18 +23,17 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.txt")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Headers to mimic a real browser and avoid 403 errors
+# Headers to mimic a real browser
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
     'Accept-Encoding': 'gzip, deflate, br',
     'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Cache-Control': 'max-age=0'
+    'Referer': 'https://judicial.ky/judgments/unreported-judgments/',
+    'Origin': 'https://judicial.ky',
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'X-Requested-With': 'XMLHttpRequest',
 }
 
 def log_message(message):
@@ -42,16 +45,16 @@ def log_message(message):
         f.write(log_entry)
 
 def load_scraped_urls():
-    """Load the set of previously scraped URLs."""
+    """Load the set of previously scraped identifiers."""
     if os.path.exists(SCRAPED_URLS_FILE):
         with open(SCRAPED_URLS_FILE, "r") as f:
             return set(line.strip() for line in f if line.strip())
     return set()
 
-def save_scraped_url(url):
-    """Save a successfully scraped URL to the tracking file."""
+def save_scraped_url(identifier):
+    """Save a successfully scraped identifier to the tracking file."""
     with open(SCRAPED_URLS_FILE, "a") as f:
-        f.write(f"{url}\n")
+        f.write(f"{identifier}\n")
 
 def load_base_url():
     """Load the configured base URL or return default."""
@@ -67,149 +70,238 @@ def save_base_url(url):
     with open(CONFIG_FILE, "w") as f:
         f.write(url.strip())
 
+def extract_security_nonce(soup):
+    """Extract the WordPress security nonce from the page."""
+    # Look for inline JavaScript that contains the nonce
+    scripts = soup.find_all("script")
+    
+    for script in scripts:
+        if script.string and "security" in script.string:
+            # Try to extract nonce from various possible formats
+            # Common patterns: security: "nonce", "security":"nonce", var security = "nonce"
+            matches = re.findall(r'security["\s:=]+(["\']?)([a-f0-9]{10})(["\']?)', script.string, re.IGNORECASE)
+            if matches:
+                return matches[0][1]
+    
+    # Alternative: Look for data attributes
+    buttons = soup.find_all("button", {"data-security": True})
+    if buttons:
+        return buttons[0].get("data-security")
+    
+    return None
+
+def get_box_url(fid, fname, security, session):
+    """Get the Box.com download URL from WordPress AJAX endpoint."""
+    ajax_url = "https://judicial.ky/wp-admin/admin-ajax.php"
+    
+    payload = {
+        'action': 'dl_bfile',
+        'fid': fid,
+        'fname': fname,
+        'security': security
+    }
+    
+    try:
+        response = session.post(ajax_url, data=payload, headers=HEADERS, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if data.get('success'):
+            box_url = data.get('data', {}).get('fid')
+            if box_url:
+                return box_url
+        
+        log_message(f"  ✗ API returned no URL: {data}")
+        return None
+        
+    except Exception as e:
+        log_message(f"  ✗ Error calling API: {e}")
+        return None
+
+def extract_pdf_metadata(row):
+    """Extract PDF metadata from table row."""
+    try:
+        # Find download button with data-dl and data-fid attributes
+        dl_button = row.find("button", {"data-dl": True})
+        if not dl_button:
+            return None
+        
+        fname = dl_button.get("data-dl")
+        fid = dl_button.get("data-fid")
+        
+        if not fname or not fid:
+            return None
+        
+        # Extract case information from the row
+        cells = row.find_all("td")
+        if len(cells) < 8:
+            return None
+        
+        neutral_citation = cells[0].get_text(strip=True)
+        cause_number = cells[1].get_text(strip=True)
+        judgment_date = cells[2].get_text(strip=True)
+        title = cells[3].get_text(strip=True)
+        subject = cells[4].get_text(strip=True)
+        court = cells[5].get_text(strip=True)
+        category = cells[6].get_text(strip=True)
+        
+        # Skip criminal cases
+        if "criminal" in category.lower() or "crim" in category.lower():
+            log_message(f"  ⊘ Skipping criminal case: {neutral_citation}")
+            return None
+        
+        return {
+            "fname": fname,
+            "fid": fid,
+            "neutral_citation": neutral_citation,
+            "cause_number": cause_number,
+            "judgment_date": judgment_date,
+            "title": title,
+            "subject": subject,
+            "court": court,
+            "category": category,
+        }
+    except Exception as e:
+        log_message(f"  ✗ Error extracting metadata: {e}")
+        return None
+
 def scrape_pdfs(base_url=None):
-    """Scrape PDFs from Bailii and return a list of dicts with metadata."""
+    """Scrape PDFs from Cayman Judicial website."""
     results = []
     log_message("=" * 60)
     log_message("Starting new scrape session")
     
-    # Load previously scraped URLs
-    scraped_urls = load_scraped_urls()
-    log_message(f"Loaded {len(scraped_urls)} previously scraped URLs")
+    # Load previously scraped identifiers
+    scraped_ids = load_scraped_urls()
+    log_message(f"Loaded {len(scraped_ids)} previously scraped identifiers")
     
     # Determine which base URL to use
     if not base_url:
         base_url = load_base_url()
     log_message(f"Fetching main page: {base_url}")
     
+    # Create a session to maintain cookies
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    
     try:
         # Get the main page
-        r = requests.get(base_url, headers=HEADERS, timeout=10)
+        r = session.get(base_url, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         
-        # Find all case links (typically in a list or table)
-        links = soup.find_all("a", href=True)
-        case_links = []
+        # Extract security nonce
+        security_nonce = extract_security_nonce(soup)
+        if not security_nonce:
+            log_message("ERROR: Could not find security nonce on page!")
+            log_message("The website may have changed its structure.")
+            return results
         
-        for link in links:
-            href = link.get("href", "")
-            # Filter for case links (usually end with .html or are relative paths)
-            if href and not href.startswith("http") and not href.startswith("#"):
-                # Skip parent directory links
-                if href == "../" or href == "./":
-                    continue
-                # Construct full URL
-                full_url = urljoin(base_url, href)
-                if full_url not in case_links:
-                    case_links.append(full_url)
+        log_message(f"Found security nonce: {security_nonce}")
         
-        log_message(f"Found {len(case_links)} potential case pages")
+        # Find all rows in the tbody
+        tbody = soup.find("tbody")
+        if not tbody:
+            log_message("ERROR: Could not find table body on page")
+            return results
         
-        # Filter out already scraped URLs
-        new_case_links = [url for url in case_links if url not in scraped_urls]
-        skipped_count = len(case_links) - len(new_case_links)
+        rows = tbody.find_all("tr")
+        log_message(f"Found {len(rows)} table rows")
+        
+        # Extract metadata for all PDFs
+        pdf_entries = []
+        for row in rows:
+            metadata = extract_pdf_metadata(row)
+            if metadata:
+                pdf_entries.append(metadata)
+        
+        log_message(f"Found {len(pdf_entries)} PDF entries")
+        
+        # Filter out already scraped entries
+        new_entries = [e for e in pdf_entries if e["fname"] not in scraped_ids]
+        skipped_count = len(pdf_entries) - len(new_entries)
         
         if skipped_count > 0:
-            log_message(f"Skipping {skipped_count} previously scraped pages")
-        log_message(f"Will check {len(new_case_links)} new/unscraped pages")
+            log_message(f"Skipping {skipped_count} previously scraped entries")
+        log_message(f"Will download {len(new_entries)} new PDFs")
         
-        # Visit each case page to find PDF links
-        for idx, case_url in enumerate(new_case_links, 1):
+        # Download each PDF
+        for idx, entry in enumerate(new_entries, 1):
             try:
-                log_message(f"[{idx}/{len(new_case_links)}] Checking: {case_url}")
-                time.sleep(0.5)  # Be polite to the server
+                fname = entry["fname"]
+                fid = entry["fid"]
                 
-                case_r = requests.get(case_url, headers=HEADERS, timeout=10)
-                case_r.raise_for_status()
-                case_soup = BeautifulSoup(case_r.text, "html.parser")
+                log_message(f"[{idx}/{len(new_entries)}] Processing: {entry['title']}")
+                log_message(f"  Citation: {entry['neutral_citation']}")
+                log_message(f"  Category: {entry['category']}")
                 
-                # Track if we found any PDFs on this page
-                pdfs_found_on_page = 0
+                # Generate filename
+                pdf_filename = f"{fname}.pdf"
+                pdf_path = os.path.join(DATA_DIR, pdf_filename)
                 
-                # Look for PDF links on the case page (both <a> tags and <object> tags)
-                pdf_sources = []
-                
-                # Method 1: Find all <a> tags with PDF hrefs
-                pdf_links = case_soup.find_all("a", href=True)
-                for pdf_link in pdf_links:
-                    pdf_href = pdf_link.get("href", "")
-                    if pdf_href.lower().endswith(".pdf"):
-                        pdf_sources.append(pdf_href)
-                
-                # Method 2: Find all <object> tags with PDF data attributes
-                pdf_objects = case_soup.find_all("object", {"type": "application/pdf"})
-                for pdf_obj in pdf_objects:
-                    pdf_data = pdf_obj.get("data", "")
-                    if pdf_data:
-                        pdf_sources.append(pdf_data)
-                
-                # Remove duplicates while preserving order
-                seen = set()
-                unique_sources = []
-                for src in pdf_sources:
-                    if src not in seen:
-                        seen.add(src)
-                        unique_sources.append(src)
-                
-                # Download each unique PDF
-                for pdf_href in unique_sources:
-                    pdf_url = urljoin(case_url, pdf_href)
-                    pdf_filename = os.path.basename(urlparse(pdf_url).path)
-                        
-                    # Sanitize filename
-                    pdf_filename = pdf_filename.replace("/", "_").replace("\\", "_")
-                    
-                    # Skip if filename is empty or invalid
-                    if not pdf_filename or pdf_filename == ".pdf":
-                        continue
-                    
-                    pdf_path = os.path.join(DATA_DIR, pdf_filename)
-                    
-                    # Check if already downloaded
-                    if os.path.exists(pdf_path):
-                        status = "EXISTING"
-                        log_message(f"  ✓ Already have: {pdf_filename}")
-                    else:
-                        status = "NEW"
-                        try:
-                            log_message(f"  ↓ Downloading: {pdf_filename}")
-                            pdf_r = requests.get(pdf_url, headers=HEADERS, timeout=30)
-                            pdf_r.raise_for_status()
-                            
-                            # Verify it's actually a PDF
-                            if pdf_r.content[:4] != b'%PDF':
-                                log_message(f"  ✗ Not a valid PDF: {pdf_filename}")
-                                continue
-                            
-                            with open(pdf_path, "wb") as f:
-                                f.write(pdf_r.content)
-                            
-                            log_message(f"  ✓ Saved: {pdf_filename} ({len(pdf_r.content)} bytes)")
-                        except Exception as e:
-                            status = f"ERROR: {e}"
-                            log_message(f"  ✗ Error downloading {pdf_filename}: {e}")
-                    
-                    results.append({
-                        "file": pdf_filename,
-                        "status": status,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "url": pdf_url
-                    })
-                    pdfs_found_on_page += 1
-                
-                # Mark this URL as successfully scraped (even if no PDFs found)
-                save_scraped_url(case_url)
-                if pdfs_found_on_page > 0:
-                    log_message(f"  Found {pdfs_found_on_page} PDF(s) on this page")
+                # Check if already downloaded
+                if os.path.exists(pdf_path):
+                    status = "EXISTING"
+                    log_message(f"  ✓ Already have: {pdf_filename}")
                 else:
-                    log_message(f"  No PDFs found on this page")
+                    # Get Box.com URL from API
+                    log_message(f"  → Calling API to get download URL...")
+                    box_url = get_box_url(fid, fname, security_nonce, session)
+                    
+                    if not box_url:
+                        status = "API_FAILED"
+                        log_message(f"  ✗ Could not get download URL from API")
+                    else:
+                        # Download the PDF from Box.com
+                        try:
+                            log_message(f"  ↓ Downloading from Box.com...")
+                            pdf_response = session.get(box_url, timeout=60, stream=True)
+                            pdf_response.raise_for_status()
+                            
+                            # Verify it's a PDF
+                            content = pdf_response.content
+                            if content[:4] != b'%PDF':
+                                status = "NOT_PDF"
+                                log_message(f"  ✗ Downloaded file is not a valid PDF")
+                            else:
+                                with open(pdf_path, "wb") as f:
+                                    f.write(content)
+                                
+                                status = "NEW"
+                                file_size = len(content)
+                                log_message(f"  ✓ Saved: {pdf_filename} ({file_size / 1024:.1f} KB)")
+                        
+                        except Exception as e:
+                            status = f"DOWNLOAD_ERROR: {e}"
+                            log_message(f"  ✗ Error downloading PDF: {e}")
+                
+                results.append({
+                    "file": pdf_filename,
+                    "status": status,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "identifier": fname,
+                    "neutral_citation": entry["neutral_citation"],
+                    "cause_number": entry["cause_number"],
+                    "judgment_date": entry["judgment_date"],
+                    "title": entry["title"],
+                    "subject": entry["subject"],
+                    "court": entry["court"],
+                    "category": entry["category"]
+                })
+                
+                # Mark as processed
+                save_scraped_url(fname)
+                
+                # Be polite to the server
+                time.sleep(1)
                 
             except Exception as e:
-                log_message(f"  ✗ Error accessing case page: {e}")
+                log_message(f"  ✗ Error processing entry: {e}")
                 continue
         
-        log_message(f"Scraping complete. Found {len(results)} PDFs")
+        log_message(f"Scraping complete. Processed {len(results)} entries")
+        log_message("=" * 60)
         
     except Exception as e:
         error_msg = f"SCRAPING ERROR: {e}"
@@ -218,7 +310,7 @@ def scrape_pdfs(base_url=None):
             "file": "ERROR",
             "status": error_msg,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "url": ""
+            "identifier": ""
         })
     
     return results
@@ -246,12 +338,12 @@ def index():
     html = """
     <html>
     <head>
-        <title>Bailii PDF Scraper</title>
+        <title>Cayman Judicial PDF Scraper</title>
         <style>
             body { 
                 font-family: Arial, sans-serif; 
                 margin: 40px;
-                max-width: 800px;
+                max-width: 900px;
             }
             .form-group {
                 margin-bottom: 20px;
@@ -278,6 +370,8 @@ def index():
                 border-radius: 4px;
                 cursor: pointer;
                 margin-right: 10px;
+                text-decoration: none;
+                display: inline-block;
             }
             .button:hover {
                 background-color: #45a049;
@@ -294,20 +388,21 @@ def index():
                 padding: 15px;
                 margin: 20px 0;
             }
-            .examples {
-                background-color: #f9f9f9;
+            .success-box {
+                background-color: #d4edda;
+                border-left: 4px solid #28a745;
                 padding: 15px;
-                border-radius: 4px;
-                margin-top: 10px;
-            }
-            .examples ul {
-                margin: 10px 0;
-                padding-left: 20px;
+                margin: 20px 0;
             }
         </style>
     </head>
     <body>
-        <h1>🔍 Bailii PDF Scraper</h1>
+        <h1>🏛️ Cayman Judicial PDF Scraper</h1>
+        
+        <div class="success-box">
+            <strong>✅ Fully Automated Scraping Enabled!</strong><br>
+            This scraper now automatically downloads PDFs from judicial.ky using the WordPress AJAX API.
+        </div>
         
         <form action="{{ url_for('update_config') }}" method="post">
             <div class="form-group">
@@ -317,7 +412,7 @@ def index():
                     id="base_url" 
                     name="base_url" 
                     value="{{ current_url }}"
-                    placeholder="https://www.bailii.org/ky/cases/GCCI/FSD/2025/"
+                    placeholder="https://judicial.ky/judgments/unreported-judgments/"
                     required
                 >
             </div>
@@ -336,6 +431,18 @@ def index():
             <a href="{{ current_url }}" target="_blank">{{ current_url }}</a>
         </div>
         
+        <div class="info-box">
+            <strong>How It Works:</strong>
+            <ol style="margin: 10px 0;">
+                <li>Scraper visits the judicial.ky website</li>
+                <li>Extracts the security nonce and PDF metadata</li>
+                <li>Calls the WordPress AJAX API for each judgment</li>
+                <li>Gets the temporary Box.com download URL</li>
+                <li>Downloads and saves the PDF automatically</li>
+                <li>Tracks progress to avoid re-downloading</li>
+            </ol>
+        </div>
+        
         <form action="{{ url_for('run_download') }}" method="post" style="margin-top: 20px;">
             <button type="submit" class="button" style="font-size: 18px; padding: 15px 30px;">
                 ▶️ Run Scraper Now
@@ -343,19 +450,8 @@ def index():
         </form>
         
         <p style="margin-top: 20px;">
-            <a href="{{ url_for('report') }}">📊 View Report & Downloads</a>
+            <a href="{{ url_for('report') }}" class="button">📊 View Report & Downloads</a>
         </p>
-        
-        <div class="examples">
-            <strong>💡 Example URLs:</strong>
-            <ul>
-                <li><code>https://www.bailii.org/ky/cases/GCCI/FSD/2025/</code> - Cayman Islands 2025</li>
-                <li><code>https://www.bailii.org/ky/cases/GCCI/FSD/2024/</code> - Cayman Islands 2024</li>
-                <li><code>https://www.bailii.org/ew/cases/EWHC/</code> - England & Wales High Court</li>
-                <li><code>https://www.bailii.org/uk/cases/UKSC/</code> - UK Supreme Court</li>
-            </ul>
-            <p><small>⚠️ Make sure URL ends with a trailing slash (/) for proper scraping</small></p>
-        </div>
         
         <div class="info-box" style="margin-top: 30px; border-left-color: #FF9800;">
             <strong>🔗 For changedetection.io integration:</strong><br>
@@ -378,10 +474,6 @@ def update_config():
     new_url = request.form.get("base_url", "").strip()
     
     if new_url:
-        # Ensure URL ends with /
-        if not new_url.endswith("/"):
-            new_url += "/"
-        
         save_base_url(new_url)
         log_message(f"Configuration updated: Base URL changed to {new_url}")
     
@@ -392,13 +484,11 @@ def run_download():
     """Run the scraper and redirect to report."""
     from flask import request
     
-    # Check if a custom URL was provided (for API/changedetection.io use)
+    # Check if a custom URL was provided
     custom_url = request.args.get("url") or request.form.get("url")
     
     if custom_url:
         custom_url = custom_url.strip()
-        if not custom_url.endswith("/"):
-            custom_url += "/"
         results = scrape_pdfs(base_url=custom_url)
     else:
         # Use saved configuration
@@ -419,7 +509,7 @@ def report():
             file_path = os.path.join(DATA_DIR, f)
             files.append({
                 "name": f,
-                "status": "EXISTING",
+                "status": "DOWNLOADED",
                 "timestamp": datetime.fromtimestamp(
                     os.path.getmtime(file_path)
                 ).strftime("%Y-%m-%d %H:%M:%S"),
@@ -437,18 +527,18 @@ def report():
     if os.path.exists(SCRAPE_LOG):
         with open(SCRAPE_LOG, "r") as f:
             log_lines = f.readlines()
-            # Get last 50 lines
-            log_content = "".join(log_lines[-50:])
+            # Get last 150 lines
+            log_content = "".join(log_lines[-150:])
     
     html = """
     <html>
     <head>
-        <title>Bailii PDF Report</title>
+        <title>Cayman Judicial PDF Report</title>
         <style>
             body { font-family: Arial, sans-serif; margin: 40px; }
-            table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+            table { border-collapse: collapse; width: 100%; margin-top: 20px; font-size: 13px; }
             th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-            th { background-color: #4CAF50; color: white; }
+            th { background-color: #4CAF50; color: white; position: sticky; top: 0; }
             tr:nth-child(even) { background-color: #f2f2f2; }
             .button { 
                 background-color: #4CAF50; 
@@ -459,61 +549,90 @@ def report():
                 margin: 10px 5px;
                 border-radius: 4px;
             }
+            .button:hover {
+                background-color: #45a049;
+            }
             .log { 
                 background-color: #f5f5f5; 
                 padding: 10px; 
                 border: 1px solid #ddd;
-                max-height: 300px;
+                max-height: 400px;
                 overflow-y: scroll;
                 font-family: monospace;
                 font-size: 12px;
                 white-space: pre-wrap;
             }
+            .stats {
+                background-color: #e8f5e9;
+                padding: 15px;
+                border-radius: 4px;
+                margin: 20px 0;
+            }
+            .table-container {
+                max-height: 600px;
+                overflow-y: auto;
+                margin-top: 20px;
+            }
+            .filename-cell {
+                font-family: monospace;
+                font-size: 11px;
+            }
         </style>
     </head>
     <body>
-        <h1>Bailii PDF Report</h1>
-        <p><strong>Current Target:</strong> <a href="{{ current_url }}" target="_blank">{{ current_url }}</a></p>
-        <p><strong>Total PDFs:</strong> {{ files|length }}</p>
+        <h1>📊 Cayman Judicial PDF Report</h1>
+        
+        <div class="stats">
+            <strong>Statistics</strong><br>
+            Current Target: <a href="{{ current_url }}" target="_blank">{{ current_url }}</a><br>
+            Total PDFs Downloaded: <strong>{{ files|length }}</strong><br>
+            <em>Note: Criminal cases are automatically excluded from downloads</em>
+        </div>
         
         <div>
-            <a href="{{ url_for('index') }}" class="button">Home</a>
+            <a href="{{ url_for('index') }}" class="button">🏠 Home</a>
             {% if zip_exists %}
             <a href="{{ url_for('download_file', filename=zip_name) }}" class="button">
-                Download All as ZIP
+                📦 Download All as ZIP
             </a>
             {% endif %}
             <a href="{{ url_for('run_download') }}" class="button" 
-               onclick="return confirm('Start new scrape?')">
-                Run Scraper Again
+               onclick="return confirm('Run scraper to check for new judgments?')">
+                🔄 Run Scraper Again
             </a>
         </div>
         
-        <h2>Downloaded PDFs</h2>
+        <h2>📁 Downloaded PDFs</h2>
         {% if files %}
-        <table>
-            <tr>
-                <th>Filename</th>
-                <th>Size</th>
-                <th>Downloaded</th>
-                <th>Actions</th>
-            </tr>
-            {% for f in files %}
-            <tr>
-                <td>{{ f.name }}</td>
-                <td>{{ f.size }}</td>
-                <td>{{ f.timestamp }}</td>
-                <td>
-                    <a href="{{ url_for('download_file', filename=f.name) }}">Download</a>
-                </td>
-            </tr>
-            {% endfor %}
-        </table>
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width: 250px;">Filename</th>
+                        <th style="width: 80px;">Size</th>
+                        <th style="width: 140px;">Downloaded</th>
+                        <th style="width: 100px;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for f in files %}
+                    <tr>
+                        <td class="filename-cell">{{ f.name }}</td>
+                        <td>{{ f.size }}</td>
+                        <td>{{ f.timestamp }}</td>
+                        <td>
+                            <a href="{{ url_for('download_file', filename=f.name) }}">Download</a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
         {% else %}
-        <p>No PDFs found. Run the scraper to download files.</p>
+        <p>No PDFs downloaded yet. Click "Run Scraper Again" to start downloading.</p>
         {% endif %}
         
-        <h2>Recent Log</h2>
+        <h2>📜 Recent Log (Last 150 lines)</h2>
         <div class="log">{{ log_content or "No log entries yet." }}</div>
     </body>
     </html>
@@ -523,7 +642,8 @@ def report():
         files=files, 
         zip_exists=zip_exists,
         zip_name=ZIP_NAME,
-        log_content=log_content
+        log_content=log_content,
+        current_url=current_url
     )
 
 @app.route("/files/<path:filename>")
@@ -535,6 +655,5 @@ def download_file(filename):
         return f"File not found: {e}", 404
 
 if __name__ == "__main__":
-    # Railway expects 0.0.0.0 and correct port
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)

@@ -89,7 +89,56 @@ def cloak_url(url):
         return f"http://anon.to/?{url}"
     return url
 
-def extract_security_nonce(soup):
+def extract_datatable_ajax_url(soup):
+    """Extract the DataTables AJAX URL from the page scripts."""
+    scripts = soup.find_all("script")
+    
+    for script in scripts:
+        if script.string and "DataTable" in script.string:
+            # Look for ajax URL patterns
+            # Pattern 1: ajax: "url"
+            matches = re.findall(r'ajax\s*:\s*["\']([^"\']+)["\']', script.string)
+            if matches:
+                log_message(f"  Found DataTable ajax URL: {matches[0]}")
+                return matches[0]
+            
+            # Pattern 2: ajax: { url: "url" }
+            matches = re.findall(r'ajax\s*:\s*\{[^}]*url\s*:\s*["\']([^"\']+)["\']', script.string, re.DOTALL)
+            if matches:
+                log_message(f"  Found DataTable ajax URL (object): {matches[0]}")
+                return matches[0]
+    
+    return None
+
+def fetch_datatable_data(ajax_url, session, length=2740):
+    """Fetch all data from DataTables AJAX endpoint."""
+    # DataTables server-side processing parameters
+    params = {
+        'draw': 1,
+        'start': 0,
+        'length': length,  # Get all records at once
+        'search[value]': '',
+        'search[regex]': 'false',
+        'order[0][column]': 2,  # Order by date column
+        'order[0][dir]': 'desc'
+    }
+    
+    try:
+        response = session.get(ajax_url, params=params, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if 'data' in data:
+            log_message(f"  Retrieved {len(data['data'])} records from DataTables API")
+            return data['data']
+        
+        log_message(f"  No 'data' field in response: {list(data.keys())}")
+        return []
+        
+    except Exception as e:
+        log_message(f"  Error fetching DataTable data: {e}")
+        return []
     """Extract the WordPress security nonce from the page."""
     # Look for inline JavaScript that contains the nonce
     scripts = soup.find_all("script")
@@ -163,36 +212,40 @@ def get_box_url(fid, fname, security, session):
         log_message(f"  ✗ Error calling API: {e}")
         return None
 
-def extract_pdf_metadata(row):
-    """Extract PDF metadata from table row."""
+def extract_pdf_metadata(row_data):
+    """Extract PDF metadata from DataTables row data (array format)."""
     try:
-        # Find download button with data-dl and data-fid attributes
-        dl_button = row.find("button", {"data-dl": True})
+        # Row data is an array: [citation, cause_num, date, title, subject, court, category, actions_html]
+        if len(row_data) < 8:
+            return None
+        
+        neutral_citation = row_data[0] if isinstance(row_data[0], str) else str(row_data[0])
+        cause_number = row_data[1] if isinstance(row_data[1], str) else str(row_data[1])
+        judgment_date = row_data[2] if isinstance(row_data[2], str) else str(row_data[2])
+        title = row_data[3] if isinstance(row_data[3], str) else str(row_data[3])
+        subject = row_data[4] if isinstance(row_data[4], str) else str(row_data[4])
+        court = row_data[5] if isinstance(row_data[5], str) else str(row_data[5])
+        category = row_data[6] if isinstance(row_data[6], str) else str(row_data[6])
+        actions_html = row_data[7] if isinstance(row_data[7], str) else str(row_data[7])
+        
+        # Skip criminal cases
+        if "criminal" in category.lower() or "crim" in category.lower():
+            log_message(f"  ⊘ Skipping criminal case: {neutral_citation}")
+            return None
+        
+        # Extract fname and fid from actions HTML
+        soup = BeautifulSoup(actions_html, 'html.parser')
+        dl_button = soup.find("button", {"data-dl": True})
+        
         if not dl_button:
+            log_message(f"  ✗ No download button found for: {neutral_citation}")
             return None
         
         fname = dl_button.get("data-dl")
         fid = dl_button.get("data-fid")
         
         if not fname or not fid:
-            return None
-        
-        # Extract case information from the row
-        cells = row.find_all("td")
-        if len(cells) < 8:
-            return None
-        
-        neutral_citation = cells[0].get_text(strip=True)
-        cause_number = cells[1].get_text(strip=True)
-        judgment_date = cells[2].get_text(strip=True)
-        title = cells[3].get_text(strip=True)
-        subject = cells[4].get_text(strip=True)
-        court = cells[5].get_text(strip=True)
-        category = cells[6].get_text(strip=True)
-        
-        # Skip criminal cases
-        if "criminal" in category.lower() or "crim" in category.lower():
-            log_message(f"  ⊘ Skipping criminal case: {neutral_citation}")
+            log_message(f"  ✗ Missing fname/fid for: {neutral_citation}")
             return None
         
         return {
@@ -261,23 +314,39 @@ def scrape_pdfs(base_url=None):
         
         log_message(f"✓ Found security nonce: {security_nonce}")
         
-        # Find all rows in the tbody
-        tbody = soup.find("tbody")
-        if not tbody:
-            log_message("ERROR: Could not find table body on page")
+        # Find DataTables AJAX endpoint
+        ajax_url = extract_datatable_ajax_url(soup)
+        if not ajax_url:
+            log_message("ERROR: Could not find DataTables AJAX URL!")
+            log_message("Attempting to construct URL from base...")
+            # Try common WordPress AJAX pattern
+            ajax_url = "https://judicial.ky/wp-admin/admin-ajax.php"
+            log_message(f"Using default WordPress AJAX URL: {ajax_url}")
+        
+        # Make absolute URL if relative
+        if ajax_url and not ajax_url.startswith("http"):
+            ajax_url = urljoin(base_url, ajax_url)
+        
+        log_message(f"DataTables AJAX URL: {ajax_url}")
+        
+        # Fetch data from DataTables endpoint
+        table_data = fetch_datatable_data(ajax_url, session)
+        
+        if not table_data:
+            log_message("ERROR: Could not fetch data from DataTables endpoint")
+            log_message("The table might use a different API structure")
             return results
         
-        rows = tbody.find_all("tr")
-        log_message(f"Found {len(rows)} table rows")
+        log_message(f"Successfully retrieved {len(table_data)} rows from DataTables")
         
         # Extract metadata for all PDFs
         pdf_entries = []
-        for row in rows:
-            metadata = extract_pdf_metadata(row)
+        for row_data in table_data:
+            metadata = extract_pdf_metadata(row_data)
             if metadata:
                 pdf_entries.append(metadata)
         
-        log_message(f"Found {len(pdf_entries)} PDF entries")
+        log_message(f"Extracted metadata for {len(pdf_entries)} non-criminal cases")
         
         # Filter out already scraped entries
         new_entries = [e for e in pdf_entries if e["fname"] not in scraped_ids]

@@ -20,6 +20,7 @@ ZIP_NAME = "all_pdfs.zip"
 SCRAPE_LOG = os.path.join(DATA_DIR, "scrape_log.txt")
 SCRAPED_URLS_FILE = os.path.join(DATA_DIR, "scraped_urls.txt")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.txt")
+METADATA_FILE = os.path.join(DATA_DIR, "metadata.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -70,23 +71,66 @@ def save_base_url(url):
     with open(CONFIG_FILE, "w") as f:
         f.write(url.strip())
 
+def save_metadata(metadata_list):
+    """Save metadata for all downloaded PDFs."""
+    with open(METADATA_FILE, "w") as f:
+        json.dump(metadata_list, f, indent=2)
+
+def load_metadata():
+    """Load metadata for all downloaded PDFs."""
+    if os.path.exists(METADATA_FILE):
+        with open(METADATA_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def cloak_url(url):
+    """Cloak URL with anon.to to strip referrer information."""
+    if url and url.startswith("http"):
+        return f"http://anon.to/?{url}"
+    return url
+
 def extract_security_nonce(soup):
     """Extract the WordPress security nonce from the page."""
     # Look for inline JavaScript that contains the nonce
     scripts = soup.find_all("script")
     
     for script in scripts:
-        if script.string and "security" in script.string:
+        if script.string and "security" in script.string.lower():
             # Try to extract nonce from various possible formats
-            # Common patterns: security: "nonce", "security":"nonce", var security = "nonce"
+            # Pattern 1: security: "nonce"
             matches = re.findall(r'security["\s:=]+(["\']?)([a-f0-9]{10})(["\']?)', script.string, re.IGNORECASE)
             if matches:
+                log_message(f"  Found nonce (pattern 1): {matches[0][1]}")
                 return matches[0][1]
+            
+            # Pattern 2: "security":"nonce"
+            matches = re.findall(r'"security"\s*:\s*"([a-f0-9]{10})"', script.string)
+            if matches:
+                log_message(f"  Found nonce (pattern 2): {matches[0]}")
+                return matches[0]
+            
+            # Pattern 3: var security = "nonce"
+            matches = re.findall(r'var\s+security\s*=\s*["\']([a-f0-9]{10})["\']', script.string)
+            if matches:
+                log_message(f"  Found nonce (pattern 3): {matches[0]}")
+                return matches[0]
     
-    # Alternative: Look for data attributes
+    # Alternative: Look for data attributes on buttons
     buttons = soup.find_all("button", {"data-security": True})
     if buttons:
-        return buttons[0].get("data-security")
+        nonce = buttons[0].get("data-security")
+        log_message(f"  Found nonce in data attribute: {nonce}")
+        return nonce
+    
+    # Try to find any 10-character hex string that might be the nonce
+    for script in scripts:
+        if script.string:
+            # Look for any 10-char hex strings
+            hex_matches = re.findall(r'\b([a-f0-9]{10})\b', script.string.lower())
+            if hex_matches:
+                # Return the first one found
+                log_message(f"  Found possible nonce (hex pattern): {hex_matches[0]}")
+                return hex_matches[0]
     
     return None
 
@@ -195,10 +239,27 @@ def scrape_pdfs(base_url=None):
         security_nonce = extract_security_nonce(soup)
         if not security_nonce:
             log_message("ERROR: Could not find security nonce on page!")
+            log_message("Attempting to save page HTML for debugging...")
+            
+            # Save HTML for debugging
+            debug_file = os.path.join(DATA_DIR, "debug_page.html")
+            with open(debug_file, "w", encoding="utf-8") as f:
+                f.write(soup.prettify())
+            log_message(f"Saved page HTML to: {debug_file}")
+            
+            # Try to find all script tags and log what we see
+            scripts = soup.find_all("script")
+            log_message(f"Found {len(scripts)} script tags on page")
+            
+            for idx, script in enumerate(scripts[:5], 1):  # Check first 5 scripts
+                if script.string:
+                    snippet = script.string[:200].replace('\n', ' ')
+                    log_message(f"  Script {idx} preview: {snippet}...")
+            
             log_message("The website may have changed its structure.")
             return results
         
-        log_message(f"Found security nonce: {security_nonce}")
+        log_message(f"✓ Found security nonce: {security_nonce}")
         
         # Find all rows in the tbody
         tbody = soup.find("tbody")
@@ -299,6 +360,11 @@ def scrape_pdfs(base_url=None):
             except Exception as e:
                 log_message(f"  ✗ Error processing entry: {e}")
                 continue
+        
+        # Save metadata
+        if results:
+            save_metadata(results)
+            log_message(f"Saved metadata for {len(results)} entries")
         
         log_message(f"Scraping complete. Processed {len(results)} entries")
         log_message("=" * 60)
@@ -428,7 +494,7 @@ def index():
         
         <div class="info-box">
             <strong>Current Target:</strong><br>
-            <a href="{{ current_url }}" target="_blank">{{ current_url }}</a>
+            <a href="{{ cloak_url(current_url) }}" target="_blank" rel="noopener noreferrer">{{ current_url }}</a>
         </div>
         
         <div class="info-box">
@@ -464,7 +530,8 @@ def index():
     return render_template_string(
         html, 
         current_url=current_url,
-        default_url=DEFAULT_BASE_URL
+        default_url=DEFAULT_BASE_URL,
+        cloak_url=cloak_url
     )
 
 @app.route("/update-config", methods=["POST"])
@@ -584,7 +651,7 @@ def report():
         
         <div class="stats">
             <strong>Statistics</strong><br>
-            Current Target: <a href="{{ current_url }}" target="_blank">{{ current_url }}</a><br>
+            Current Target: <a href="{{ cloak_url(current_url) }}" target="_blank" rel="noopener noreferrer">{{ current_url }}</a><br>
             Total PDFs Downloaded: <strong>{{ files|length }}</strong><br>
             <em>Note: Criminal cases are automatically excluded from downloads</em>
         </div>
@@ -596,6 +663,9 @@ def report():
                 📦 Download All as ZIP
             </a>
             {% endif %}
+            <a href="{{ url_for('export_csv') }}" class="button" style="background-color: #FF9800;">
+                📊 Export Metadata (CSV)
+            </a>
             <a href="{{ url_for('run_download') }}" class="button" 
                onclick="return confirm('Run scraper to check for new judgments?')">
                 🔄 Run Scraper Again
@@ -643,7 +713,8 @@ def report():
         zip_exists=zip_exists,
         zip_name=ZIP_NAME,
         log_content=log_content,
-        current_url=current_url
+        current_url=current_url,
+        cloak_url=cloak_url
     )
 
 @app.route("/files/<path:filename>")
@@ -653,6 +724,39 @@ def download_file(filename):
         return send_from_directory(DATA_DIR, filename, as_attachment=True)
     except Exception as e:
         return f"File not found: {e}", 404
+
+@app.route("/api/metadata")
+def api_metadata():
+    """API endpoint to get metadata as JSON."""
+    metadata = load_metadata()
+    return jsonify(metadata)
+
+@app.route("/export/csv")
+def export_csv():
+    """Export metadata as CSV."""
+    metadata = load_metadata()
+    
+    if not metadata:
+        return "No metadata available", 404
+    
+    # Create CSV in memory
+    si = StringIO()
+    fieldnames = ['neutral_citation', 'cause_number', 'judgment_date', 'title', 
+                  'subject', 'court', 'category', 'file', 'status', 'timestamp']
+    writer = csv.DictWriter(si, fieldnames=fieldnames)
+    
+    writer.writeheader()
+    for item in metadata:
+        # Only write fields that exist
+        row = {k: item.get(k, '') for k in fieldnames}
+        writer.writerow(row)
+    
+    # Create response
+    output = make_response(si.getvalue())
+    output.headers["Content-Disposition"] = "attachment; filename=judgments_metadata.csv"
+    output.headers["Content-type"] = "text/csv"
+    
+    return output
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))

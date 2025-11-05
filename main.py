@@ -1,4 +1,4 @@
-"""Cayman judicial PDF scraper and minimal Flask dashboard."""
+"""Comprehensive Cayman judicial PDF scraper and web dashboard."""
 from __future__ import annotations
 
 import csv
@@ -6,11 +6,15 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, asdict
+import csv
+import json
+import requests
+from urllib.parse import urlparse, parse_qs
+from io import StringIO
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 from zipfile import ZipFile
 
@@ -18,7 +22,6 @@ import requests
 from bs4 import BeautifulSoup
 from flask import (
     Flask,
-    Response,
     jsonify,
     make_response,
     redirect,
@@ -27,126 +30,109 @@ from flask import (
     url_for,
 )
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 APP = Flask(__name__)
 
-BASE_DATA_DIR = Path("data")
-PDF_DIR = BASE_DATA_DIR / "pdfs"
-BASE_DATA_DIR.mkdir(exist_ok=True)
-PDF_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path("./data/pdfs")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_SOURCE_URL = "https://judicial.ky/judgments/unreported-judgments/"
+DEFAULT_BASE_URL = "https://judicial.ky/judgments/unreported-judgments/"
 CSV_URL = "https://judicial.ky/wp-content/uploads/box_files/judgments.csv"
-AJAX_URL = "https://judicial.ky/wp-admin/admin-ajax.php"
-ZIP_NAME = "judgments.zip"
+ZIP_NAME = "all_pdfs.zip"
+SCRAPE_LOG = os.path.join(DATA_DIR, "scrape_log.txt")
+SCRAPED_URLS_FILE = os.path.join(DATA_DIR, "scraped_urls.txt")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.txt")
+METADATA_FILE = os.path.join(DATA_DIR, "metadata.json")
 
-SCRAPE_LOG = BASE_DATA_DIR / "scrape.log"
-SCRAPED_IDS_FILE = BASE_DATA_DIR / "scraped_ids.txt"
-CONFIG_FILE = BASE_DATA_DIR / "config.json"
-METADATA_FILE = BASE_DATA_DIR / "metadata.json"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
+# Headers
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'X-Requested-With': 'XMLHttpRequest',
+    'Origin': 'https://judicial.ky',
+    'Referer': DEFAULT_BASE_URL,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
     "X-Requested-With": "XMLHttpRequest",
+    "Origin": "https://judicial.ky",
+    "Referer": DEFAULT_BASE_URL,
 }
 
 
 # ---------------------------------------------------------------------------
-# Storage helpers
+# Utility helpers
 # ---------------------------------------------------------------------------
-
 
 def log_message(message: str) -> None:
-    """Write a log entry to stdout and the scrape log."""
+    """Write a timestamped log line to stdout and the scrape log."""
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    entry = f"[{timestamp}] {message}"
-    print(entry)
-    with SCRAPE_LOG.open("a", encoding="utf-8") as handle:
-        handle.write(entry + "\n")
+    log_entry = f"[{timestamp}] {message}\n"
+    print(log_entry.strip())
+    with open(SCRAPE_LOG, "a") as f:
+        f.write(log_entry)
 
+def load_scraped_urls():
+    if os.path.exists(SCRAPED_URLS_FILE):
+        with open(SCRAPED_URLS_FILE, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
 
-def read_json(path: Path, default: Iterable | Dict | None = None):
-    if not path.exists():
-        return default
+def save_scraped_url(identifier):
+    with open(SCRAPED_URLS_FILE, "a") as f:
+        f.write(f"{identifier}\n")
+
+def load_base_url():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            url = f.read().strip()
+            if url:
+@@ -107,161 +106,250 @@ def fetch_csv_data(csv_url, session):
+        reader = csv.DictReader(StringIO(resp.text))
+        entries = []
+        for row in reader:
+            if not row.get('Actions'):
+                continue
+            if 'criminal' in row.get('Category', '').lower():
+                continue
+            entries.append({
+                'neutral_citation': row.get('Neutral Citation', ''),
+                'cause_number': row.get('Cause Number', ''),
+                'judgment_date': row.get('Judgment Date', ''),
+                'title': row.get('Title', ''),
+                'subject': row.get('Subject', ''),
+                'court': row.get('Court', ''),
+                'category': row.get('Category', ''),
+                'actions': row.get('Actions', '')
+            })
+        log_message(f"Loaded {len(entries)} non-criminal cases from CSV")
+        return entries
+    except Exception as e:
+        log_message(f"ERROR fetching CSV: {e}")
+        return []
+
+def get_box_url(fid, fname, security, session):
+    ajax_url = "https://judicial.ky/wp-admin/admin-ajax.php"
+    payload = {'action':'dl_bfile','fid':fid,'fname':fname,'security':security}
+    payload = {"action": "dl_bfile", "fid": fid, "fname": fname, "security": security}
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except json.JSONDecodeError:
-        log_message(f"Unable to parse JSON from {path}; using default")
-        return default
-
-
-def write_json(path: Path, payload) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-
-
-def load_scraped_ids() -> set[str]:
-    if not SCRAPED_IDS_FILE.exists():
-        return set()
-    with SCRAPED_IDS_FILE.open("r", encoding="utf-8") as handle:
-        return {line.strip() for line in handle if line.strip()}
-
-
-def remember_scraped_id(identifier: str) -> None:
-    with SCRAPED_IDS_FILE.open("a", encoding="utf-8") as handle:
-        handle.write(identifier + "\n")
-
-
-def load_metadata() -> List[Dict[str, str]]:
-    return read_json(METADATA_FILE, default=[]) or []
-
-
-def save_metadata(rows: Iterable[Dict[str, str]]) -> None:
-    write_json(METADATA_FILE, list(rows))
-
-
-def load_base_url() -> str:
-    config = read_json(CONFIG_FILE, default={}) or {}
-    return config.get("base_url", DEFAULT_SOURCE_URL)
-
-
-def save_base_url(url: str) -> None:
-    write_json(CONFIG_FILE, {"base_url": url.strip() or DEFAULT_SOURCE_URL})
-
-
-# ---------------------------------------------------------------------------
-# CSV parsing
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ActionInfo:
-    file_id: str
-    file_name: str
-    fallback_url: Optional[str]
-
-
-@dataclass
-class CaseRecord:
-    neutral_citation: str
-    cause_number: str
-    judgment_date: str
-    title: str
-    subject: str
-    court: str
-    category: str
-    actions: str
-
-    @classmethod
-    def from_row(cls, row: Dict[str, str]) -> Optional["CaseRecord"]:
-        actions = (row.get("Actions") or "").strip()
-        if not actions:
-            return None
-        category = (row.get("Category") or "").lower()
-        if "criminal" in category:
+        headers = HEADERS.copy()
+        headers.update({'Referer': DEFAULT_BASE_URL, 'Origin': 'https://judicial.ky'})
+        referer = session.headers.get("Referer", DEFAULT_BASE_URL)
+        headers.update({"Referer": referer, "Origin": "https://judicial.ky"})
+        resp = session.post(ajax_url, data=payload, headers=headers, timeout=30)
+        if resp.status_code == 403:
+            log_message("403 Forbidden: could not get PDF via AJAX")
             return None
         return cls(
             neutral_citation=row.get("Neutral Citation", ""),
@@ -284,125 +270,189 @@ class Scraper:
         log_message("Could not locate nonce on page")
         return None
 
-    def ajax_download_url(self, nonce: str, action: ActionInfo) -> Optional[str]:
-        payload = {
-            "action": "dl_bfile",
-            "fid": action.file_id,
-            "fname": action.file_name,
-            "security": nonce,
-        }
-        try:
-            response = self.session.post(AJAX_URL, data=payload, timeout=30)
-        except requests.RequestException as exc:
-            log_message(f"AJAX request failed: {exc}")
-            return None
+    if response.content.startswith(b"%PDF"):
+        return response.url or action_info.fallback_url
 
-        if response.status_code == 403:
-            log_message("AJAX request returned 403")
-            return None
-
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            log_message(f"AJAX error: {exc}")
-            return None
-
-        if response.content.startswith(b"%PDF"):
-            return response.url or action.fallback_url
-
-        try:
-            payload_json = response.json()
-        except ValueError:
-            log_message("AJAX response was not JSON")
-            return None
-
-        if payload_json.get("success"):
-            data = payload_json.get("data", {})
-            return (
-                data.get("url")
-                or data.get("download_url")
-                or data.get("downloadUrl")
-                or data.get("fid")
-            )
-        log_message("AJAX payload indicated failure")
+    try:
+        payload_json = response.json()
+    except ValueError:
+        log_message("AJAX response was not JSON")
         return None
 
-    def resolve_download_url(self, nonce: Optional[str], action: ActionInfo) -> Optional[str]:
-        if nonce:
-            ajax_url = self.ajax_download_url(nonce, action)
-            if ajax_url:
-                return ajax_url
-        if action.fallback_url and action.fallback_url.startswith("http"):
-            log_message("Using fallback URL from Actions column")
-            return action.fallback_url
-        constructed = f"https://judicial.ky/wp-content/uploads/box_files/{action.file_id}.pdf"
-        log_message(f"Constructed fallback URL: {constructed}")
-        return constructed
 
-    def download_pdf(self, url: str, destination: Path) -> tuple[bool, Optional[str]]:
-        try:
-            with self.session.get(url, timeout=60, stream=True) as response:
-                response.raise_for_status()
-                content = response.content
-        except requests.RequestException as exc:
-            return False, f"Request failed: {exc}"
+def parse_actions_field(actions_value):
+    """Extract the Box.com identifiers from the CSV actions column."""
+    if not actions_value:
+        return None, None
 
-        if not content.startswith(b"%PDF"):
-            return False, "Response did not contain a PDF"
+    try:
+        action_soup = BeautifulSoup(actions_value, "html.parser")
+    except Exception:
+        action_soup = None
 
-        destination.write_bytes(content)
-        return True, None
+    fid = None
+    fname = None
 
-    # ---- main entry point ------------------------------------------------
-    def run(self) -> List[Dict[str, str]]:
-        log_message("=" * 70)
-        log_message("Starting scrape session")
-        log_message(f"Target page: {self.base_url}")
+    if action_soup:
+        link = action_soup.find("a")
+        if link:
+            for attr in ("data-fid", "data-file", "data-id", "data-item", "data-file-id"):
+                if link.get(attr):
+                    fid = link.get(attr).strip()
+                    break
+            for attr in ("data-fname", "data-name", "data-file-name", "data-title"):
+                if link.get(attr):
+                    fname = link.get(attr).strip()
+                    break
 
-        scraped_ids = load_scraped_ids()
-        log_message(f"Loaded {len(scraped_ids)} known identifiers")
+            href = link.get("href")
+            if href:
+                parsed = urlparse(href)
+                query_params = parse_qs(parsed.query)
+                if not fid:
+                    for key in ("fid", "file", "id"):
+                        if query_params.get(key):
+                            fid = query_params[key][0]
+                            break
+                if not fname:
+                    for key in ("fname", "name", "file_name"):
+                        if query_params.get(key):
+                            fname = query_params[key][0]
+                            break
+                if not fname:
+                    possible_name = os.path.basename(parsed.path)
+                    if possible_name:
+                        fname = os.path.splitext(possible_name)[0]
 
-        nonce = self.discover_nonce()
-        if not nonce:
-            log_message("Proceeding without nonce; will rely on fallbacks")
+            if not fname:
+                text_label = link.get_text(strip=True)
+                if text_label:
+                    fname = re.sub(r"\s+", "_", text_label)
 
-        try:
-            cases = self.fetch_cases()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            log_message(f"Failed to load CSV: {exc}")
-            return []
+    if not fid or not fname:
+        cleaned = actions_value.strip()
+        if not fid:
+            fid = cleaned
+        if not fname:
+            fname = cleaned
 
-        pending = [case for case in cases if case.actions not in scraped_ids]
-        log_message(f"Preparing to download {len(pending)} new PDFs")
+    return fid, fname
 
-        results: List[Dict[str, str]] = []
-        for index, case in enumerate(pending, start=1):
-            action = parse_actions(case.actions)
-            if not action:
-                log_message("Unable to parse Actions field; skipping")
-                continue
+def scrape_pdfs(base_url=None):
+    results = []
+    log_message("="*60)
+    log_message("Starting new scrape session")
 
-            filename = sanitize_filename(action.file_name) + ".pdf"
-            destination = PDF_DIR / filename
+    log_message("AJAX payload indicated failure")
+    return None
 
-            log_message(
-                f"[{index}/{len(pending)}] {case.title or 'Untitled case'} "
-                f"(fid={action.file_id}, file={filename})"
-            )
 
-            status = "SKIPPED"
-            message = ""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.headers["Referer"] = base_url
 
-            if destination.exists():
-                status = "EXISTS"
-                message = "Already downloaded"
-                log_message(f"✓ {filename} already exists")
+def download_pdf(session: requests.Session, url: str, destination: Path) -> Tuple[bool, Optional[str]]:
+    try:
+        r = session.get(base_url, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        security_nonce = extract_security_nonce(soup)
+        if not security_nonce:
+            log_message("ERROR: could not find security nonce")
+            return results
+        log_message(f"Found security nonce: {security_nonce}")
+
+        csv_entries = fetch_csv_data(CSV_URL, session)
+        if not csv_entries:
+            return results
+
+        new_entries = [e for e in csv_entries if e['actions'] not in scraped_ids]
+        log_message(f"Will download {len(new_entries)} new PDFs")
+
+        for idx, entry in enumerate(new_entries, 1):
+            try:
+                fid = entry['actions']
+                fname = entry['actions']
+                pdf_filename = f"{fname}.pdf"
+                fid, fname = parse_actions_field(entry['actions'])
+                if not fid or not fname:
+                    log_message("✗ Could not parse file identifiers from CSV entry, skipping")
+                    status = "PARSE_FAILED"
+                    results.append({
+                        "file": "",
+                        "status": status,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "identifier": entry['actions'],
+                        "neutral_citation": entry["neutral_citation"],
+                        "cause_number": entry["cause_number"],
+                        "judgment_date": entry["judgment_date"],
+                        "title": entry["title"],
+                        "subject": entry["subject"],
+                        "court": entry["court"],
+                        "category": entry["category"]
+                    })
+                    continue
+
+                safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", fname).strip("._") or fid
+                pdf_filename = f"{safe_name}.pdf"
+                pdf_path = os.path.join(DATA_DIR, pdf_filename)
+
+                log_message(f"[{idx}/{len(new_entries)}] {entry['title']} ({fid})")
+                log_message(f"[{idx}/{len(new_entries)}] {entry['title']} (fid={fid}, fname={safe_name})")
+
+    session = build_session(base_url)
+    scraped_ids = load_scraped_ids()
+    log_message(f"Loaded {len(scraped_ids)} previously downloaded identifiers")
+
+    nonce = discover_security_nonce(session, base_url)
+    if not nonce:
+        log_message("Proceeding without nonce; will rely on fallbacks")
+
+    try:
+        cases = load_cases(session)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log_message(f"Failed to load cases: {exc}")
+        return []
+
+    new_cases = [case for case in cases if case.actions not in scraped_ids]
+    log_message(f"Preparing to download {len(new_cases)} new PDFs")
+
+    results: List[Dict[str, str]] = []
+    for index, case in enumerate(new_cases, start=1):
+        action_info = parse_actions_field(case.actions)
+        if not action_info:
+            log_message("Unable to parse Actions column; skipping entry")
+            continue
+
+        sanitized_name = sanitize_filename(action_info.file_name)
+        filename = f"{sanitized_name}.pdf"
+        file_path = DATA_DIR / filename
+
+        log_message(
+            f"[{index}/{len(new_cases)}] {case.title or 'Untitled case'} "
+            f"(fid={action_info.file_id}, file={filename})"
+        )
+
+        status = "SKIPPED"
+        message = ""
+
+        if file_path.exists():
+            status = "EXISTS"
+            message = "Already downloaded"
+            log_message(f"✓ {filename} already exists")
+        else:
+            download_url = resolve_download_url(session, nonce, action_info)
+            if not download_url:
+                status = "FAILED"
+                message = "No download URL resolved"
+                log_message("✗ Could not resolve download URL")
             else:
-                download_url = self.resolve_download_url(nonce, action)
-                if not download_url:
-                    status = "FAILED"
-                    message = "Could not resolve download URL"
-                    log_message("✗ No download URL available")
+                success, error = download_pdf(session, download_url, file_path)
+                if success:
+                    status = "DOWNLOADED"
+                    message = f"Saved {filename}"
+                    size_kib = file_path.stat().st_size / 1024
+                    log_message(f"✓ Saved {filename} ({size_kib:.1f} KiB)")
                 else:
                     success, error = self.download_pdf(download_url, destination)
                     if success:
@@ -411,215 +461,89 @@ class Scraper:
                         message = f"Saved {filename} ({size_kib:.1f} KiB)"
                         log_message(f"✓ {message}")
                     else:
-                        status = "FAILED"
-                        message = error or "Download failed"
-                        log_message(f"✗ Download failed: {message}")
-                        if destination.exists():
-                            destination.unlink()
+                        fallback_url = f"https://judicial.ky/wp-content/uploads/box_files/{fid}.pdf"
+                        log_message(f"⚠️ AJAX download failed; attempting direct link {fallback_url}")
+                        box_url = fallback_url
 
-            record = {
-                **case.to_metadata(),
-                "file": filename,
-                "status": status,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "message": message,
-            }
-            results.append(record)
+                    if box_url:
+                        pdf_resp = session.get(box_url, timeout=60, stream=True)
+                        pdf_resp.raise_for_status()
+                        content = pdf_resp.content
+                        if content[:4] != b'%PDF':
+                            status = "NOT_PDF"
+                            log_message(f"✗ Downloaded file is not a PDF")
+                        else:
+                            with open(pdf_path, "wb") as f:
+                                f.write(content)
+                            status = "NEW"
+                            log_message(f"✓ Saved: {pdf_filename} ({len(content)/1024:.1f} KB)")
+                    else:
+                        status = "API_FAILED"
+                        log_message(f"✗ Could not get download URL, skipping")
 
-            if status in {"DOWNLOADED", "EXISTS"}:
-                remember_scraped_id(case.actions)
-
-            time.sleep(1)
+                results.append({
+                    "file": pdf_filename,
+                    "status": status,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "identifier": fname,
+                    "identifier": fid,
+                    "neutral_citation": entry["neutral_citation"],
+                    "cause_number": entry["cause_number"],
+                    "judgment_date": entry["judgment_date"],
+                    "title": entry["title"],
+                    "subject": entry["subject"],
+                    "court": entry["court"],
+                    "category": entry["category"]
+                })
+                save_scraped_url(fname)
+                save_scraped_url(fid)
+                time.sleep(1)
+            except Exception as e:
+                log_message(f"✗ Error processing entry: {e}")
+                continue
 
         if results:
-            existing = load_metadata()
-            save_metadata(existing + results)
-            log_message(f"Persisted metadata for {len(results)} rows")
+            save_metadata(results)
+            log_message(f"Saved metadata for {len(results)} entries")
 
-        log_message("Scrape session complete")
-        log_message("=" * 70)
-        return results
+        log_message("Scraping complete")
+        log_message("="*60)
+    except Exception as e:
+        log_message(f"SCRAPING ERROR: {e}")
+        results.append({"file":"ERROR","status":str(e),"timestamp":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"identifier":""})
+        results.append({
+            "file": "ERROR",
+            "status": str(e),
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "identifier": "",
+        })
+    return results
 
 
 # ---------------------------------------------------------------------------
 # ZIP packaging
 # ---------------------------------------------------------------------------
 
-
-def build_zip_archive() -> Path:
-    zip_path = BASE_DATA_DIR / ZIP_NAME
+def create_zip_archive() -> Path:
+    zip_path = DATA_DIR / ZIP_NAME
     with ZipFile(zip_path, "w") as archive:
         count = 0
-        for pdf in PDF_DIR.glob("*.pdf"):
-            archive.write(pdf, pdf.name)
+        for file in DATA_DIR.glob("*.pdf"):
+            archive.write(file, file.name)
             count += 1
-    log_message(f"Created ZIP archive containing {count} PDFs")
+    log_message(f"Created archive with {count} PDFs")
     return zip_path
 
 
 # ---------------------------------------------------------------------------
-# Flask views
+# Flask routes
 # ---------------------------------------------------------------------------
-
-
-def cloak_url(url: str) -> str:
-    return f"http://anon.to/?{url}" if url.startswith("http") else url
-
 
 @APP.route("/")
 def index() -> str:
     current_url = load_base_url()
-    return f"""
+    return f'''
     <html>
     <head>
         <title>Cayman Judicial PDF Scraper</title>
         <style>
-            body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; }}
-            h1 {{ color: #333; }}
-            .form-group {{ margin-bottom: 14px; }}
-            input[type=text] {{ width: 420px; padding: 8px; }}
-            button {{ padding: 8px 16px; margin-top: 6px; }}
-            a {{ color: #0052cc; text-decoration: none; }}
-        </style>
-    </head>
-    <body>
-        <h1>Cayman Judicial PDF Scraper</h1>
-        <form method="POST" action="/update-config">
-            <div class="form-group">
-                <label>Source page URL:</label><br />
-                <input type="text" name="base_url" value="{current_url}" />
-            </div>
-            <button type="submit">Save URL</button>
-        </form>
-        <form method="POST" action="/run-scraper">
-            <button type="submit">Run Scraper</button>
-        </form>
-        <p>
-            <a href="/report">View download report</a> |
-            <a href="{cloak_url(CSV_URL)}" target="_blank">Open CSV source</a>
-        </p>
-    </body>
-    </html>
-    """
-
-
-@APP.route("/update-config", methods=["POST"])
-def update_config() -> Response:
-    new_url = request.form.get("base_url", "").strip()
-    if new_url:
-        save_base_url(new_url)
-        log_message(f"Updated base URL to {new_url}")
-    return redirect(url_for("index"))
-
-
-@APP.route("/run-scraper", methods=["POST"])
-def run_scraper() -> Response:
-    custom_url = request.form.get("base_url") or request.args.get("url")
-    Scraper(custom_url).run()
-    build_zip_archive()
-    return redirect(url_for("report"))
-
-
-@APP.route("/report")
-def report() -> str:
-    files = []
-    for pdf in PDF_DIR.glob("*.pdf"):
-        files.append(
-            {
-                "name": pdf.name,
-                "size": f"{pdf.stat().st_size / 1024:.1f} KiB",
-                "timestamp": datetime.fromtimestamp(pdf.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        )
-    files.sort(key=lambda item: item["timestamp"], reverse=True)
-
-    log_tail = ""
-    if SCRAPE_LOG.exists():
-        log_tail = "\n".join(SCRAPE_LOG.read_text(encoding="utf-8").splitlines()[-200:])
-
-    rows_html = "".join(
-        f"<tr><td>{item['name']}</td><td>{item['size']}</td><td>{item['timestamp']}</td></tr>"
-        for item in files
-    )
-
-    zip_exists = (BASE_DATA_DIR / ZIP_NAME).exists()
-    zip_link = (
-        f"<a href=\"/files/{ZIP_NAME}\">Download ZIP</a>" if zip_exists else "ZIP not created yet."
-    )
-
-    return f"""
-    <html>
-    <head>
-        <title>Scraper report</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; }}
-            table {{ border-collapse: collapse; width: 100%; }}
-            th, td {{ border: 1px solid #ddd; padding: 8px; }}
-            th {{ background-color: #222; color: #fff; }}
-            tr:nth-child(even) {{ background-color: #fafafa; }}
-            pre {{ background: #111; color: #0f0; padding: 12px; max-height: 320px; overflow-y: auto; }}
-        </style>
-    </head>
-    <body>
-        <h1>Download report</h1>
-        <p><a href="/">Back to dashboard</a></p>
-        <h2>PDF files</h2>
-        <table>
-            <tr><th>Filename</th><th>Size</th><th>Downloaded</th></tr>
-            {rows_html}
-        </table>
-        <p>{zip_link}</p>
-        <h2>Recent logs</h2>
-        <pre>{log_tail}</pre>
-    </body>
-    </html>
-    """
-
-
-@APP.route("/files/<path:filename>")
-def serve_file(filename: str):
-    try:
-        return send_from_directory(BASE_DATA_DIR, filename, as_attachment=True)
-    except FileNotFoundError:
-        return "File not found", 404
-
-
-@APP.route("/api/metadata")
-def api_metadata():
-    return jsonify(load_metadata())
-
-
-@APP.route("/export/csv")
-def export_csv():
-    metadata = load_metadata()
-    if not metadata:
-        return "No metadata available", 404
-
-    buffer = StringIO()
-    fieldnames = [
-        "neutral_citation",
-        "cause_number",
-        "judgment_date",
-        "title",
-        "subject",
-        "court",
-        "category",
-        "file",
-        "status",
-        "timestamp",
-        "message",
-    ]
-    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
-    writer.writeheader()
-    for row in metadata:
-        writer.writerow({key: row.get(key, "") for key in fieldnames})
-
-    response = make_response(buffer.getvalue())
-    response.headers["Content-Disposition"] = "attachment; filename=judgments_metadata.csv"
-    response.headers["Content-Type"] = "text/csv"
-    return response
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
-    APP.run(host="0.0.0.0", port=port, debug=False)

@@ -90,6 +90,13 @@ def cloak_url(url):
         return f"http://anon.to/?{url}"
     return url
 
+def extract_ajax_endpoints(soup):
+    print("=== Checking for AJAX endpoints ===")
+    scripts = soup.find_all("script")
+    for s in scripts:
+        if s.string and "ajax" in s.string.lower():
+            print(s.string[:500])
+            
 def extract_security_nonce(soup):
     """Extract the WordPress security nonce from the page."""
     scripts = soup.find_all("script")
@@ -248,6 +255,13 @@ def fetch_csv_data(csv_url, session):
         log_message(f"ERROR fetching CSV: {e}")
         return []
 
+def extract_ajax_endpoints(soup):
+    print("=== Checking for AJAX endpoints ===")
+    scripts = soup.find_all("script")
+    for s in scripts:
+        if s.string and "ajax" in s.string.lower():
+            print(s.string[:500])
+            
 def scrape_pdfs(base_url=None):
     """Scrape PDFs from Cayman Judicial website using CSV data."""
     results = []
@@ -277,7 +291,10 @@ def scrape_pdfs(base_url=None):
         log_message(f"Session cookies: {list(session.cookies.keys())}")
         
         soup = BeautifulSoup(r.text, "html.parser")
-        
+
+        # Debug new AJAX endpoint scanner
+        extract_ajax_endpoints(soup)
+
         # Extract security nonce
         security_nonce = extract_security_nonce(soup)
         if not security_nonce:

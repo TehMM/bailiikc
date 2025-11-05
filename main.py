@@ -254,44 +254,63 @@ def parse_actions_field(actions_value: str) -> Tuple[Optional[str], Optional[str
 # Networking / Download
 # ---------------------------------------------------------------------------
 
+def build_session(base_url: str) -> requests.Session:
+    """Create a session and pre-populate cookies by visiting the base page."""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    # Load main page to establish pdb-sess cookie
+    try:
+        r = session.get(base_url, timeout=15)
+        r.raise_for_status()
+        if "pdb-sess" in session.cookies:
+            log_message(f"Session cookie set: pdb-sess={session.cookies.get('pdb-sess')[:8]}…")
+        else:
+            log_message("⚠️ pdb-sess cookie not found after initial request")
+    except Exception as e:
+        log_message(f"⚠️ Could not fetch main page for session init: {e}")
+    return session
+
+
 def get_box_url(fid: str, fname: str, security: str, session: requests.Session) -> Optional[str]:
-    """
-    Get the actual Box file URL from the site's AJAX endpoint.
-    Returns a URL on success, None otherwise.
-    """
+    """Accurately mimic browser AJAX request to obtain Box.com download URL."""
     ajax_url = "https://judicial.ky/wp-admin/admin-ajax.php"
-    payload = {"action": "dl_bfile", "fid": fid, "fname": fname, "security": security}
+    payload = {
+        "action": "dl_bfile",
+        "fid": fid,
+        "fname": fname,
+        "security": security
+    }
 
     try:
         headers = HEADERS.copy()
-        # ensure referer aligns with the actual page we loaded
-        headers["Referer"] = session.headers.get("Referer", DEFAULT_BASE_URL)
+        headers.update({
+            "Origin": "https://judicial.ky",
+            "Referer": DEFAULT_BASE_URL,
+        })
+
         resp = session.post(ajax_url, data=payload, headers=headers, timeout=30)
 
         if resp.status_code == 403:
-            log_message("  ✗ 403 Forbidden from AJAX endpoint")
+            log_message("✗ 403 Forbidden from AJAX endpoint — check nonce or cookies")
             return None
 
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            log_message(f"✗ Unexpected AJAX status {resp.status_code}")
+            return None
 
-        # Usually JSON: {"success":true,"data":{"fid":"<box url>"}}
-        try:
-            data = resp.json()
-            if data.get("success"):
-                url = (data.get("data") or {}).get("fid") or (data.get("data") or {}).get("url")
-                if url:
-                    return url
+        data = resp.json()
+        if data.get("success"):
+            box_url = (data.get("data") or {}).get("fid")
+            if box_url and box_url.startswith("https://dl.boxcloud.com/"):
+                log_message("✓ AJAX returned valid Box.com URL")
+                return box_url
             else:
-                log_message(f"  ✗ AJAX success==False: {data}")
-        except ValueError:
-            # Not JSON; very unlikely, but check if it's directly a PDF response
-            if resp.content[:4] == b"%PDF":
-                return resp.url
-
+                log_message(f"⚠️ AJAX success but missing boxcloud URL: {data}")
+        else:
+            log_message(f"✗ AJAX failure payload: {data}")
         return None
-
     except Exception as e:
-        log_message(f"  ✗ Error during AJAX call: {e}")
+        log_message(f"✗ AJAX call error: {e}")
         return None
 
 def try_download_pdf(session: requests.Session, url: str, out_path: Path) -> Tuple[bool, Optional[str]]:
@@ -323,9 +342,7 @@ def scrape_pdfs(base_url: Optional[str] = None) -> List[Dict]:
         base_url = load_base_url()
     log_message(f"Target URL: {base_url}")
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    session.headers["Referer"] = base_url
+    session = build_session(base_url)
 
     try:
         # 1) Load base page and discover nonce

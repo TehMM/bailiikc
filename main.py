@@ -178,10 +178,10 @@ def get_box_url(fid, fname, security, session):
     ajax_url = "https://judicial.ky/wp-admin/admin-ajax.php"
     
     payload = {
-        'action': 'dl_bfile',
+        'action': 'pt_cv_dl_bfile',
         'fid': fid,
         'fname': fname,
-        'security': security
+        '_nonce': nonce_value
     }
     
     try:

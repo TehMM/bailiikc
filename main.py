@@ -263,15 +263,15 @@ def extract_ajax_endpoints(soup):
             print(s.string[:500])
 
 def debug_list_scripts(soup):
-    """List all script tags to help find AJAX and nonce sources."""
-    print("=== Listing all <script> tags ===")
+    import sys
+    print("=== Listing all <script> tags ===", flush=True)
     for s in soup.find_all("script"):
         src = s.get("src")
         if src:
-            print("External JS:", src)
+            print("External JS:", src, flush=True)
         elif s.string:
             snippet = s.string.strip().replace("\n", " ")[:250]
-            print("Inline JS snippet:", snippet)
+            print("Inline JS snippet:", snippet, flush=True)
             
 def scrape_pdfs(base_url=None):
     """Scrape PDFs from Cayman Judicial website using CSV data."""

@@ -1,27 +1,24 @@
-# Use a lightweight Python base image
 FROM python:3.11-slim
 
-# Install dependencies for Chrome & Selenium
+# Install Chrome + Chromedriver + basics
 RUN apt-get update && \
-    apt-get install -y wget gnupg unzip curl chromium chromium-driver && \
+    apt-get install -y --no-install-recommends \
+      chromium chromium-driver ca-certificates fonts-liberation wget gnupg unzip curl && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Set environment variables for Chrome
+# Environment for chromium
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 ENV PYTHONUNBUFFERED=1
 
-# Set work directory
 WORKDIR /app
-
-# Copy application files
-COPY . /app
-
-# Install Python requirements
+COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose Flask port
-EXPOSE 5000
+COPY . /app
 
-# Run the Flask app
+# Create data directory expected by the app
+RUN mkdir -p /app/data/pdfs
+
+EXPOSE 5000
 CMD ["python", "main.py"]

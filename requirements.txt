@@ -2,3 +2,5 @@ Flask==3.0.3
 requests==2.32.3
 beautifulsoup4==4.12.3
 lxml==5.3.0
+gunicorn==22.0.0        # WSGI server for production (instead of Flask dev server)
+python-dotenv==1.0.1    # If you want to load .env configuration for PORT etc.

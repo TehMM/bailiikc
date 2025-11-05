@@ -90,7 +90,7 @@ def cloak_url(url):
         return f"http://anon.to/?{url}"
     return url
 
-def extract_security_nonce(soup, page_html):
+def extract_security_nonce(soup):
     """Extract the WordPress security nonce from the page."""
     scripts = soup.find_all("script")
     

@@ -68,7 +68,7 @@ def load_base_url():
         with open(CONFIG_FILE, "r") as f:
             url = f.read().strip()
             if url:
-@@ -107,147 +106,231 @@ def fetch_csv_data(csv_url, session):
+@@ -107,161 +106,250 @@ def fetch_csv_data(csv_url, session):
         reader = csv.DictReader(StringIO(resp.text))
         entries = []
         for row in reader:
@@ -300,6 +300,12 @@ def scrape_pdfs(base_url=None):
     except Exception as e:
         log_message(f"SCRAPING ERROR: {e}")
         results.append({"file":"ERROR","status":str(e),"timestamp":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"identifier":""})
+        results.append({
+            "file": "ERROR",
+            "status": str(e),
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "identifier": "",
+        })
     return results
 
 def create_zip():
@@ -311,3 +317,17 @@ def create_zip():
                 if f.endswith(".pdf"):
                     zipf.write(os.path.join(DATA_DIR, f), f)
                     count += 1
+        log_message(f"Created ZIP with {count} PDFs")
+    except Exception as e:
+        log_message(f"ZIP creation error: {e}")
+    return zip_path
+
+# --- Flask Routes ---
+@app.route("/")
+def index():
+    current_url = load_base_url()
+    html = f"""
+    <html>
+    <head>
+        <title>Cayman Judgments PDF Scraper</title>
+        <style>

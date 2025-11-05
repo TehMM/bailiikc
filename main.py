@@ -144,6 +144,14 @@ def get_box_url(fid, fname, security, session):
     
     try:
         response = session.post(ajax_url, data=payload, headers=HEADERS, timeout=30)
+        
+        # Log the full response for debugging
+        if response.status_code == 403:
+            log_message(f"  ✗ 403 Forbidden. Response: {response.text[:200]}")
+            log_message(f"  Security nonce used: {security}")
+            log_message(f"  Payload: {payload}")
+            return None
+        
         response.raise_for_status()
         
         data = response.json()
@@ -156,6 +164,11 @@ def get_box_url(fid, fname, security, session):
         log_message(f"  ✗ API returned no URL: {data}")
         return None
         
+    except requests.exceptions.HTTPError as e:
+        log_message(f"  ✗ HTTP Error calling API: {e}")
+        log_message(f"  Response status: {response.status_code}")
+        log_message(f"  Response text: {response.text[:500]}")
+        return None
     except Exception as e:
         log_message(f"  ✗ Error calling API: {e}")
         return None
@@ -220,10 +233,14 @@ def scrape_pdfs(base_url=None):
     session.headers.update(HEADERS)
     
     try:
-        # Get the main page to extract security nonce
+        # Get the main page to extract security nonce and establish session
         log_message(f"Fetching main page for security nonce...")
         r = session.get(base_url, timeout=15)
         r.raise_for_status()
+        
+        # Log cookies received
+        log_message(f"Session cookies: {list(session.cookies.keys())}")
+        
         soup = BeautifulSoup(r.text, "html.parser")
         
         # Extract security nonce
@@ -238,6 +255,23 @@ def scrape_pdfs(base_url=None):
             return results
         
         log_message(f"✓ Found security nonce: {security_nonce}")
+        
+        # Test the nonce with a sample request before processing all entries
+        log_message("Testing security nonce with sample API call...")
+        test_fid = "59LLDG6R2OTW1DE6089H76C60314E467CE573E05DE3E0A9E4167"
+        test_fname = test_fid
+        test_url = get_box_url(test_fid, test_fname, security_nonce, session)
+        
+        if test_url:
+            log_message(f"✓ Security nonce is valid! Test succeeded.")
+        else:
+            log_message(f"✗ Security nonce test FAILED!")
+            log_message(f"The nonce may be invalid or the API endpoint may have changed.")
+            log_message(f"Check the debug output above for details.")
+            # Continue anyway to log all failures
+        
+        # Add a small delay after test
+        time.sleep(2)
         
         # Fetch CSV data
         csv_entries = fetch_csv_data(CSV_URL, session)

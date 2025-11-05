@@ -261,6 +261,17 @@ def extract_ajax_endpoints(soup):
     for s in scripts:
         if s.string and "ajax" in s.string.lower():
             print(s.string[:500])
+
+def debug_list_scripts(soup):
+    """List all script tags to help find AJAX and nonce sources."""
+    print("=== Listing all <script> tags ===")
+    for s in soup.find_all("script"):
+        src = s.get("src")
+        if src:
+            print("External JS:", src)
+        elif s.string:
+            snippet = s.string.strip().replace("\n", " ")[:250]
+            print("Inline JS snippet:", snippet)
             
 def scrape_pdfs(base_url=None):
     """Scrape PDFs from Cayman Judicial website using CSV data."""
@@ -291,6 +302,9 @@ def scrape_pdfs(base_url=None):
         log_message(f"Session cookies: {list(session.cookies.keys())}")
         
         soup = BeautifulSoup(r.text, "html.parser")
+
+        # Debug: list all scripts to find AJAX handlers or nonces
+        debug_list_scripts(soup)
 
         # Debug new AJAX endpoint scanner
         extract_ajax_endpoints(soup)

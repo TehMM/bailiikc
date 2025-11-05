@@ -272,7 +272,7 @@ def build_session(base_url: str) -> requests.Session:
 
 
 def get_box_url(fid: str, fname: str, security: str, session: requests.Session) -> Optional[str]:
-    """Accurately mimic browser AJAX request to obtain Box.com download URL."""
+    """Fully emulate browser AJAX to get Box.com download URL."""
     ajax_url = "https://judicial.ky/wp-admin/admin-ajax.php"
     payload = {
         "action": "dl_bfile",
@@ -282,33 +282,44 @@ def get_box_url(fid: str, fname: str, security: str, session: requests.Session) 
     }
 
     try:
-        headers = HEADERS.copy()
-        headers.update({
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
             "Origin": "https://judicial.ky",
-            "Referer": DEFAULT_BASE_URL,
-        })
+            "Referer": "https://judicial.ky/judgments/unreported-judgments/",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+        }
+
+        # Ensure we’re sending pdb-sess
+        if "pdb-sess" not in session.cookies:
+            log_message("⚠️ pdb-sess cookie missing before AJAX, re-fetching base page")
+            session.get("https://judicial.ky/judgments/unreported-judgments/", timeout=10)
+
+        cookie_info = "; ".join(f"{c.name}={c.value}" for c in session.cookies)
+        log_message(f"Using cookies: {cookie_info}")
 
         resp = session.post(ajax_url, data=payload, headers=headers, timeout=30)
-
         if resp.status_code == 403:
-            log_message("✗ 403 Forbidden from AJAX endpoint — check nonce or cookies")
+            log_message(f"✗ 403 Forbidden (nonce or cookie mismatch)")
+            log_message(f"  Sent payload: {payload}")
             return None
-
         if resp.status_code != 200:
-            log_message(f"✗ Unexpected AJAX status {resp.status_code}")
+            log_message(f"✗ Unexpected status {resp.status_code}: {resp.text[:200]}")
             return None
 
         data = resp.json()
         if data.get("success"):
             box_url = (data.get("data") or {}).get("fid")
             if box_url and box_url.startswith("https://dl.boxcloud.com/"):
-                log_message("✓ AJAX returned valid Box.com URL")
+                log_message(f"✓ AJAX returned valid Box.com URL for {fid}")
                 return box_url
-            else:
-                log_message(f"⚠️ AJAX success but missing boxcloud URL: {data}")
+            log_message(f"⚠️ AJAX success but unexpected structure: {json.dumps(data)[:400]}")
         else:
-            log_message(f"✗ AJAX failure payload: {data}")
+            log_message(f"✗ AJAX returned failure payload: {data}")
         return None
+
     except Exception as e:
         log_message(f"✗ AJAX call error: {e}")
         return None

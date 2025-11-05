@@ -113,39 +113,44 @@ def sanitize_filename(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def extract_security_nonce(soup: BeautifulSoup) -> Optional[str]:
-    """
-    Try multiple patterns. Logs what it finds.
-    Known site hint from your log: ..."_nonce":"abf843bc01"...
-    """
+    """Extract the correct WordPress security nonce for dl_bfile AJAX calls."""
     scripts = soup.find_all("script")
 
-    # 1) Specific 'dl_bfile' context
-    for script in scripts:
-        if script.string and "dl_bfile" in script.string:
-            matches = re.findall(
-                r'security["\s:=]+["\']?([a-f0-9]{10})["\']?', script.string, re.IGNORECASE
-            )
-            if matches:
-                log_message(f"Found nonce in dl_bfile script: {matches[0]}")
-                return matches[0]
-
-    # 2) Common patterns (including _nonce used by Post Table CV/VC)
-    patterns = [
-        r'"security"\s*:\s*"([a-f0-9]{10})"',
-        r'var\s+security\s*=\s*["\']([a-f0-9]{10})["\']',
-        r'"_nonce"\s*:\s*"([a-f0-9]{10})"',
-        r'\b([a-f0-9]{10})\b',  # last resort
-    ]
     for script in scripts:
         if not script.string:
             continue
-        s = script.string
-        for pat in patterns:
-            m = re.search(pat, s, re.IGNORECASE)
-            if m:
-                log_message(f"Found possible nonce: {m.group(1)}")
-                return m.group(1)
 
+        # Case 1: Find 'dl_bfile' or similar object with 'security' field
+        if "dl_bfile" in script.string or "dlbfile" in script.string or "security" in script.string:
+            m = re.search(r"['\"]security['\"]\s*:\s*['\"]([a-f0-9]{10})['\"]", script.string)
+            if m:
+                nonce = m.group(1)
+                log_message(f"Found dl_bfile nonce: {nonce}")
+                return nonce
+
+        # Case 2: Generic pattern like var security="abc123"
+        m = re.search(r"var\s+security\s*=\s*['\"]([a-f0-9]{10})['\"]", script.string)
+        if m:
+            nonce = m.group(1)
+            log_message(f"Found generic nonce: {nonce}")
+            return nonce
+
+        # Case 3: Look for wp_localize_script or JSON blocks
+        m = re.search(r'"_nonce"\s*:\s*"([a-f0-9]{10})"', script.string)
+        if m:
+            nonce = m.group(1)
+            log_message(f"Found _nonce key: {nonce}")
+            return nonce
+
+    # Fallback search anywhere in page source
+    html = soup.get_text(" ")
+    m = re.search(r'["\']([a-f0-9]{10})["\']', html)
+    if m:
+        nonce = m.group(1)
+        log_message(f"Fallback nonce found: {nonce}")
+        return nonce
+
+    log_message("✗ No valid security nonce found in scripts")
     return None
 
 def fetch_csv_data(csv_url: str, session: requests.Session) -> List[Dict]:

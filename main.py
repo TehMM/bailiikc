@@ -90,10 +90,39 @@ def cloak_url(url):
         return f"http://anon.to/?{url}"
     return url
 
-def extract_security_nonce(soup):
+def extract_security_nonce(soup, page_html):
     """Extract the WordPress security nonce from the page."""
     scripts = soup.find_all("script")
     
+    # First, look for the specific nonce variable used for file downloads
+    for script in scripts:
+        if script.string and "dl_bfile" in script.string:
+            log_message(f"  Found script containing 'dl_bfile'")
+            # Look for the nonce in this specific context
+            matches = re.findall(r'security["\s:=]+(["\']?)([a-f0-9]{10})(["\']?)', script.string, re.IGNORECASE)
+            if matches:
+                log_message(f"  Found nonce in dl_bfile script: {matches[0][1]}")
+                return matches[0][1]
+    
+    # Look for specific variable names that might contain the nonce
+    for script in scripts:
+        if script.string:
+            # Look for common WordPress nonce variable patterns
+            patterns = [
+                r'var\s+box_ajax\s*=\s*\{[^}]*security["\s:]+["\']([a-f0-9]{10})["\']',
+                r'boxAjax\s*=\s*\{[^}]*security["\s:]+["\']([a-f0-9]{10})["\']',
+                r'wp_ajax\s*=\s*\{[^}]*security["\s:]+["\']([a-f0-9]{10})["\']',
+                r'"security"\s*:\s*"([a-f0-9]{10})"',
+            ]
+            
+            for pattern in patterns:
+                matches = re.findall(pattern, script.string, re.IGNORECASE | re.DOTALL)
+                if matches:
+                    log_message(f"  Found nonce with pattern: {pattern[:50]}...")
+                    log_message(f"  Nonce value: {matches[0]}")
+                    return matches[0]
+    
+    # Original patterns as fallback
     for script in scripts:
         if script.string and "security" in script.string.lower():
             # Pattern 1: security: "nonce"
@@ -114,19 +143,25 @@ def extract_security_nonce(soup):
                 log_message(f"  Found nonce (pattern 3): {matches[0]}")
                 return matches[0]
     
-    # Alternative: Look for data attributes on buttons
+    # Look for data attributes on buttons
     buttons = soup.find_all("button", {"data-security": True})
     if buttons:
         nonce = buttons[0].get("data-security")
         log_message(f"  Found nonce in data attribute: {nonce}")
         return nonce
     
-    # Try to find any 10-character hex string
+    # Try to find any 10-character hex string as last resort
     for script in scripts:
         if script.string:
             hex_matches = re.findall(r'\b([a-f0-9]{10})\b', script.string.lower())
             if hex_matches:
                 log_message(f"  Found possible nonce (hex pattern): {hex_matches[0]}")
+                # Save a snippet of surrounding context for debugging
+                for match in hex_matches[:3]:  # Check first 3 matches
+                    idx = script.string.lower().find(match)
+                    if idx > 0:
+                        context = script.string[max(0, idx-50):min(len(script.string), idx+60)]
+                        log_message(f"  Context for {match}: ...{context}...")
                 return hex_matches[0]
     
     return None

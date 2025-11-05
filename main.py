@@ -1,3 +1,8 @@
+"""Comprehensive Cayman judicial PDF scraper and web dashboard."""
+from __future__ import annotations
+
+import csv
+import json
 import os
 import re
 import time
@@ -7,14 +12,32 @@ import requests
 from urllib.parse import urlparse, parse_qs
 from io import StringIO
 from datetime import datetime
+from io import StringIO
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 from zipfile import ZipFile
+
+import requests
 from bs4 import BeautifulSoup
-from flask import Flask, render_template_string, redirect, url_for, send_from_directory, jsonify, make_response, request
+from flask import (
+    Flask,
+    jsonify,
+    make_response,
+    redirect,
+    request,
+    send_from_directory,
+    url_for,
+)
 
-app = Flask(__name__)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+APP = Flask(__name__)
 
-# Config
-DATA_DIR = "./data/pdfs"
+DATA_DIR = Path("./data/pdfs")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 DEFAULT_BASE_URL = "https://judicial.ky/judgments/unreported-judgments/"
 CSV_URL = "https://judicial.ky/wp-content/uploads/box_files/judgments.csv"
 ZIP_NAME = "all_pdfs.zip"
@@ -45,8 +68,14 @@ HEADERS = {
     "Referer": DEFAULT_BASE_URL,
 }
 
-# --- Utility Functions ---
-def log_message(message):
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def log_message(message: str) -> None:
+    """Write a timestamped log line to stdout and the scrape log."""
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{timestamp}] {message}\n"
     print(log_entry.strip())
@@ -114,8 +143,14 @@ def get_box_url(fid, fname, security, session):
             if resp.content[:4] == b'%PDF':
                 return resp.url
         return None
-    except Exception as e:
-        log_message(f"Error calling API: {e}")
+
+    if response.content.startswith(b"%PDF"):
+        return response.url or action_info.fallback_url
+
+    try:
+        payload_json = response.json()
+    except ValueError:
+        log_message("AJAX response was not JSON")
         return None
 
 
@@ -182,17 +217,15 @@ def scrape_pdfs(base_url=None):
     log_message("="*60)
     log_message("Starting new scrape session")
 
-    scraped_ids = load_scraped_urls()
-    log_message(f"Loaded {len(scraped_ids)} previously scraped identifiers")
+    log_message("AJAX payload indicated failure")
+    return None
 
-    if not base_url:
-        base_url = load_base_url()
-    log_message(f"Target URL: {base_url}")
 
     session = requests.Session()
     session.headers.update(HEADERS)
     session.headers["Referer"] = base_url
 
+def download_pdf(session: requests.Session, url: str, destination: Path) -> Tuple[bool, Optional[str]]:
     try:
         r = session.get(base_url, timeout=15)
         r.raise_for_status()
@@ -241,9 +274,59 @@ def scrape_pdfs(base_url=None):
                 log_message(f"[{idx}/{len(new_entries)}] {entry['title']} ({fid})")
                 log_message(f"[{idx}/{len(new_entries)}] {entry['title']} (fid={fid}, fname={safe_name})")
 
-                if os.path.exists(pdf_path):
-                    status = "EXISTING"
-                    log_message(f"✓ Already exists: {pdf_filename}")
+    session = build_session(base_url)
+    scraped_ids = load_scraped_ids()
+    log_message(f"Loaded {len(scraped_ids)} previously downloaded identifiers")
+
+    nonce = discover_security_nonce(session, base_url)
+    if not nonce:
+        log_message("Proceeding without nonce; will rely on fallbacks")
+
+    try:
+        cases = load_cases(session)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log_message(f"Failed to load cases: {exc}")
+        return []
+
+    new_cases = [case for case in cases if case.actions not in scraped_ids]
+    log_message(f"Preparing to download {len(new_cases)} new PDFs")
+
+    results: List[Dict[str, str]] = []
+    for index, case in enumerate(new_cases, start=1):
+        action_info = parse_actions_field(case.actions)
+        if not action_info:
+            log_message("Unable to parse Actions column; skipping entry")
+            continue
+
+        sanitized_name = sanitize_filename(action_info.file_name)
+        filename = f"{sanitized_name}.pdf"
+        file_path = DATA_DIR / filename
+
+        log_message(
+            f"[{index}/{len(new_cases)}] {case.title or 'Untitled case'} "
+            f"(fid={action_info.file_id}, file={filename})"
+        )
+
+        status = "SKIPPED"
+        message = ""
+
+        if file_path.exists():
+            status = "EXISTS"
+            message = "Already downloaded"
+            log_message(f"✓ {filename} already exists")
+        else:
+            download_url = resolve_download_url(session, nonce, action_info)
+            if not download_url:
+                status = "FAILED"
+                message = "No download URL resolved"
+                log_message("✗ Could not resolve download URL")
+            else:
+                success, error = download_pdf(session, download_url, file_path)
+                if success:
+                    status = "DOWNLOADED"
+                    message = f"Saved {filename}"
+                    size_kib = file_path.stat().st_size / 1024
+                    log_message(f"✓ Saved {filename} ({size_kib:.1f} KiB)")
                 else:
                     box_url = get_box_url(fid, fname, security_nonce, session)
                     if not box_url:
@@ -308,26 +391,31 @@ def scrape_pdfs(base_url=None):
         })
     return results
 
-def create_zip():
-    zip_path = os.path.join(DATA_DIR, ZIP_NAME)
-    try:
-        with ZipFile(zip_path, "w") as zipf:
-            count = 0
-            for f in os.listdir(DATA_DIR):
-                if f.endswith(".pdf"):
-                    zipf.write(os.path.join(DATA_DIR, f), f)
-                    count += 1
-        log_message(f"Created ZIP with {count} PDFs")
-    except Exception as e:
-        log_message(f"ZIP creation error: {e}")
+
+# ---------------------------------------------------------------------------
+# ZIP packaging
+# ---------------------------------------------------------------------------
+
+def create_zip_archive() -> Path:
+    zip_path = DATA_DIR / ZIP_NAME
+    with ZipFile(zip_path, "w") as archive:
+        count = 0
+        for file in DATA_DIR.glob("*.pdf"):
+            archive.write(file, file.name)
+            count += 1
+    log_message(f"Created archive with {count} PDFs")
     return zip_path
 
-# --- Flask Routes ---
-@app.route("/")
-def index():
+
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
+
+@APP.route("/")
+def index() -> str:
     current_url = load_base_url()
-    html = f"""
+    return f'''
     <html>
     <head>
-        <title>Cayman Judgments PDF Scraper</title>
+        <title>Cayman Judicial PDF Scraper</title>
         <style>

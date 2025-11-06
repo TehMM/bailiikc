@@ -1,40 +1,31 @@
-"""Flask web application for controlling and monitoring the scraper."""
-from __future__ import annotations
-
-import csv
-import io
 import os
-import time
-from typing import Generator
+import threading
 
 from flask import (
     Flask,
-    Response,
-    jsonify,
-    redirect,
     render_template,
     request,
-    send_file,
+    send_from_directory,
+    redirect,
     url_for,
-    os,
+    flash,
+    jsonify,
 )
 
-from app.scraper import config
-from app.scraper.run import run_scrape
 from app.scraper.utils import (
-    build_zip,
     ensure_dirs,
     list_pdfs,
+    build_zip,
     load_base_url,
-    load_metadata,
-    log_line,
     save_base_url,
+    load_metadata,
 )
+from app.scraper.run import run_scrape
 
-app = Flask(__name__, template_folder="templates", static_folder="static")
-
-# Use env var in production; fallback for dev
+app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+
+ensure_dirs()
 
 # app/main.py (add near top)
 import threading

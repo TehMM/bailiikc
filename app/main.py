@@ -1,5 +1,6 @@
 import os
 import threading
+from typing import Generator
 
 from flask import (
     Flask,

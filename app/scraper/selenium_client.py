@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Optional
+from typing import Any, Iterable, Optional
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -77,6 +77,42 @@ def get_nonce_and_cookies(driver: WebDriver, base_url: str, wait_seconds: int) -
     return nonce, cookies
 
 
+def _iter_potential_urls(data: Any) -> Iterable[str]:
+    """Yield string fragments that might contain a usable URL."""
+
+    if isinstance(data, str):
+        yield data
+        return
+
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, str) and key.lower() in {"fid", "url", "download", "href", "link"}:
+                # Prioritise obvious URL-bearing keys.
+                yield value
+            yield from _iter_potential_urls(value)
+        return
+
+    if isinstance(data, (list, tuple, set)):
+        for item in data:
+            yield from _iter_potential_urls(item)
+
+
+_URL_PATTERN = re.compile(r"https?://[^\s\"']+")
+
+
+def _extract_box_url_from_payload(payload: Any) -> Optional[str]:
+    """Extract a direct download URL from a decoded AJAX payload."""
+
+    for candidate in _iter_potential_urls(payload):
+        candidate = candidate.strip()
+        if candidate.lower().startswith("http"):
+            return candidate.rstrip(",)}]>")
+        match = _URL_PATTERN.search(candidate)
+        if match:
+            return match.group(0).rstrip(",)}]>")
+    return None
+
+
 def selenium_ajax_get_box_url(driver: WebDriver, fid: str, fname: str, nonce: str) -> Optional[str]:
     """Request a Box download URL via the site's AJAX endpoint using Selenium.
 
@@ -120,8 +156,9 @@ def selenium_ajax_get_box_url(driver: WebDriver, fid: str, fname: str, nonce: st
         log_line(f"Failed to decode AJAX response: {raw_response[:120]}")
         return None
 
-    if isinstance(payload, dict) and payload.get("success") and isinstance(payload.get("data"), dict):
-        box_url = payload["data"].get("fid") or payload["data"].get("url")
+    if isinstance(payload, dict) and payload.get("success"):
+        data = payload.get("data")
+        box_url = _extract_box_url_from_payload(data)
         if box_url:
             log_line(f"Received Box URL for fid={fid}")
             return box_url

@@ -1,0 +1,42 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="card">
+    <h2>Start a Scrape</h2>
+    <form method="post" action="{{ url_for('start_scrape') }}" class="form-grid">
+        <label>
+            Base URL
+            <input type="url" name="base_url" value="{{ default_base_url }}" required>
+        </label>
+        <label>
+            Page Wait (seconds)
+            <input type="number" name="page_wait" min="1" value="{{ default_wait }}" required>
+        </label>
+        <label>
+            Entry Cap
+            <input type="number" name="entry_cap" min="1" value="{{ default_cap }}" required>
+        </label>
+        <label>
+            Delay Between Downloads (seconds)
+            <input type="number" step="0.1" name="per_download_delay" min="0" value="{{ default_delay }}" required>
+        </label>
+        <div class="form-actions">
+            <button type="submit" class="primary">Start Scrape</button>
+            <a href="{{ url_for('report') }}" class="button">View Report</a>
+            <a href="{{ url_for('download_all_zip') }}" class="button">Download All as ZIP</a>
+        </div>
+    </form>
+</section>
+
+{% if last_summary %}
+<section class="card">
+    <h2>Last Run Summary</h2>
+    <ul class="summary-list">
+        <li><strong>Processed:</strong> {{ last_summary.processed }}</li>
+        <li><strong>Downloaded:</strong> {{ last_summary.downloaded }}</li>
+        <li><strong>Skipped:</strong> {{ last_summary.skipped }}</li>
+        <li><strong>Failed:</strong> {{ last_summary.failed }}</li>
+    </ul>
+    <a href="{{ url_for('report') }}" class="button">View Detailed Report</a>
+</section>
+{% endif %}
+{% endblock %}

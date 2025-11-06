@@ -1,0 +1,77 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="card">
+    <h2>Scrape Report</h2>
+    <p><strong>Target URL:</strong> <a href="{{ base_url }}" target="_blank" rel="noopener">{{ base_url }}</a></p>
+    <p><strong>CSV Source:</strong> <a href="{{ csv_url }}" target="_blank" rel="noopener">judgments.csv</a></p>
+    <p><strong>Total PDFs:</strong> {{ total_pdfs }} ({{ (total_size / 1024)|round(1) }} KiB)</p>
+    <div class="button-row">
+        <a href="{{ url_for('index') }}" class="button">Home</a>
+        <a href="{{ url_for('download_all_zip') }}" class="button">Download All ZIP</a>
+        <a href="{{ url_for('export_csv') }}" class="button">Export Metadata CSV</a>
+        <a href="{{ url_for('start_scrape') }}" class="button" onclick="event.preventDefault(); document.getElementById('run-again-form').submit();">Run Again</a>
+    </div>
+    {% if last_summary %}
+    <ul class="summary-list">
+        <li><strong>Total CSV Entries:</strong> {{ last_summary.total_cases }}</li>
+        <li><strong>Processed:</strong> {{ last_summary.processed }}</li>
+        <li><strong>Downloaded:</strong> {{ last_summary.downloaded }}</li>
+        <li><strong>Skipped:</strong> {{ last_summary.skipped }}</li>
+        <li><strong>Failed:</strong> {{ last_summary.failed }}</li>
+    </ul>
+    {% endif %}
+    <form id="run-again-form" method="post" action="{{ url_for('start_scrape') }}" hidden>
+        <input type="hidden" name="base_url" value="{{ last_params.base_url | default(base_url) }}">
+        <input type="hidden" name="page_wait" value="{{ last_params.page_wait | default(config.PAGE_WAIT_SECONDS) }}">
+        <input type="hidden" name="entry_cap" value="{{ last_params.entry_cap | default(config.ENTRY_CAP) }}">
+        <input type="hidden" name="per_download_delay" value="{{ last_params.per_download_delay | default(config.PER_DOWNLOAD_DELAY) }}">
+    </form>
+</section>
+
+<section class="card">
+    <h3>Downloaded Files</h3>
+    {% if pdfs %}
+    <div class="table-wrapper">
+        <table>
+            <thead>
+                <tr>
+                    <th>Filename</th>
+                    <th>Size</th>
+                    <th>Timestamp</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for pdf in pdfs %}
+                <tr>
+                    <td class="mono">{{ pdf.name }}</td>
+                    <td>{{ (pdf.size / 1024)|round(1) }} KiB</td>
+                    <td>{{ pdf.timestamp }}</td>
+                    <td><a href="{{ url_for('download_file', filename=pdf.name) }}">Download</a></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p>No PDFs downloaded yet.</p>
+    {% endif %}
+</section>
+
+<section class="card">
+    <h3>Live Logs</h3>
+    <pre id="log-output" class="log-area">{% for line in log_lines %}{{ line }}
+{% endfor %}</pre>
+</section>
+
+<script>
+const logOutput = document.getElementById('log-output');
+if (window.EventSource) {
+    const source = new EventSource('{{ url_for('logs_stream') }}');
+    source.onmessage = function(event) {
+        logOutput.textContent += event.data + "\n";
+        logOutput.scrollTop = logOutput.scrollHeight;
+    };
+}
+</script>
+{% endblock %}

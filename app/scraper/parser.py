@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import html
+import re
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -13,55 +14,70 @@ from . import config
 from .utils import log_line, sanitize_filename
 
 
+_PLAIN_TEXT_FID = re.compile(r"([A-Za-z]{1,6}\d{4,})")
+
+
 def _extract_anchor_data(actions_html: str) -> tuple[str | None, str | None]:
     """Extract fid and fname attributes from an HTML anchor snippet."""
     soup = BeautifulSoup(actions_html, "html5lib")
     anchor = soup.find("a")
-    if not anchor:
-        return None, None
 
-    attr_candidates = [
-        "data-fid",
-        "data-file",
-        "data-id",
-        "data-file-id",
-        "data-dfid",
-    ]
-    fid = None
-    for key in attr_candidates:
-        if anchor.has_attr(key):
-            fid = anchor.get(key)
-            break
+    fid: str | None = None
+    fname: str | None = None
 
-    name_candidates = [
-        "data-fname",
-        "data-name",
-        "data-file-name",
-        "data-filename",
-        "data-title",
-    ]
-    fname = None
-    for key in name_candidates:
-        if anchor.has_attr(key):
-            fname = anchor.get(key)
-            break
-
-    if not fid and anchor.has_attr("href"):
-        query = parse_qs(urlparse(anchor["href"]).query)
-        for key in ["fid", "file", "id"]:
-            if key in query:
-                fid = query[key][0]
+    if anchor:
+        attr_candidates = [
+            "data-fid",
+            "data-file",
+            "data-id",
+            "data-file-id",
+            "data-dfid",
+        ]
+        for key in attr_candidates:
+            if anchor.has_attr(key):
+                fid = anchor.get(key)
                 break
 
-    if not fname:
-        if anchor.has_attr("href"):
+        name_candidates = [
+            "data-fname",
+            "data-name",
+            "data-file-name",
+            "data-filename",
+            "data-title",
+        ]
+        for key in name_candidates:
+            if anchor.has_attr(key):
+                fname = anchor.get(key)
+                break
+
+        if not fid and anchor.has_attr("href"):
+            query = parse_qs(urlparse(anchor["href"]).query)
+            for key in ["fid", "file", "id"]:
+                if key in query:
+                    fid = query[key][0]
+                    break
+
+        if not fname and anchor.has_attr("href"):
             query = parse_qs(urlparse(anchor["href"]).query)
             for key in ["fname", "name", "file"]:
                 if key in query:
                     fname = query[key][0]
                     break
+
         if not fname:
-            fname = anchor.get_text(strip=True)
+            fname = anchor.get_text(strip=True) or None
+
+    # Fallback for cases where the "Actions" column does not contain an anchor
+    text_content = soup.get_text(separator=" ", strip=True)
+    text_content = text_content or actions_html.strip()
+    if text_content:
+        match = _PLAIN_TEXT_FID.search(text_content)
+        if match and not fid:
+            fid = match.group(1)
+        if match:
+            after = text_content[match.end():].strip(" -:_")
+            if after and not fname:
+                fname = after
 
     return (fid or None, fname or None)
 

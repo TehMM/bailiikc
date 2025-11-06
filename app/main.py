@@ -38,13 +38,11 @@ from app.scraper.run import run_scrape
 def scrape():
     def _job():
         try:
-            run_scrape()  # add a filter_pred=... here if you want to limit
+            run_scrape()  # base_url + others default inside run_scrape
         except Exception as e:
-            # Minimal crash log; main logs still go to scrape_log.txt
             print(f"[SCRAPE THREAD ERROR] {e}", flush=True)
 
-    t = threading.Thread(target=_job, daemon=True)
-    t.start()
+    threading.Thread(target=_job, daemon=True).start()
     flash("Scrape started! Check the Report page in a bit.", "info")
     return redirect(url_for("report"))
 

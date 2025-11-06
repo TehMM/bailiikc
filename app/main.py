@@ -32,6 +32,26 @@ from app.scraper.utils import (
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
+# app/main.py (add near top)
+import threading
+from flask import redirect, url_for, flash
+from app.scraper.run import run_scrape
+
+# ...
+
+@app.route("/scrape", methods=["POST", "GET"])
+def scrape():
+    def _job():
+        try:
+            run_scrape()  # add a filter_pred=... here if you want to limit
+        except Exception as e:
+            # Minimal crash log; main logs still go to scrape_log.txt
+            print(f"[SCRAPE THREAD ERROR] {e}", flush=True)
+
+    t = threading.Thread(target=_job, daemon=True)
+    t.start()
+    flash("Scrape started! Check the Report page in a bit.", "info")
+    return redirect(url_for("report"))
 
 @app.context_processor
 def inject_globals() -> dict[str, object]:

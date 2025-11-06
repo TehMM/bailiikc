@@ -226,7 +226,7 @@ def _stream_pdf(api, url: str, out_path: Path) -> None:
 # ---------- Public API ----------
 
 def run_scrape(
-    base_url: str,
+    base_url: str | None = None,
     entry_cap: int | None = None,
     page_wait: int | None = None,
     per_delay: float | None = None,
@@ -234,8 +234,8 @@ def run_scrape(
     """
     Execute a scraping run using Playwright + dl_bfile AJAX.
 
-    This is called by the /scrape route. Signature kept compatible with the
-    previous Selenium-based implementation.
+    Called by the /scrape route. All params optional; sensible defaults
+    pulled from config.
     """
     ensure_dirs()
 
@@ -250,6 +250,8 @@ def run_scrape(
         f"Params: entry_cap={entry_cap} page_wait={page_wait}s "
         f"per_download_delay={per_delay}s"
     )
+
+    # ...leave the rest of the function body exactly as you have it now...
 
     # Load CSV cases (non-criminal only) for metadata & filtering
     cases = load_cases_from_csv(config.CSV_URL)

@@ -127,6 +127,7 @@ def attempt_download_case(
                 "title": case.get("title"),
                 "category": case.get("category"),
                 "judgment_date": case.get("judgment_date"),
+                "source_url": box_url,
                 "size_bytes": out_path.stat().st_size,
             },
         )

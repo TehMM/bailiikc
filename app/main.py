@@ -60,6 +60,7 @@ def _metadata_to_csv(meta: dict) -> str:
         "title",
         "category",
         "judgment_date",
+        "source_url",
         "size_bytes",
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames)

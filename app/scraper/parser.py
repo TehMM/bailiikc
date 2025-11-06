@@ -11,32 +11,64 @@ import requests
 from bs4 import BeautifulSoup
 
 from . import config
-from .utils import log_line, sanitize_filename
+from .utils import ensure_dirs, log_line, sanitize_filename
 
 
 _PLAIN_TEXT_FID = re.compile(r"([A-Za-z]{1,6}\d{4,})")
+_FID_ATTR_PATTERN = re.compile(r"fid[^=]*=[\"']?([A-Za-z0-9._-]+)")
+_FNAME_ATTR_PATTERN = re.compile(r"fname[^=]*=[\"']?([A-Za-z0-9._-]+)")
 
 
 def _extract_anchor_data(actions_html: str) -> tuple[str | None, str | None]:
     """Extract fid and fname attributes from an HTML anchor snippet."""
     soup = BeautifulSoup(actions_html, "html5lib")
-    anchor = soup.find("a")
+    anchors = soup.find_all("a") or [soup.find("a")]
 
-    fid: str | None = None
-    fname: str | None = None
+    best_fid: str | None = None
+    best_fname: str | None = None
 
-    if anchor:
+    def update_best(fid_candidate: str | None, fname_candidate: str | None) -> None:
+        nonlocal best_fid, best_fname
+        if fid_candidate:
+            if not best_fid:
+                best_fid = fid_candidate
+            elif fid_candidate.isdigit() and not (best_fid and best_fid.isdigit()):
+                # Prefer purely numeric identifiers which the AJAX endpoint expects.
+                best_fid = fid_candidate
+        if fname_candidate and not best_fname:
+            best_fname = fname_candidate
+
+    for anchor in filter(None, anchors):
+        fid_candidate: str | None = None
+        fname_candidate: str | None = None
+
         attr_candidates = [
             "data-fid",
             "data-file",
             "data-id",
             "data-file-id",
             "data-dfid",
+            "data-params",
+            "data-options",
+            "data-config",
         ]
         for key in attr_candidates:
             if anchor.has_attr(key):
-                fid = anchor.get(key)
-                break
+                value = anchor.get(key)
+                if not value:
+                    continue
+                value_str = str(value)
+                if key in {"data-params", "data-options", "data-config"}:
+                    match = _FID_ATTR_PATTERN.search(value_str)
+                    if match:
+                        fid_candidate = match.group(1)
+                    match = _FNAME_ATTR_PATTERN.search(value_str)
+                    if match:
+                        fname_candidate = match.group(1)
+                else:
+                    fid_candidate = value_str
+                if fid_candidate:
+                    break
 
         name_candidates = [
             "data-fname",
@@ -47,25 +79,42 @@ def _extract_anchor_data(actions_html: str) -> tuple[str | None, str | None]:
         ]
         for key in name_candidates:
             if anchor.has_attr(key):
-                fname = anchor.get(key)
-                break
+                value = anchor.get(key)
+                if value:
+                    fname_candidate = str(value)
+                if fname_candidate:
+                    break
 
-        if not fid and anchor.has_attr("href"):
-            query = parse_qs(urlparse(anchor["href"]).query)
+        href = anchor.get("href")
+        if href:
+            query = parse_qs(urlparse(href).query)
             for key in ["fid", "file", "id"]:
-                if key in query:
-                    fid = query[key][0]
+                if key in query and not fid_candidate:
+                    fid_candidate = query[key][0]
                     break
-
-        if not fname and anchor.has_attr("href"):
-            query = parse_qs(urlparse(anchor["href"]).query)
             for key in ["fname", "name", "file"]:
-                if key in query:
-                    fname = query[key][0]
+                if key in query and not fname_candidate:
+                    fname_candidate = query[key][0]
                     break
 
-        if not fname:
-            fname = anchor.get_text(strip=True) or None
+        if not fid_candidate or not fname_candidate:
+            anchor_html = str(anchor)
+            if not fid_candidate:
+                match = _FID_ATTR_PATTERN.search(anchor_html)
+                if match:
+                    fid_candidate = match.group(1)
+            if not fname_candidate:
+                match = _FNAME_ATTR_PATTERN.search(anchor_html)
+                if match:
+                    fname_candidate = match.group(1)
+
+        if not fname_candidate:
+            fname_candidate = anchor.get_text(strip=True) or None
+
+        update_best(fid_candidate, fname_candidate)
+
+    fid = best_fid
+    fname = best_fname
 
     # Fallback for cases where the "Actions" column does not contain an anchor
     text_content = soup.get_text(separator=" ", strip=True)
@@ -91,6 +140,7 @@ def load_cases_from_csv(csv_url: str = config.CSV_URL) -> list[dict[str, Any]]:
     Returns:
         A list of dictionaries describing each non-criminal case.
     """
+    ensure_dirs()
     log_line(f"Downloading CSV from {csv_url}")
     try:
         response = requests.get(csv_url, headers=config.COMMON_HEADERS, timeout=60)

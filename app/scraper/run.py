@@ -86,54 +86,53 @@ def _load_all_results(page, max_loadmore: int) -> None:
 
 def _collect_buttons(page) -> List[Tuple[str, str, str]]:
     """
-    Collect (fid, fname, security) from rendered download controls.
+    Collect (fid, fname, security) triples from any elements that look like
+    the live "Download" controls.
 
-    We only keep entries with:
-      - numeric fid (the Box file id used by dl_bfile)
-      - a fname
-      - a usable security nonce (data-s or fallback)
+    We intentionally:
+      * DO NOT hard-fail if a specific selector isn't found.
+      * Accept any element with data-fid, and then read data-fname / data-s.
     """
-    selectors = [
-        "[data-fid][data-fname][data-s]",
-        "[data-fid][data-fname]",
-        "button[data-fid], a[data-fid]",
-    ]
 
+    # Give the JS app a moment to render after all our scrolling / load-more
     try:
-        page.wait_for_selector(
-            selectors[0] + "," + selectors[1] + "," + selectors[2],
-            timeout=25000,
-        )
-    except PWTimeout:
-        log_line("Timed out waiting for download buttons")
+        page.wait_for_timeout(3000)
+    except Exception:
+        pass
+
+    # Grab every element that advertises a fid; this is the most stable hook
+    elements = page.query_selector_all("[data-fid]")
+    log_line(f"Found {len(elements)} raw [data-fid] elements on page")
+
+    if not elements:
+        # Nothing matched at all; let the caller log a friendly message.
         return []
 
-    elements = []
-    for sel in selectors:
-        try:
-            elements.extend(page.query_selector_all(sel))
-        except Exception:
-            continue
-
-    # Try to find a global nonce as fallback
+    # Try to discover a reusable nonce as fallback
     nonce_fallback = None
+
+    # 1) Check any element with data-s
     for n in page.query_selector_all("[data-s]"):
-        val = n.get_attribute("data-s")
+        val = (n.get_attribute("data-s") or "").strip()
         if val and re.fullmatch(r"[A-Za-z0-9]+", val):
             nonce_fallback = val
             break
 
+    # 2) Fallback: look inside inline scripts for dl_bfile / security token
     if not nonce_fallback:
         for s in page.query_selector_all("script"):
             txt = s.text_content() or ""
             m = re.search(
-                r"dl_bfile.*?security[^A-Za-z0-9]+([A-Za-z0-9]{6,})",
+                r"dl_bfile[^A-Za-z0-9]+security[^A-Za-z0-9]+([A-Za-z0-9]{6,})",
                 txt,
-                flags=re.S,
+                flags=re.S | re.I,
             )
             if m:
                 nonce_fallback = m.group(1)
                 break
+
+    if nonce_fallback:
+        log_line(f"Using fallback nonce candidate: {nonce_fallback}")
 
     seen = set()
     out: List[Tuple[str, str, str]] = []
@@ -143,10 +142,20 @@ def _collect_buttons(page) -> List[Tuple[str, str, str]]:
         fname = (el.get_attribute("data-fname") or "").strip()
         sec = (el.get_attribute("data-s") or "" or nonce_fallback or "").strip()
 
-        if not fid or not fname or not sec:
+        # Must have a fid and some security token to try dl_bfile
+        if not fid or not sec:
             continue
 
-        # Only trust numeric fids – matches live ajax payloads
+        # Prefer fname from attribute; if missing, derive something minimal
+        if not fname:
+            # some implementations embed fname in data attributes or text; keep this cheap
+            txt = (el.text_content() or "").strip().replace(" ", "")
+            if txt:
+                fname = txt
+        if not fname:
+            continue
+
+        # Protect against old-style non-numeric IDs (we only want new AJAX ones)
         if not re.fullmatch(r"\d{5,}", fid):
             continue
 
@@ -157,9 +166,8 @@ def _collect_buttons(page) -> List[Tuple[str, str, str]]:
 
         out.append((fid, fname, sec))
 
-    log_line(f"Collected {len(out)} candidate download buttons from page")
+    log_line(f"Collected {len(out)} candidate download buttons after filtering")
     return out
-
 
 def _fetch_box_url(api, fid: str, fname: str, security: str, referer: str) -> str:
     """Call the same dl_bfile AJAX endpoint the site uses to get a Box URL."""

@@ -5,9 +5,10 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict
+from urllib.parse import urljoin
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 from . import config
 from .parser import load_cases_from_csv
@@ -31,143 +32,22 @@ UA = (
 
 # ---------- Playwright helpers ----------
 
-def _load_all_results(page, max_loadmore: int) -> None:
-    """Click 'Load more' and scroll to reveal as many rows as possible."""
-    page.wait_for_load_state("networkidle")
-
-    selectors = [
-        "button.pt-cv-loadmore",
-        ".pt-cv-loadmore button",
-        ".pt-cv-loadmore a",
-        "button:has-text('Load more')",
-        "button:has-text('Load More')",
-    ]
-
-    clicks = 0
-    while clicks < max_loadmore:
-        found = None
-        for sel in selectors:
-            try:
-                loc = page.locator(sel)
-                if loc.count() and loc.first.is_visible():
-                    found = loc.first
-                    break
-            except Exception:
-                continue
-
-        if not found:
-            break
-
-        try:
-            found.click()
-            clicks += 1
-            log_line(f"Clicked 'Load more' ({clicks})")
-            page.wait_for_load_state("networkidle")
-            time.sleep(0.4)
-        except Exception as exc:  # noqa: BLE001
-            log_line(f"'Load more' click failed: {exc}")
-            break
-
-    # Infinite scroll safety: nudge a few times
-    last_h = 0
-    for _ in range(20):
-        try:
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(0.4)
-            page.wait_for_load_state("networkidle")
-            h = page.evaluate("document.body.scrollHeight")
-        except Exception:
-            break
-
-        if h == last_h:
-            break
-        last_h = h
+_NONCE_PATTERNS = [
+    re.compile(r"['\"](?:_?nonce|security)['\"]\s*[:=]\s*['\"]([A-Za-z0-9]{8,})['\"]"),
+    re.compile(r"dl_bfile[^A-Za-z0-9]+['\"]([A-Za-z0-9]{8,})['\"]", re.I),
+]
 
 
-def _collect_buttons(page) -> List[Tuple[str, str, str]]:
-    """
-    Collect (fid, fname, security) triples from any elements that look like
-    the live "Download" controls.
+def _extract_nonce(page_html: str) -> str:
+    """Attempt to locate the AJAX security nonce within rendered HTML."""
 
-    We intentionally:
-      * DO NOT hard-fail if a specific selector isn't found.
-      * Accept any element with data-fid, and then read data-fname / data-s.
-    """
+    for pattern in _NONCE_PATTERNS:
+        match = pattern.search(page_html)
+        if match:
+            return match.group(1)
 
-    # Give the JS app a moment to render after all our scrolling / load-more
-    try:
-        page.wait_for_timeout(3000)
-    except Exception:
-        pass
+    raise RuntimeError("Failed to locate AJAX security nonce on the page")
 
-    # Grab every element that advertises a fid; this is the most stable hook
-    elements = page.query_selector_all("[data-fid]")
-    log_line(f"Found {len(elements)} raw [data-fid] elements on page")
-
-    if not elements:
-        # Nothing matched at all; let the caller log a friendly message.
-        return []
-
-    # Try to discover a reusable nonce as fallback
-    nonce_fallback = None
-
-    # 1) Check any element with data-s
-    for n in page.query_selector_all("[data-s]"):
-        val = (n.get_attribute("data-s") or "").strip()
-        if val and re.fullmatch(r"[A-Za-z0-9]+", val):
-            nonce_fallback = val
-            break
-
-    # 2) Fallback: look inside inline scripts for dl_bfile / security token
-    if not nonce_fallback:
-        for s in page.query_selector_all("script"):
-            txt = s.text_content() or ""
-            m = re.search(
-                r"dl_bfile[^A-Za-z0-9]+security[^A-Za-z0-9]+([A-Za-z0-9]{6,})",
-                txt,
-                flags=re.S | re.I,
-            )
-            if m:
-                nonce_fallback = m.group(1)
-                break
-
-    if nonce_fallback:
-        log_line(f"Using fallback nonce candidate: {nonce_fallback}")
-
-    seen = set()
-    out: List[Tuple[str, str, str]] = []
-
-    for el in elements:
-        fid = (el.get_attribute("data-fid") or "").strip()
-        fname = (el.get_attribute("data-fname") or "").strip()
-        sec = (el.get_attribute("data-s") or "" or nonce_fallback or "").strip()
-
-        # Must have a fid and some security token to try dl_bfile
-        if not fid or not sec:
-            continue
-
-        # Prefer fname from attribute; if missing, derive something minimal
-        if not fname:
-            # some implementations embed fname in data attributes or text; keep this cheap
-            txt = (el.text_content() or "").strip().replace(" ", "")
-            if txt:
-                fname = txt
-        if not fname:
-            continue
-
-        # Protect against old-style non-numeric IDs (we only want new AJAX ones)
-        if not re.fullmatch(r"\d{5,}", fid):
-            continue
-
-        key = fid + "|" + fname
-        if key in seen:
-            continue
-        seen.add(key)
-
-        out.append((fid, fname, sec))
-
-    log_line(f"Collected {len(out)} candidate download buttons after filtering")
-    return out
 
 def _fetch_box_url(api, fid: str, fname: str, security: str, referer: str) -> str:
     """Call the same dl_bfile AJAX endpoint the site uses to get a Box URL."""
@@ -259,19 +139,9 @@ def run_scrape(
         f"per_download_delay={per_delay}s"
     )
 
-    # ...leave the rest of the function body exactly as you have it now...
-
     # Load CSV cases (non-criminal only) for metadata & filtering
     cases = load_cases_from_csv(config.CSV_URL)
     meta = load_metadata()
-
-    # Index by sanitized fname so we can join DOM buttons ↔ CSV rows
-    cases_by_fname: Dict[str, Dict[str, Any]] = {}
-    for c in cases:
-        fname = c.get("fname")
-        if not fname:
-            continue
-        cases_by_fname[fname] = c
 
     summary: Dict[str, Any] = {
         "base_url": base_url,
@@ -280,6 +150,7 @@ def run_scrape(
         "failed": 0,
         "skipped": 0,
         "total_cases": len(cases),
+        "error": None,
     }
 
     if not cases:
@@ -289,94 +160,113 @@ def run_scrape(
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         context = browser.new_context(user_agent=UA, locale="en-US")
-        page = context.new_page()
 
-        log_line("Opening judgments page in Playwright...")
-        page.goto(base_url, wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle")
-        if page_wait:
-            page.wait_for_timeout(page_wait * 1000)
+        try:
+            page = context.new_page()
 
-        # Reveal as many entries as possible
-        _load_all_results(page, max_loadmore=200)
+            log_line("Opening judgments page in Playwright...")
+            page.goto(base_url, wait_until="domcontentloaded")
+            page.wait_for_load_state("networkidle")
+            if page_wait:
+                page.wait_for_timeout(page_wait * 1000)
 
-        buttons = _collect_buttons(page)
-        if not buttons:
-            log_line("No valid download buttons discovered on page.")
-            browser.close()
-            return summary
-
-        api = context.request
-
-        for fid, raw_fname, sec in buttons:
-            if summary["processed"] >= entry_cap:
-                break
-
-            # The site's fname is already a clean key; normalise via sanitize
-            sanitized = sanitize_filename(raw_fname)
-            filename = (
-                sanitized if sanitized.lower().endswith(".pdf") else f"{sanitized}.pdf"
-            )
-            out_path = config.PDF_DIR / filename
-
-            # Only keep entries that exist in the non-criminal CSV
-            case = cases_by_fname.get(sanitized) or cases_by_fname.get(raw_fname)
-            if not case:
-                log_line(
-                    f"Skipping fid={fid} fname={raw_fname} "
-                    f"(not found in non-criminal CSV)"
-                )
-                summary["skipped"] += 1
-                continue
-
-            summary["processed"] += 1
-
-            if out_path.exists() or is_duplicate(fid, filename, meta):
-                log_line(
-                    f"Skipping fid={fid} ({filename}) – already downloaded/recorded"
-                )
-                summary["skipped"] += 1
-                continue
-
+            page_html = page.content()
             try:
-                log_line(
-                    f"Requesting Box URL for fid={fid} fname={raw_fname} via dl_bfile"
-                )
-                box_url = _fetch_box_url(api, fid, raw_fname, sec, referer=base_url)
-
-                log_line(f"Streaming PDF from {box_url}")
-                _stream_pdf(api, box_url, out_path)
-
-                size_bytes = out_path.stat().st_size
-
-                record_result(
-                    meta,
-                    fid=fid,
-                    filename=filename,
-                    fields={
-                        "title": case.get("title"),
-                        "category": case.get("category"),
-                        "judgment_date": case.get("judgment_date"),
-                        "source_url": box_url,
-                        "size_bytes": size_bytes,
-                    },
-                )
-
-                log_line(
-                    f"Saved {filename} ({size_bytes / 1024:.1f} KiB) "
-                    f"for case '{case.get('title', '').strip()}'"
-                )
-                summary["downloaded"] += 1
-
+                nonce = _extract_nonce(page_html)
             except Exception as exc:  # noqa: BLE001
-                log_line(f"Failed fid={fid} ({raw_fname}): {exc}")
-                if out_path.exists():
-                    out_path.unlink(missing_ok=True)
-                summary["failed"] += 1
+                log_line(f"Failed to extract AJAX nonce: {exc}")
+                summary["error"] = f"nonce_error: {exc}"
+                log_line("Aborting scrape due to nonce extraction failure")
+                return summary
 
-            time.sleep(per_delay)
+            log_line(f"Using AJAX security nonce: {nonce}")
 
-        browser.close()
+            api = context.request
+
+            for case in cases:
+                if summary["processed"] >= entry_cap:
+                    break
+
+                fid = case.get("fid")
+                fname = case.get("fname") or fid
+                if not fid or not fname:
+                    log_line(
+                        "Skipping case with missing fid/fname: "
+                        f"{case.get('title', 'Untitled')}"
+                    )
+                    summary["skipped"] += 1
+                    continue
+
+                sanitized = sanitize_filename(fname)
+                filename = (
+                    sanitized if sanitized.lower().endswith(".pdf") else f"{sanitized}.pdf"
+                )
+                out_path = config.PDF_DIR / filename
+
+                if out_path.exists() or is_duplicate(fid, filename, meta):
+                    log_line(f"Skipping {fid} ({filename}) – already downloaded/recorded")
+                    summary["skipped"] += 1
+                    continue
+
+                summary["processed"] += 1
+
+                box_url = None
+
+                try:
+                    log_line(
+                        f"Requesting Box URL for fid={fid} fname={fname} via dl_bfile"
+                    )
+                    box_url = _fetch_box_url(api, fid, fname, nonce, referer=base_url)
+                except Exception as exc:  # noqa: BLE001
+                    log_line(f"AJAX lookup failed for fid={fid}: {exc}")
+
+                if not box_url:
+                    fallback_url = (
+                        f"https://judicial.ky/wp-content/uploads/box_files/{fid}.pdf"
+                    )
+                    log_line(f"Falling back to direct URL {fallback_url}")
+                    box_url = fallback_url
+
+                if not box_url.lower().startswith("http"):
+                    box_url = urljoin(base_url, box_url)
+
+                try:
+                    log_line(f"Streaming PDF from {box_url}")
+                    _stream_pdf(api, box_url, out_path)
+
+                    size_bytes = out_path.stat().st_size
+
+                    record_result(
+                        meta,
+                        fid=fid,
+                        filename=filename,
+                        fields={
+                            "title": case.get("title"),
+                            "category": case.get("category"),
+                            "judgment_date": case.get("judgment_date"),
+                            "source_url": box_url,
+                            "size_bytes": size_bytes,
+                        },
+                    )
+
+                    log_line(
+                        f"Saved {filename} ({size_bytes / 1024:.1f} KiB) "
+                        f"for case '{case.get('title', '').strip()}'"
+                    )
+                    summary["downloaded"] += 1
+
+                except Exception as exc:  # noqa: BLE001
+                    log_line(f"Failed fid={fid} ({filename}): {exc}")
+                    if out_path.exists():
+                        out_path.unlink(missing_ok=True)
+                    summary["failed"] += 1
+
+                time.sleep(per_delay)
+        finally:
+            try:
+                context.close()
+            finally:
+                browser.close()
 
     log_line(
         "Completed run: "

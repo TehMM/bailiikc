@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from app.main import app
-from scraper.utils import ensure_dirs
+from app.scraper.utils import ensure_dirs
 
 
 if __name__ == "__main__":

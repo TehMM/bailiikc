@@ -16,6 +16,7 @@ from flask import (
     request,
     send_file,
     url_for,
+    os,
 )
 
 from app.scraper import config
@@ -31,6 +32,9 @@ from app.scraper.utils import (
 )
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
+
+# Use env var in production; fallback for dev
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 # app/main.py (add near top)
 import threading

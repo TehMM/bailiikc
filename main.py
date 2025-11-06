@@ -270,8 +270,9 @@ def main():
         browser.close()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        log("Interrupted by user")
-        sys.exit(130)
+    from app.scraper.utils import ensure_dirs
+    import os
+
+    ensure_dirs()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)

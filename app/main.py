@@ -1,51 +1,38 @@
+import csv
+import io
 import os
 import threading
+import time
 from typing import Generator
 
 from flask import (
     Flask,
-    render_template,
-    request,
-    send_from_directory,
-    redirect,
-    url_for,
+    Response,
     flash,
     jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    url_for,
 )
 
+from app.scraper import config
+from app.scraper.run import run_scrape
 from app.scraper.utils import (
+    build_zip,
     ensure_dirs,
     list_pdfs,
-    build_zip,
     load_base_url,
-    save_base_url,
     load_metadata,
+    log_line,
+    save_base_url,
 )
-from app.scraper.run import run_scrape
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 ensure_dirs()
-
-# app/main.py (add near top)
-import threading
-from flask import redirect, url_for, flash
-from app.scraper.run import run_scrape
-
-# ...
-
-@app.route("/scrape", methods=["POST", "GET"])
-def scrape():
-    def _job():
-        try:
-            run_scrape()  # base_url + others default inside run_scrape
-        except Exception as e:
-            print(f"[SCRAPE THREAD ERROR] {e}", flush=True)
-
-    threading.Thread(target=_job, daemon=True).start()
-    flash("Scrape started! Check the Report page in a bit.", "info")
-    return redirect(url_for("report"))
 
 @app.context_processor
 def inject_globals() -> dict[str, object]:
@@ -130,9 +117,23 @@ def start_scrape() -> Response:
         "entry_cap": entry_cap,
         "per_download_delay": per_delay,
     }
-    log_line("Initiating scrape via web UI")
-    summary = run_scrape(base_url=base_url, entry_cap=entry_cap, page_wait=page_wait, per_delay=per_delay)
-    app.config["LAST_SUMMARY"] = summary
+
+    def _run() -> None:
+        with app.app_context():
+            try:
+                log_line("Initiating scrape via web UI")
+                summary = run_scrape(
+                    base_url=base_url,
+                    entry_cap=entry_cap,
+                    page_wait=page_wait,
+                    per_delay=per_delay,
+                )
+                app.config["LAST_SUMMARY"] = summary
+            except Exception as exc:  # noqa: BLE001
+                log_line(f"Scrape thread failed: {exc}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    flash("Scrape started! Check the Report page in a bit.", "info")
     return redirect(url_for("report"))
 
 

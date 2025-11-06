@@ -18,9 +18,9 @@ from flask import (
     url_for,
 )
 
-from scraper import config
-from scraper.run import run_scrape
-from scraper.utils import (
+from app.scraper import config
+from app.scraper.run import run_scrape
+from app.scraper.utils import (
     build_zip,
     ensure_dirs,
     list_pdfs,

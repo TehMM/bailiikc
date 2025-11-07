@@ -33,7 +33,53 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 ensure_dirs()
-   
+
+# app/main.py
+
+import os
+import threading
+from typing import Generator
+
+from flask import (
+    Flask,
+    render_template,
+    request,
+    send_from_directory,
+    redirect,
+    url_for,
+    flash,
+    jsonify,
+)
+
+from app.scraper import config as scraper_config
+from app.scraper.utils import (
+    ensure_dirs,
+    list_pdfs,
+    build_zip,
+    load_base_url,
+    save_base_url,
+    load_metadata,
+)
+from app.scraper.run import run_scrape
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+ensure_dirs()
+
+# ... existing routes ...
+
+
+@app.route("/debug/unreported_judgments.png")
+def debug_unreported_png():
+    """
+    Serve the headless screenshot so we can see what Playwright rendered.
+    """
+    return send_from_directory(
+        scraper_config.PDF_DIR,
+        "unreported_judgments.png",
+        mimetype="image/png",
+    )
+
 @app.context_processor
 def inject_globals() -> dict[str, object]:
     """Inject global configuration into all template contexts."""

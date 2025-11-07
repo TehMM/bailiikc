@@ -21,9 +21,13 @@ This is wired to /scrape via run_scrape().
 
 from __future__ import annotations
 
+import re
 import time
 import urllib.parse
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
+
+import requests
 
 from playwright.sync_api import (
     Browser,
@@ -37,14 +41,17 @@ from playwright.sync_api import (
 )
 
 from . import config
-from .parser import load_cases_from_csv
+from .cases_index import (
+    CASES_BY_ACTION,
+    find_case_by_fname,
+    load_cases_from_csv as load_cases_index,
+)
 from .utils import (
     ensure_dirs,
     is_duplicate,
     load_metadata,
     log_line,
     record_result,
-    sanitize_filename,
 )
 
 ADMIN_AJAX = "https://judicial.ky/wp-admin/admin-ajax.php"
@@ -166,6 +173,191 @@ def _extract_box_url(data: Dict[str, Any]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Download + AJAX helpers
+# ---------------------------------------------------------------------------
+
+def queue_or_download_file(
+    url: str,
+    dest_path: Path,
+    *,
+    http_client: Optional[Any] = None,
+    max_retries: int = 3,
+    timeout: int = 120,
+) -> tuple[bool, Optional[str]]:
+    """Download ``url`` to ``dest_path`` with retries and validation."""
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    last_error: Optional[str] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            if http_client is not None:
+                response = http_client(url, timeout=timeout)
+                status = getattr(response, "status", None)
+                if status is None:
+                    status = getattr(response, "status_code", None)
+                if status is not None and int(status) >= 400:
+                    raise RuntimeError(f"HTTP {status}")
+
+                body = response.body() if hasattr(response, "body") else response.content
+                if isinstance(body, str):
+                    body_bytes = body.encode("utf-8")
+                elif isinstance(body, (bytes, bytearray)):
+                    body_bytes = bytes(body)
+                else:
+                    body_bytes = bytes(body)
+
+                if not body_bytes.startswith(b"%PDF"):
+                    raise RuntimeError("Response is not a PDF")
+
+                dest_path.write_bytes(body_bytes)
+                return True, None
+
+            with requests.get(url, stream=True, timeout=timeout) as resp:
+                resp.raise_for_status()
+                with dest_path.open("wb") as handle:
+                    first_chunk = True
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        if first_chunk:
+                            if not chunk.startswith(b"%PDF"):
+                                raise RuntimeError("Response is not a PDF")
+                            first_chunk = False
+                        handle.write(chunk)
+
+            if dest_path.stat().st_size <= 0:
+                raise RuntimeError("Empty download")
+
+            return True, None
+
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            log_line(
+                f"[AJAX] Download attempt {attempt} for {url} failed: {exc}"
+            )
+            dest_path.unlink(missing_ok=True)
+            time.sleep(min(2 ** attempt, 5))
+
+    return False, last_error
+
+
+def handle_dl_bfile_from_ajax(
+    post_body: str,
+    payload: Any,
+    downloads_dir: Path,
+    *,
+    meta: Optional[Dict[str, Any]] = None,
+    seen: Optional[Set[str]] = None,
+    http_client: Optional[Any] = None,
+) -> str:
+    """Process a dl_bfile AJAX response and download the corresponding PDF."""
+
+    params = {k: v for k, v in urllib.parse.parse_qsl(post_body or "", keep_blank_values=True)}
+    fname = (params.get("fname") or "").strip()
+    fid_param = (params.get("fid") or "").strip()
+
+    if not fname:
+        log_line(f"[AJAX] dl_bfile without fname; params={params!r}")
+        return "ignored"
+
+    if seen is not None and fname in seen:
+        log_line(f"[AJAX] fname {fname} already processed this run.")
+        return "duplicate"
+
+    if not isinstance(payload, dict):
+        log_line(
+            f"[AJAX] dl_bfile payload is not a dict for fname={fname}: {payload!r}"
+        )
+        if seen is not None:
+            seen.add(fname)
+        return "failed"
+
+    if payload in (-1, "-1") or not payload.get("success"):
+        log_line(f"[AJAX] dl_bfile failure for fname={fname}: {payload!r}")
+        if seen is not None:
+            seen.add(fname)
+        return "failed"
+
+    data = payload.get("data") or {}
+    box_url = _extract_box_url(data)
+    if not box_url:
+        log_line(
+            f"[AJAX] Could not find Box URL in payload for fname={fname}: {data!r}"
+        )
+        if seen is not None:
+            seen.add(fname)
+        return "failed"
+
+    case = find_case_by_fname(fname)
+    if not case:
+        log_line(f"[AJAX] fname not found in CSV: {fname}; skipping.")
+        if seen is not None:
+            seen.add(fname)
+        return "unknown"
+
+    if case.code and case.title:
+        base_name = f"{case.code} - {case.title}"
+    elif case.action and case.title:
+        base_name = f"{case.action} - {case.title}"
+    else:
+        base_name = case.action or fname
+
+    safe_title = re.sub(r"[^\w\s\-\.,()]+", "_", base_name).strip(" _") or case.action or fname
+    filename = safe_title if safe_title.lower().endswith(".pdf") else f"{safe_title}.pdf"
+    dest_path = Path(downloads_dir) / filename
+
+    if dest_path.exists():
+        log_line(f"[AJAX] Already have {filename}; skipping download.")
+        if seen is not None:
+            seen.add(fname)
+        return "duplicate"
+
+    if meta is not None and is_duplicate(fid_param or fname, filename, meta):
+        log_line(f"[AJAX] Metadata already records {filename}; skipping download.")
+        if seen is not None:
+            seen.add(fname)
+        return "duplicate"
+
+    success, error = queue_or_download_file(
+        box_url,
+        dest_path,
+        http_client=http_client,
+    )
+    if not success:
+        log_line(f"[AJAX] Failed to save {fname} to {dest_path}: {error}")
+        if seen is not None:
+            seen.add(fname)
+        dest_path.unlink(missing_ok=True)
+        return "failed"
+
+    size_bytes = dest_path.stat().st_size
+    log_line(
+        f"[AJAX] Saved {fname} -> {dest_path} ({size_bytes/1024:.1f} KiB)"
+    )
+
+    if meta is not None:
+        record_result(
+            meta,
+            fid=fid_param or fname,
+            filename=dest_path.name,
+            fields={
+                "title": case.title,
+                "category": case.extra.get("Category", ""),
+                "judgment_date": case.extra.get("Judgment Date")
+                or case.extra.get("Date", ""),
+                "source_url": box_url,
+                "size_bytes": size_bytes,
+            },
+        )
+
+    if seen is not None:
+        seen.add(fname)
+
+    return "downloaded"
+
+
+# ---------------------------------------------------------------------------
 # Main entrypoint
 # ---------------------------------------------------------------------------
 
@@ -192,15 +384,9 @@ def run_scrape(
         f"per_download_delay={per_delay}"
     )
 
-    # Load CSV (non-criminal only)
-    cases = load_cases_from_csv(config.CSV_URL)
+    # Load case index from CSV once per run
+    load_cases_index("data/judgments.csv")
     meta = load_metadata()
-
-    cases_by_fname: Dict[str, Dict[str, Any]] = {
-        str(c.get("fname")).strip(): c
-        for c in cases
-        if c.get("fname")
-    }
 
     summary: Dict[str, Any] = {
         "base_url": base_url,
@@ -208,11 +394,11 @@ def run_scrape(
         "downloaded": 0,
         "failed": 0,
         "skipped": 0,
-        "total_cases": len(cases),
+        "total_cases": len(CASES_BY_ACTION),
     }
 
-    if not cases:
-        log_line("No non-criminal cases loaded from CSV; aborting.")
+    if not CASES_BY_ACTION:
+        log_line("No cases loaded from judgments CSV; aborting.")
         return summary
 
     seen_fnames_in_run: Set[str] = set()
@@ -283,116 +469,37 @@ def run_scrape(
                     # Other admin-ajax actions are noise for us
                     return
 
-                # Some implementations may omit fname; if so, try to recover later.
-                if not fname_param:
-                    log_line("[AJAX] dl_bfile without fname; skipping.")
-                    return
-
-                if fname_param in seen_fnames_in_run:
-                    log_line(
-                        f"[AJAX] fname {fname_param} already processed this run."
-                    )
-                    return
-
-                # Parse JSON payload
+                payload: Any
                 try:
                     payload = resp.json()
                 except Exception as exc:
                     log_line(f"[AJAX] dl_bfile non-JSON response: {exc}")
-                    return
+                    payload = None
 
                 log_line(f"[AJAX] dl_bfile payload={payload!r}")
 
-                if (
-                    payload in (-1, "-1")
-                    or not isinstance(payload, dict)
-                    or not payload.get("success")
-                ):
-                    log_line(
-                        f"[AJAX] dl_bfile failure for fname={fname_param}: {payload}"
+                http_fetcher = (
+                    lambda download_url, timeout=120: context.request.get(
+                        download_url,
+                        timeout=timeout * 1000,
                     )
-                    return
-
-                data = payload.get("data") or {}
-                box_url = _extract_box_url(data)
-                if not box_url:
-                    log_line(
-                        f"[AJAX] Could not find Box URL in payload for "
-                        f"fname={fname_param}: {data!r}"
-                    )
-                    return
-
-                # Map fname -> CSV row
-                case = (
-                    cases_by_fname.get(fname_param)
-                    or cases_by_fname.get(sanitize_filename(fname_param))
                 )
-                if not case:
-                    log_line(
-                        f"[AJAX] fname not found in CSV: {fname_param}; skipping."
-                    )
-                    return
 
-                safe_root = sanitize_filename(fname_param)
-                safe_name = (
-                    safe_root
-                    if safe_root.lower().endswith(".pdf")
-                    else f"{safe_root}.pdf"
+                result = handle_dl_bfile_from_ajax(
+                    post_body=body,
+                    payload=payload,
+                    downloads_dir=config.PDF_DIR,
+                    meta=meta,
+                    seen=seen_fnames_in_run,
+                    http_client=http_fetcher,
                 )
-                out_path = config.PDF_DIR / safe_name
 
-                if out_path.exists() or is_duplicate(fid_param, safe_name, meta):
-                    log_line(
-                        f"[AJAX] Already have {safe_name}; skipping download."
-                    )
-                    seen_fnames_in_run.add(fname_param)
-                    summary["skipped"] += 1
-                    return
-
-                # Download PDF
-                try:
-                    log_line(
-                        f"[AJAX] Streaming PDF for {fname_param} from {box_url}"
-                    )
-                    r = context.request.get(box_url, timeout=120_000)
-                    if r.status not in (200, 206):
-                        raise RuntimeError(f"Download HTTP {r.status}")
-
-                    body_bytes = r.body()
-                    if not body_bytes.startswith(b"%PDF"):
-                        raise RuntimeError("Response is not a PDF")
-
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    out_path.write_bytes(body_bytes)
-                    size_bytes = out_path.stat().st_size
-
-                    record_result(
-                        meta,
-                        fid=fid_param or fname_param,
-                        filename=safe_name,
-                        fields={
-                            "title": case.get("title"),
-                            "category": case.get("category"),
-                            "judgment_date": case.get("judgment_date"),
-                            "source_url": box_url,
-                            "size_bytes": size_bytes,
-                        },
-                    )
-
-                    log_line(
-                        f"[AJAX] Saved {safe_name} ({size_bytes/1024:.1f} KiB) "
-                        f"for case '{(case.get('title') or '').strip()}'"
-                    )
-                    seen_fnames_in_run.add(fname_param)
+                if result == "downloaded":
                     summary["downloaded"] += 1
-
-                except Exception as exc:
-                    log_line(
-                        f"[AJAX] Failed to save PDF for {fname_param}: {exc}"
-                    )
-                    if out_path.exists():
-                        out_path.unlink(missing_ok=True)
+                elif result == "failed":
                     summary["failed"] += 1
+                elif result in {"duplicate", "unknown", "ignored"}:
+                    summary["skipped"] += 1
 
             except Exception as exc:
                 # Catch any bug in our handler so it never kills Playwright
@@ -491,4 +598,66 @@ def run_scrape(
     return summary
 
 
+
+
+if __name__ == "__main__":  # pragma: no cover - quick manual verification
+    from tempfile import TemporaryDirectory
+
+    from .cases_index import CASES_ALL, CaseRow
+
+    CASES_BY_ACTION.clear()
+    CASES_ALL.clear()
+
+    CASES_BY_ACTION["FSD0151202511062025ATPLIFESCIENCE"] = CaseRow(
+        action="FSD0151202511062025ATPLIFESCIENCE",
+        code="FSD0151202511062025",
+        suffix="ATPLIFESCIENCE",
+        title="Re ATP Life Science Ventures LP - Judgment",
+        extra={"Category": "Grand Court", "Judgment Date": "2025-Nov-06"},
+    )
+    CASES_BY_ACTION["1J1CB5JDVWQJ1DE60AG13020A37E6E68EADE88BE7AE51E57A648"] = CaseRow(
+        action="1J1CB5JDVWQJ1DE60AG13020A37E6E68EADE88BE7AE51E57A648",
+        code="1J1CB5JDVWQJ1DE60AG13020",
+        suffix="A37E6E68EADE88BE7AE51E57A648",
+        title="Embedded Token Fixture",
+        extra={"Category": "Example", "Judgment Date": "2024-Jun-01"},
+    )
+    CASES_ALL.extend(CASES_BY_ACTION.values())
+
+    print("[Demo] Exact lookup:", find_case_by_fname("FSD0151202511062025ATPLIFESCIENCE"))
+    print("[Demo] Partial lookup:", find_case_by_fname("AG13020"))
+
+    class _DummyResponse:
+        status = 200
+
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+
+        def body(self) -> bytes:
+            return self._payload
+
+    class _DummyClient:
+        def __call__(self, url: str, timeout: int = 120) -> _DummyResponse:  # noqa: D401
+            return _DummyResponse(b"%PDF-1.4\n%%EOF\n")
+
+    sample_body = (
+        "action=dl_bfile&fid=999&fname=FSD0151202511062025ATPLIFESCIENCE&security=dummy"
+    )
+    sample_payload = {
+        "success": True,
+        "data": {"fid": "https://example.org/dummy.pdf"},
+    }
+
+    with TemporaryDirectory() as tmpdir:
+        result = handle_dl_bfile_from_ajax(
+            sample_body,
+            sample_payload,
+            Path(tmpdir),
+            meta={},
+            seen=set(),
+            http_client=_DummyClient(),
+        )
+        print("[Demo] Handler result:", result)
+
 __all__ = ["run_scrape"]
+

@@ -33,18 +33,7 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 ensure_dirs()
-
-@app.route("/debug/unreported_judgments.png")
-def debug_unreported_png():
-    """
-    Serve the headless screenshot so we can see what Playwright rendered.
-    """
-    return send_from_directory(
-        scraper_config.PDF_DIR,
-        "unreported_judgments.png",
-        mimetype="image/png",
-    )
-    
+   
 @app.context_processor
 def inject_globals() -> dict[str, object]:
     """Inject global configuration into all template contexts."""

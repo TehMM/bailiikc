@@ -110,8 +110,7 @@ def _guess_download_locators() -> List[str]:
 
     Based on observed markup:
 
-        <button class="btn p-2 btn-outline-primary lh-1"
-                data-dl="FSD0151202511062025ATPLIFESCIENCE">
+        <button ... data-dl="FSD0151202511062025ATPLIFESCIENCE">
             <i class="icon-dl fs-6 lh-1"></i>
         </button>
     """
@@ -120,11 +119,11 @@ def _guess_download_locators() -> List[str]:
         "button[data-dl]",
         "[data-dl]",
 
-        # Icon-based buttons
+        # Icon-based: buttons/links containing the download icon
         "button:has(i.icon-dl)",
         "a:has(i.icon-dl)",
 
-        # Fallbacks: text / generic download semantics / older patterns
+        # Fallbacks for future changes / older markup
         "a:has-text('Download')",
         "button:has-text('Download')",
         "a:has-text(/download/i)",
@@ -374,29 +373,29 @@ def run_scrape(
             if not count:
                 continue
 
-            for i in range(count):
-                if clicked >= max_clicks:
-                    break
+                    for i in range(count):
+            if clicked >= max_clicks:
+                break
 
-                try:
-                    el = items.nth(i)
-                    if not el.is_visible():
-                        continue
-                    # Be gentle: click, then give responses time to arrive
-                    el.click(timeout=2000)
-                    clicked += 1
-
-                    # Wait a little for any AJAX to fire/complete
-                    page.wait_for_timeout(int(per_delay * 1000) + 400)
-                except Exception:
+            try:
+                el = items.nth(i)
+                if not el.is_visible():
                     continue
+
+                el.click(timeout=2000)
+                clicked += 1
+
+                # Let the dl_bfile AJAX fire and the response handler run
+                time.sleep(per_delay + 0.4)
+            except Exception:
+                continue
 
             if clicked >= max_clicks:
                 break
 
         # ---------- Final wait to let late responses finish ----------
 
-        page.wait_for_timeout(2500)
+        time.sleep(2.5)
 
         # Summarize from metadata diff: we don't mutate summary counters live because
         # downloads happen in the response hook. Instead, compute a cheap delta:

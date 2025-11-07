@@ -5,18 +5,19 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 from urllib.parse import urljoin
 
-from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
+from playwright.sync_api import Page, sync_playwright
 
 from . import config
 from .parser import load_cases_from_csv
 from .utils import (
     ensure_dirs,
+    is_duplicate,
     load_metadata,
     log_line,
-    is_duplicate,
     record_result,
     sanitize_filename,
 )
@@ -30,23 +31,285 @@ UA = (
 )
 
 
+# ---------- DOM helpers ----------
+
+_LOAD_MORE_SELECTORS: Sequence[str] = (
+    "button.pt-cv-loadmore",
+    "button:has-text(\"Load more\")",
+    "button:has-text(\"Load More\")",
+    "a.pt-cv-loadmore",
+    ".pt-cv-loadmore button",
+    ".pt-cv-loadmore a",
+)
+
+_ATTR_FNAME_KEYS: Sequence[str] = (
+    "data-fname",
+    "data-name",
+    "data-file-name",
+    "data-filename",
+    "data-title",
+    "data-code",
+)
+
+_ATTR_FID_KEYS: Sequence[str] = (
+    "data-fid",
+    "data-id",
+    "data-file",
+    "data-file-id",
+    "data-dfid",
+    "data-dl-fid",
+)
+
+_ATTR_NONCE_KEYS: Sequence[str] = (
+    "data-s",
+    "data-security",
+    "data-nonce",
+    "data-token",
+)
+
+_RE_PAIR_CAPTURE = re.compile(
+    r"(?P<key>[A-Za-z0-9_-]+)[\"']?\s*(?:[:=])\s*[\"']?(?P<val>[A-Za-z0-9._-]+)",
+    flags=re.I,
+)
+
+_NONCE_REGEXES = (
+    re.compile(r"['\"](?:_?nonce|security)['\"]\s*[:=]\s*['\"]([A-Za-z0-9]{6,})['\"]"),
+    re.compile(r"dl_bfile[^A-Za-z0-9]+['\"]([A-Za-z0-9]{6,})['\"]", flags=re.I),
+)
+
+
+# ---------- Utility helpers ----------
+
+def _normalize_fname(value: str) -> str:
+    cleaned = value.strip()
+    if cleaned.lower().endswith(".pdf"):
+        cleaned = cleaned[:-4]
+    return cleaned.strip().upper()
+
+
+def _fname_variants(value: str) -> List[str]:
+    cleaned = value.strip()
+    variants = {cleaned, cleaned.upper()}
+    if cleaned.lower().endswith(".pdf"):
+        core = cleaned[:-4]
+        variants.update({core, core.upper()})
+    sanitized = sanitize_filename(cleaned)
+    variants.update({sanitized, sanitized.upper()})
+    if sanitized.lower().endswith(".pdf"):
+        core = sanitized[:-4]
+        variants.update({core, core.upper()})
+    return [v for v in variants if v]
+
+
+def _first_attr(tag, keys: Sequence[str]) -> str:
+    for key in keys:
+        value = tag.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _parse_payload(text: str) -> Tuple[str | None, str | None, str | None]:
+    if not text:
+        return (None, None, None)
+
+    fid: str | None = None
+    fname: str | None = None
+    nonce: str | None = None
+
+    for match in _RE_PAIR_CAPTURE.finditer(text.replace("&amp;", "&")):
+        key = match.group("key").lower()
+        val = match.group("val").strip()
+        if not val:
+            continue
+        if key in {"fid", "file", "id"}:
+            if not fid or val.isdigit():
+                fid = val
+        elif key in {"fname", "name"}:
+            if not fname:
+                fname = val
+        elif key in {"security", "nonce", "s"}:
+            if not nonce:
+                nonce = val
+
+    return (fid, fname, nonce)
+
+
+def _iter_related_nodes(tag) -> Iterable:
+    yield tag
+    # limited parents
+    depth = 0
+    for parent in getattr(tag, "parents", []):
+        if depth >= 4:
+            break
+        yield parent
+        depth += 1
+    # limited children
+    try:
+        for child in tag.find_all(True, limit=10):
+            yield child
+    except Exception:  # noqa: BLE001
+        return
+
+
 # ---------- Playwright helpers ----------
 
-_NONCE_PATTERNS = [
-    re.compile(r"['\"](?:_?nonce|security)['\"]\s*[:=]\s*['\"]([A-Za-z0-9]{8,})['\"]"),
-    re.compile(r"dl_bfile[^A-Za-z0-9]+['\"]([A-Za-z0-9]{8,})['\"]", re.I),
-]
+def _load_all_results(page: Page, max_loadmore: int = 200) -> None:
+    """Trigger lazy loading by clicking \"Load more\" buttons and scrolling."""
+    clicks = 0
+    while clicks < max_loadmore:
+        load_button = None
+        for selector in _LOAD_MORE_SELECTORS:
+            try:
+                locator = page.locator(selector)
+                if locator.count() and locator.first.is_enabled() and locator.first.is_visible():
+                    load_button = locator.first
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if not load_button:
+            break
+        try:
+            load_button.click()
+            clicks += 1
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(400)
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"Load-more click failed after {clicks} interactions: {exc}")
+            break
+
+    last_height = 0
+    for _ in range(30):
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:  # noqa: BLE001
+            break
+        page.wait_for_timeout(350)
+        try:
+            page.wait_for_load_state("networkidle")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            height = page.evaluate("document.body.scrollHeight")
+        except Exception:  # noqa: BLE001
+            break
+        if height == last_height:
+            break
+        last_height = height
+
+    if clicks:
+        log_line(f"Triggered {clicks} load-more interactions before scrolling complete.")
 
 
-def _extract_nonce(page_html: str) -> str:
-    """Attempt to locate the AJAX security nonce within rendered HTML."""
+def _collect_buttons(page: Page) -> Tuple[List[Tuple[str, str, str]], List[str], str]:
+    """Collect (fid, fname, nonce) tuples from the rendered DOM."""
+    html = page.content()
+    soup = BeautifulSoup(html, "html.parser")
 
-    for pattern in _NONCE_PATTERNS:
-        match = pattern.search(page_html)
-        if match:
-            return match.group(1)
+    nonce_candidates: set[str] = set()
+    results: list[Tuple[str, str, str]] = []
+    seen: set[Tuple[str, str]] = set()
 
-    raise RuntimeError("Failed to locate AJAX security nonce on the page")
+    def maybe_add(fid: str | None, fname: str | None, nonce: str | None) -> None:
+        if not fid or not fname:
+            return
+        fid = fid.strip()
+        fname = fname.strip()
+        nonce_val = (nonce or "").strip()
+        if not re.fullmatch(r"\d{5,}", fid):
+            return
+        key = (fid, fname)
+        if key in seen:
+            return
+        seen.add(key)
+        if nonce_val:
+            nonce_candidates.add(nonce_val)
+        results.append((fid, fname, nonce_val))
+
+    for tag in soup.select("[data-s]"):
+        nonce_val = str(tag.get("data-s")).strip()
+        if nonce_val and re.fullmatch(r"[A-Za-z0-9]{6,}", nonce_val):
+            nonce_candidates.add(nonce_val)
+
+    for tag in soup.select("[data-security]"):
+        nonce_val = str(tag.get("data-security")).strip()
+        if nonce_val and re.fullmatch(r"[A-Za-z0-9]{6,}", nonce_val):
+            nonce_candidates.add(nonce_val)
+
+    for tag in soup.select("[data-fid]"):
+        fid = _first_attr(tag, _ATTR_FID_KEYS)
+        fname = _first_attr(tag, _ATTR_FNAME_KEYS)
+        nonce = _first_attr(tag, _ATTR_NONCE_KEYS)
+
+        if not fname or not nonce:
+            for related in _iter_related_nodes(tag):
+                if not fname:
+                    fname = _first_attr(related, _ATTR_FNAME_KEYS)
+                if not nonce:
+                    nonce = _first_attr(related, _ATTR_NONCE_KEYS)
+                if fname and nonce:
+                    break
+
+        if not fname:
+            payload_attrs = (
+                "data-params",
+                "data-options",
+                "data-config",
+                "data-request",
+                "data-payload",
+                "data-data",
+            )
+            for attr in payload_attrs:
+                value = tag.get(attr)
+                if not value:
+                    continue
+                fid_candidate, fname_candidate, nonce_candidate = _parse_payload(str(value))
+                fid = fid or fid_candidate or ""
+                fname = fname or fname_candidate or ""
+                nonce = nonce or nonce_candidate or ""
+                if fname:
+                    break
+
+        if not fname:
+            text = tag.get_text(" ", strip=True)
+            match = re.search(r"[A-Za-z0-9._-]{6,}", text or "")
+            if match:
+                fname = match.group(0)
+
+        maybe_add(fid or "", fname or "", nonce or "")
+
+    anchor_selectors = (
+        "a[href*='dl_bfile']",
+        "button[onclick*='dl_bfile']",
+        "a[data-params]",
+        "button[data-params]",
+    )
+    for selector in anchor_selectors:
+        for tag in soup.select(selector):
+            payload_sources = (
+                tag.get("href"),
+                tag.get("onclick"),
+                tag.get("data-params"),
+                tag.get("data-request"),
+            )
+            fid = fname = nonce = ""
+            for source in payload_sources:
+                if not source:
+                    continue
+                fid_candidate, fname_candidate, nonce_candidate = _parse_payload(str(source))
+                fid = fid or fid_candidate or ""
+                fname = fname or fname_candidate or ""
+                nonce = nonce or nonce_candidate or ""
+            maybe_add(fid or "", fname or "", nonce or "")
+
+    if not nonce_candidates:
+        script_text = "\n".join(script.get_text(" ", strip=True) for script in soup.find_all("script"))
+        for regex in _NONCE_REGEXES:
+            match = regex.search(script_text)
+            if match:
+                nonce_candidates.add(match.group(1))
+
+    return results, sorted(nonce_candidates), html
 
 
 def _fetch_box_url(api, fid: str, fname: str, security: str, referer: str) -> str:
@@ -119,12 +382,7 @@ def run_scrape(
     page_wait: int | None = None,
     per_delay: float | None = None,
 ) -> Dict[str, Any]:
-    """
-    Execute a scraping run using Playwright + dl_bfile AJAX.
-
-    Called by the /scrape route. All params optional; sensible defaults
-    pulled from config.
-    """
+    """Execute a scraping run using Playwright + dl_bfile AJAX."""
     ensure_dirs()
 
     base_url = (base_url or config.DEFAULT_BASE_URL).strip()
@@ -139,9 +397,16 @@ def run_scrape(
         f"per_download_delay={per_delay}s"
     )
 
-    # Load CSV cases (non-criminal only) for metadata & filtering
     cases = load_cases_from_csv(config.CSV_URL)
     meta = load_metadata()
+
+    cases_by_fname: dict[str, dict[str, Any]] = {}
+    for case in cases:
+        fname = case.get("fname")
+        if not fname:
+            continue
+        for variant in _fname_variants(fname):
+            cases_by_fname.setdefault(variant.upper(), case)
 
     summary: Dict[str, Any] = {
         "base_url": base_url,
@@ -155,6 +420,7 @@ def run_scrape(
 
     if not cases:
         log_line("No cases parsed from CSV (non-criminal set is empty). Aborting.")
+        summary["error"] = "no_cases"
         return summary
 
     with sync_playwright() as pw:
@@ -170,57 +436,84 @@ def run_scrape(
             if page_wait:
                 page.wait_for_timeout(page_wait * 1000)
 
-            page_html = page.content()
-            try:
-                nonce = _extract_nonce(page_html)
-            except Exception as exc:  # noqa: BLE001
-                log_line(f"Failed to extract AJAX nonce: {exc}")
-                summary["error"] = f"nonce_error: {exc}"
-                log_line("Aborting scrape due to nonce extraction failure")
+            _load_all_results(page)
+
+            buttons, nonce_candidates, page_html = _collect_buttons(page)
+            log_line(f"Found {len(buttons)} download candidates on page.")
+
+            if not buttons:
+                snippet = re.sub(r"\s+", " ", page_html[:600])
+                log_line(
+                    "No valid download buttons discovered on page. "
+                    f"HTML snippet: {snippet}"
+                )
+                summary["error"] = "no_buttons"
                 return summary
 
-            log_line(f"Using AJAX security nonce: {nonce}")
-
             api = context.request
+            global_nonce = nonce_candidates[0] if nonce_candidates else ""
 
-            for case in cases:
+            for fid, fname, candidate_nonce in buttons:
                 if summary["processed"] >= entry_cap:
                     break
 
-                fid = case.get("fid")
-                fname = case.get("fname") or fid
-                if not fid or not fname:
-                    log_line(
-                        "Skipping case with missing fid/fname: "
-                        f"{case.get('title', 'Untitled')}"
-                    )
-                    summary["skipped"] += 1
-                    continue
+                normalized_fname = _normalize_fname(fname)
+                case = None
+                for key in _fname_variants(fname):
+                    case = cases_by_fname.get(key.upper())
+                    if case:
+                        break
 
-                sanitized = sanitize_filename(fname)
-                filename = (
-                    sanitized if sanitized.lower().endswith(".pdf") else f"{sanitized}.pdf"
-                )
+                record_fid = (case or {}).get("fid") or normalized_fname
+
+                sanitized = sanitize_filename(normalized_fname or fname)
+                filename = sanitized if sanitized.lower().endswith(".pdf") else f"{sanitized}.pdf"
                 out_path = config.PDF_DIR / filename
 
-                if out_path.exists() or is_duplicate(fid, filename, meta):
-                    log_line(f"Skipping {fid} ({filename}) – already downloaded/recorded")
+                if out_path.exists() or is_duplicate(record_fid, filename, meta):
+                    log_line(
+                        f"Skipping {record_fid} ({filename}) – already downloaded/recorded"
+                    )
                     summary["skipped"] += 1
                     continue
 
                 summary["processed"] += 1
 
-                box_url = None
+                nonce_options = []
+                if candidate_nonce:
+                    nonce_options.append(candidate_nonce)
+                for value in nonce_candidates:
+                    if value and value not in nonce_options:
+                        nonce_options.append(value)
+                if global_nonce and global_nonce not in nonce_options:
+                    nonce_options.append(global_nonce)
 
-                try:
-                    log_line(
-                        f"Requesting Box URL for fid={fid} fname={fname} via dl_bfile"
-                    )
-                    box_url = _fetch_box_url(api, fid, fname, nonce, referer=base_url)
-                except Exception as exc:  # noqa: BLE001
-                    log_line(f"AJAX lookup failed for fid={fid}: {exc}")
+                box_url = None
+                last_error: Exception | None = None
+                for nonce_val in nonce_options or [""]:
+                    if not nonce_val:
+                        continue
+                    try:
+                        log_line(
+                            f"Requesting Box URL for fid={fid} fname={fname} nonce={nonce_val}"
+                        )
+                        box_url = _fetch_box_url(api, fid, fname, nonce_val, referer=base_url)
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        last_error = exc
+                        log_line(
+                            f"AJAX lookup failed for fid={fid} with nonce={nonce_val}: {exc}"
+                        )
+                        continue
 
                 if not box_url:
+                    if last_error:
+                        summary["failed"] += 1
+                        log_line(
+                            f"Exhausted nonce attempts for fid={fid} fname={fname}: {last_error}"
+                        )
+                        time.sleep(per_delay)
+                        continue
                     fallback_url = (
                         f"https://judicial.ky/wp-content/uploads/box_files/{fid}.pdf"
                     )
@@ -238,20 +531,22 @@ def run_scrape(
 
                     record_result(
                         meta,
-                        fid=fid,
+                        fid=record_fid,
                         filename=filename,
                         fields={
-                            "title": case.get("title"),
-                            "category": case.get("category"),
-                            "judgment_date": case.get("judgment_date"),
+                            "title": (case or {}).get("title"),
+                            "category": (case or {}).get("category"),
+                            "judgment_date": (case or {}).get("judgment_date"),
                             "source_url": box_url,
                             "size_bytes": size_bytes,
+                            "box_fid": fid,
+                            "box_fname": fname,
                         },
                     )
 
                     log_line(
                         f"Saved {filename} ({size_bytes / 1024:.1f} KiB) "
-                        f"for case '{case.get('title', '').strip()}'"
+                        f"for case '{(case or {}).get('title', '').strip()}'"
                     )
                     summary["downloaded"] += 1
 
@@ -262,6 +557,7 @@ def run_scrape(
                     summary["failed"] += 1
 
                 time.sleep(per_delay)
+
         finally:
             try:
                 context.close()

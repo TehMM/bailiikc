@@ -265,7 +265,7 @@ def run_scrape(
                 if req.method != "POST":
                     return
 
-                body = req.post_data() or ""
+                body = req.post_data or ""
                 log_line(f"[AJAX] raw POST body={body!r}")
 
                 qs = urllib.parse.parse_qs(body)

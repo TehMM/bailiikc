@@ -1,22 +1,28 @@
 """Playwright-based scraper for Cayman Unreported Judgments.
 
-Key idea:
+Workflow:
 
-- Open the Unreported Judgments page.
-- Click the real download buttons: <button data-dl="..."><i class="icon-dl"></i></button>
-- Listen for wp-admin/admin-ajax.php responses.
-- For each dl_bfile response, extract the Box URL & fname from the POST + JSON.
-- Download the PDF to data/pdfs and record metadata via utils.
+- Load judgments.csv (non-criminal cases).
+- Open https://judicial.ky/judgments/unreported-judgments/ in Playwright.
+- Scroll to trigger the JS widget.
+- Click the real download buttons:
 
-This avoids brittle DOM reverse-engineering of the plugin internals.
+      <button class="btn p-2 btn-outline-primary lh-1"
+              data-dl="FSD0151202511062025ATPLIFESCIENCE">
+          <i class="icon-dl fs-6 lh-1"></i>
+      </button>
+
+- Listen for wp-admin/admin-ajax.php POSTs (dl_bfile).
+- For each successful response, extract the Box download URL, stream the PDF,
+  and record metadata.
+
+This is wired to /scrape via run_scrape().
 """
 
 from __future__ import annotations
 
-import re
 import time
 import urllib.parse
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from playwright.sync_api import (
@@ -51,7 +57,7 @@ UA = (
 
 
 # ---------------------------------------------------------------------------
-# Small helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _accept_cookies(page: Page) -> None:
@@ -66,9 +72,9 @@ def _accept_cookies(page: Page) -> None:
     for sel in selectors:
         try:
             loc = page.locator(sel).first
-            if loc.count() and loc.is_visible():
+            if loc.count():
                 loc.click(timeout=1500)
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(400)
                 log_line(f"Clicked cookie banner via {sel}")
                 return
         except Exception:
@@ -76,11 +82,11 @@ def _accept_cookies(page: Page) -> None:
 
 
 def _load_all_results(page: Page, max_scrolls: int = 40) -> None:
-    """Scroll to bottom a few times to trigger any lazy loading."""
+    """Scroll a few times to trigger lazy-loading."""
     try:
         page.wait_for_load_state("networkidle", timeout=20_000)
     except PWTimeout:
-        log_line("Initial networkidle timeout; continuing anyway.")
+        log_line("Initial networkidle timeout; continuing.")
 
     last_height = 0
     for i in range(max_scrolls):
@@ -104,25 +110,18 @@ def _load_all_results(page: Page, max_scrolls: int = 40) -> None:
 
 def _guess_download_locators() -> List[str]:
     """
-    Locators that hit the real Unreported Judgments download buttons.
-
-    Observed markup:
-
-        <button class="btn p-2 btn-outline-primary lh-1"
-                data-dl="FSD0151202511062025ATPLIFESCIENCE">
-            <i class="icon-dl fs-6 lh-1"></i>
-        </button>
+    Locators that should match the real Unreported Judgments download buttons.
     """
     return [
-        # Primary: explicit data-dl buttons
+        # Primary: explicit data-dl buttons (what we see on the page)
         "button[data-dl]",
         "[data-dl]",
 
-        # Icon-based: buttons/links containing the download icon
+        # Icon-based: anything containing the download icon
         "button:has(i.icon-dl)",
         "a:has(i.icon-dl)",
 
-        # Fallbacks if markup changes
+        # Fallbacks for possible future HTML tweaks
         "a:has-text('Download')",
         "button:has-text('Download')",
         "a:has-text(/download/i)",
@@ -137,17 +136,37 @@ def _guess_download_locators() -> List[str]:
 
 def _screenshot(page: Page, name: str = "unreported_judgments.png") -> None:
     """Save a screenshot under PDF_DIR for debugging."""
-    out = config.PDF_DIR / name
+    path = config.PDF_DIR / name
     try:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=str(out), full_page=True)
-        log_line(f"Saved debug screenshot -> {out}")
-    except Exception as e:
-        log_line(f"Failed to save debug screenshot: {e}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(path), full_page=True)
+        log_line(f"Saved debug screenshot -> {path}")
+    except Exception as exc:
+        log_line(f"Failed to save debug screenshot: {exc}")
+
+
+def _extract_box_url(data: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract Box download URL from dl_bfile payload.
+    Different plugins/sites sometimes rename the key; be flexible.
+    """
+    candidates = [
+        data.get("fid"),
+        data.get("url"),
+        data.get("download_url"),
+        data.get("link"),
+    ]
+    for raw in candidates:
+        if not raw:
+            continue
+        url = str(raw).replace("\\/", "/").strip()
+        if url.startswith("http"):
+            return url
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Main entry
+# Main entrypoint
 # ---------------------------------------------------------------------------
 
 def run_scrape(
@@ -157,7 +176,7 @@ def run_scrape(
     per_delay: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Execute a scraping run using Playwright + response capture of dl_bfile.
+    Execute a scraping run using Playwright + captured dl_bfile AJAX responses.
     """
     ensure_dirs()
 
@@ -173,12 +192,14 @@ def run_scrape(
         f"per_download_delay={per_delay}"
     )
 
-    # Load CSV (non-criminal)
+    # Load CSV (non-criminal only)
     cases = load_cases_from_csv(config.CSV_URL)
     meta = load_metadata()
 
     cases_by_fname: Dict[str, Dict[str, Any]] = {
-        str(c.get("fname")).strip(): c for c in cases if c.get("fname")
+        str(c.get("fname")).strip(): c
+        for c in cases
+        if c.get("fname")
     }
 
     summary: Dict[str, Any] = {
@@ -191,10 +212,9 @@ def run_scrape(
     }
 
     if not cases:
-        log_line("No non-criminal cases loaded from CSV; aborting scrape.")
+        log_line("No non-criminal cases loaded from CSV; aborting.")
         return summary
 
-    # Track which fname we've already handled this run
     seen_fnames_in_run: Set[str] = set()
 
     with sync_playwright() as pw:
@@ -212,27 +232,27 @@ def run_scrape(
             viewport={"width": 1368, "height": 900},
         )
 
-        # Light stealth
+        # Mild stealth
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
 
         page: Page = context.new_page()
 
-        # --------- RESPONSE HOOK: capture any admin-ajax traffic ----------
+        # ---------- RESPONSE HOOK ----------
 
         def on_response(resp: Response) -> None:
-            # This runs for every response in this context
             try:
                 url = resp.url
-            except PWError:
+            except Exception as exc:
+                log_line(f"[AJAX] error reading url: {exc}")
                 return
 
             if "admin-ajax.php" in url:
                 try:
                     method = resp.request.method
-                except PWError:
-                    method = "?"
+                except Exception as exc:
+                    method = f"? ({exc})"
                 log_line(
                     f"[AJAX] url={url} status={resp.status} method={method}"
                 )
@@ -240,143 +260,147 @@ def run_scrape(
             if not url.startswith(ADMIN_AJAX):
                 return
 
-            req: Request = resp.request
-
-            # We only care about POSTs
-            if req.method != "POST":
-                return
-
-            # Get raw POST body
             try:
+                req: Request = resp.request
+                if req.method != "POST":
+                    return
+
                 body = req.post_data() or ""
-            except PWError:
-                body = ""
+                log_line(f"[AJAX] raw POST body={body!r}")
 
-            log_line(f"[AJAX] raw POST body={body!r}")
+                qs = urllib.parse.parse_qs(body)
+                action = (qs.get("action", [""])[0] or "").strip()
+                fid_param = (qs.get("fid", [""])[0] or "").strip()
+                fname_param = (qs.get("fname", [""])[0] or "").strip()
+                security = (qs.get("security", [""])[0] or "").strip()
 
-            qs = urllib.parse.parse_qs(body)
-            action = (qs.get("action", [""])[0] or "").strip()
-            fid_param = (qs.get("fid", [""])[0] or "").strip()
-            fname_param = (qs.get("fname", [""])[0] or "").strip()
+                log_line(
+                    f"[AJAX] parsed action={action!r} fid={fid_param!r} "
+                    f"fname={fname_param!r} security={security!r}"
+                )
 
-            log_line(
-                f"[AJAX] parsed action={action!r} fid={fid_param!r} "
-                f"fname={fname_param!r}"
-            )
+                if action != "dl_bfile":
+                    # Other admin-ajax actions are noise for us
+                    return
 
-            if action != "dl_bfile":
-                # Helpful noise: shows plugin behavior even if action differs
-                log_line(f"[AJAX] Non-dl_bfile action seen: {action!r}")
-                return
+                # Some implementations may omit fname; if so, try to recover later.
+                if not fname_param:
+                    log_line("[AJAX] dl_bfile without fname; skipping.")
+                    return
 
-            if not fname_param:
-                log_line("[AJAX] dl_bfile without fname; skipping.")
-                return
+                if fname_param in seen_fnames_in_run:
+                    log_line(
+                        f"[AJAX] fname {fname_param} already processed this run."
+                    )
+                    return
 
-            if fname_param in seen_fnames_in_run:
-                log_line(f"[AJAX] fname {fname_param} already processed this run.")
-                return
+                # Parse JSON payload
+                try:
+                    payload = resp.json()
+                except Exception as exc:
+                    log_line(f"[AJAX] dl_bfile non-JSON response: {exc}")
+                    return
 
-            # Parse JSON body
-            try:
-                payload = resp.json()
+                log_line(f"[AJAX] dl_bfile payload={payload!r}")
+
+                if (
+                    payload in (-1, "-1")
+                    or not isinstance(payload, dict)
+                    or not payload.get("success")
+                ):
+                    log_line(
+                        f"[AJAX] dl_bfile failure for fname={fname_param}: {payload}"
+                    )
+                    return
+
+                data = payload.get("data") or {}
+                box_url = _extract_box_url(data)
+                if not box_url:
+                    log_line(
+                        f"[AJAX] Could not find Box URL in payload for "
+                        f"fname={fname_param}: {data!r}"
+                    )
+                    return
+
+                # Map fname -> CSV row
+                case = (
+                    cases_by_fname.get(fname_param)
+                    or cases_by_fname.get(sanitize_filename(fname_param))
+                )
+                if not case:
+                    log_line(
+                        f"[AJAX] fname not found in CSV: {fname_param}; skipping."
+                    )
+                    return
+
+                safe_root = sanitize_filename(fname_param)
+                safe_name = (
+                    safe_root
+                    if safe_root.lower().endswith(".pdf")
+                    else f"{safe_root}.pdf"
+                )
+                out_path = config.PDF_DIR / safe_name
+
+                if out_path.exists() or is_duplicate(fid_param, safe_name, meta):
+                    log_line(
+                        f"[AJAX] Already have {safe_name}; skipping download."
+                    )
+                    seen_fnames_in_run.add(fname_param)
+                    summary["skipped"] += 1
+                    return
+
+                # Download PDF
+                try:
+                    log_line(
+                        f"[AJAX] Streaming PDF for {fname_param} from {box_url}"
+                    )
+                    r = context.request.get(box_url, timeout=120_000)
+                    if r.status not in (200, 206):
+                        raise RuntimeError(f"Download HTTP {r.status}")
+
+                    body_bytes = r.body()
+                    if not body_bytes.startswith(b"%PDF"):
+                        raise RuntimeError("Response is not a PDF")
+
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_bytes(body_bytes)
+                    size_bytes = out_path.stat().st_size
+
+                    record_result(
+                        meta,
+                        fid=fid_param or fname_param,
+                        filename=safe_name,
+                        fields={
+                            "title": case.get("title"),
+                            "category": case.get("category"),
+                            "judgment_date": case.get("judgment_date"),
+                            "source_url": box_url,
+                            "size_bytes": size_bytes,
+                        },
+                    )
+
+                    log_line(
+                        f"[AJAX] Saved {safe_name} ({size_bytes/1024:.1f} KiB) "
+                        f"for case '{(case.get('title') or '').strip()}'"
+                    )
+                    seen_fnames_in_run.add(fname_param)
+                    summary["downloaded"] += 1
+
+                except Exception as exc:
+                    log_line(
+                        f"[AJAX] Failed to save PDF for {fname_param}: {exc}"
+                    )
+                    if out_path.exists():
+                        out_path.unlink(missing_ok=True)
+                    summary["failed"] += 1
+
             except Exception as exc:
-                log_line(f"[AJAX] dl_bfile non-JSON response: {exc}")
-                return
-
-            if (
-                payload in (-1, "-1")
-                or not isinstance(payload, dict)
-                or not payload.get("success")
-            ):
-                log_line(
-                    f"[AJAX] dl_bfile failure for fname={fname_param}: {payload}"
-                )
-                return
-
-            data = payload.get("data") or {}
-            box_url = str(data.get("fid") or "").replace("\\/", "/").strip()
-
-            if not box_url.startswith("http"):
-                log_line(
-                    f"[AJAX] dl_bfile invalid URL for fname={fname_param}: {box_url}"
-                )
-                return
-
-            # Join to CSV metadata
-            case = (
-                cases_by_fname.get(fname_param)
-                or cases_by_fname.get(sanitize_filename(fname_param))
-            )
-            if not case:
-                log_line(
-                    f"[AJAX] fname not found in CSV (non-criminal): "
-                    f"{fname_param}; skipping."
-                )
-                return
-
-            safe_root = sanitize_filename(fname_param)
-            safe_name = (
-                safe_root if safe_root.lower().endswith(".pdf") else f"{safe_root}.pdf"
-            )
-            out_path = config.PDF_DIR / safe_name
-
-            if out_path.exists() or is_duplicate(fid_param, safe_name, meta):
-                log_line(
-                    f"[AJAX] Already have {safe_name}; skipping download."
-                )
-                seen_fnames_in_run.add(fname_param)
-                summary["skipped"] += 1
-                return
-
-            # Download the PDF itself
-            try:
-                log_line(
-                    f"[AJAX] Streaming PDF for {fname_param} from {box_url}"
-                )
-                r = context.request.get(box_url, timeout=120_000)
-                if r.status not in (200, 206):
-                    raise RuntimeError(f"Download HTTP {r.status}")
-
-                body_bytes = r.body()
-                if not body_bytes.startswith(b"%PDF"):
-                    raise RuntimeError("Response is not a PDF")
-
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_bytes(body_bytes)
-                size_bytes = out_path.stat().st_size
-
-                record_result(
-                    meta,
-                    fid=fid_param or fname_param,
-                    filename=safe_name,
-                    fields={
-                        "title": case.get("title"),
-                        "category": case.get("category"),
-                        "judgment_date": case.get("judgment_date"),
-                        "source_url": box_url,
-                        "size_bytes": size_bytes,
-                    },
-                )
-
-                log_line(
-                    f"[AJAX] Saved {safe_name} ({size_bytes/1024:.1f} KiB) "
-                    f"for case '{(case.get('title') or '').strip()}'"
-                )
-                seen_fnames_in_run.add(fname_param)
-                summary["downloaded"] += 1
-
-            except Exception as exc:
-                log_line(
-                    f"[AJAX] Failed to save PDF for {fname_param}: {exc}"
-                )
-                if out_path.exists():
-                    out_path.unlink(missing_ok=True)
-                summary["failed"] += 1
+                # Catch any bug in our handler so it never kills Playwright
+                log_line(f"[AJAX] handler error: {exc}")
 
         context.on("response", on_response)
 
-        # --------- Navigate and prep ----------
+        # ---------- Navigate & initialise ----------
 
         log_line("Opening judgments page in Playwright...")
         page.goto(base_url, wait_until="domcontentloaded")
@@ -392,13 +416,16 @@ def run_scrape(
         _load_all_results(page)
         _screenshot(page)
 
-        # --------- Click download buttons to trigger AJAX ----------
+        # ---------- Click download buttons to trigger dl_bfile ----------
 
         locators = _guess_download_locators()
         clicked = 0
         max_clicks = entry_cap
 
         for sel in locators:
+            if clicked >= max_clicks:
+                break
+
             try:
                 items = page.locator(sel)
                 count = items.count()
@@ -417,14 +444,11 @@ def run_scrape(
 
                 try:
                     el = items.nth(i)
-                    if not el.is_visible():
-                        continue
 
-                    # Try normal Playwright click
+                    # Try normal click; if Playwright internals are broken, fall back to JS.
                     try:
                         el.click(timeout=2000)
                     except Exception as exc_click:
-                        # Fallback: JS click
                         log_line(
                             f"Playwright click failed for {sel!r} index {i}: "
                             f"{exc_click}; trying JS click."
@@ -442,7 +466,7 @@ def run_scrape(
                     summary["processed"] = clicked
                     log_line(f"Clicked element {i} for selector {sel!r}")
 
-                    # Allow dl_bfile AJAX + response hook to run
+                    # Wait a bit so dl_bfile AJAX + handler can run.
                     time.sleep(per_delay + 0.4)
 
                 except Exception as exc:
@@ -451,14 +475,15 @@ def run_scrape(
                     )
                     continue
 
-            if clicked >= max_clicks:
-                break
-
-        # Final small wait for straggler AJAX
+        # Final grace period for late AJAX responses
         time.sleep(2.5)
 
-        log_line(f"Clicks attempted: {clicked}. Downloads={summary['downloaded']}, "
-                 f"Failed={summary['failed']}, Skipped={summary['skipped']}")
+        log_line(
+            f"Clicks attempted: {clicked}. "
+            f"Downloads={summary['downloaded']}, "
+            f"Failed={summary['failed']}, "
+            f"Skipped={summary['skipped']}"
+        )
 
         browser.close()
 

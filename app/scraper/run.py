@@ -53,10 +53,10 @@ UA = (
 
 def _same_origin_frames(page: Page) -> Iterable[Page]:
     """Yield the main page and all same-origin iframes."""
-    # Include the main page
+    # Main page
     yield page
 
-    # Include any same-origin frames – this is where the JS app likely lives
+    # Any same-origin iframes (where the JS app may live)
     for frame in page.frames:
         try:
             url = frame.url or ""
@@ -74,7 +74,7 @@ def _same_origin_frames(page: Page) -> Iterable[Page]:
 
 def _discover_nonce(frame: Page) -> Optional[str]:
     """Try to discover a security nonce within a frame."""
-    # 1) Direct data-s attributes
+    # Direct data-s attributes
     try:
         nodes = frame.query_selector_all("[data-s]")
     except PWError:
@@ -88,7 +88,7 @@ def _discover_nonce(frame: Page) -> Optional[str]:
         if val and re.fullmatch(r"[A-Za-z0-9]+", val):
             return val
 
-    # 2) Inline scripts mentioning dl_bfile & security
+    # Inline scripts mentioning dl_bfile & security
     try:
         scripts = frame.query_selector_all("script")
     except PWError:
@@ -137,7 +137,6 @@ def _collect_candidates_from_frame(
     if not elements:
         return candidates
 
-    # If no explicit fallback nonce was passed, see if this frame has one
     nonce = fallback_nonce or _discover_nonce(frame)
 
     for el in elements:
@@ -155,7 +154,7 @@ def _collect_candidates_from_frame(
         # Some implementations put attributes on ancestors; climb a little
         if not (fid and fname and sec):
             parent = el
-            for _ in range(4):  # look up to a few levels up
+            for _ in range(4):
                 try:
                     parent = parent.evaluate_handle("node => node.parentElement")
                 except PWError:
@@ -206,14 +205,19 @@ def _collect_buttons(page: Page) -> List[Tuple[str, str, str]]:
         try:
             furl = frame.url
         except PWError:
-            furl = "<error-url>"
+            furl = ""
 
         frame_nonce = _discover_nonce(frame)
         frame_candidates = _collect_candidates_from_frame(frame, frame_nonce)
 
+        # FIXED: don't call frame.name as a function
+        try:
+            frame_name = getattr(frame, "name", "") or ""
+        except PWError:
+            frame_name = ""
+
         log_line(
-            f"Frame {repr(getattr(frame, 'name', lambda: '')()) or ''} "
-            f"url={furl} -> {len(frame_candidates)} candidates"
+            f"Frame name={frame_name!r} url={furl} -> {len(frame_candidates)} candidates"
         )
 
         all_candidates.extend(frame_candidates)
@@ -270,7 +274,7 @@ def _fetch_box_url(
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"AJAX non-JSON response: {exc}") from exc
 
-    # Common plugin behavior: -1 means invalid nonce / failure
+    # -1 is the plugin's "invalid nonce" / failure signal
     if payload in (-1, "-1"):
         raise RuntimeError("AJAX returned -1 (invalid security nonce)")
 
@@ -283,13 +287,7 @@ def _fetch_box_url(
 
     data = payload["data"]
 
-    # Some implementations use `data.fid` for the final URL, with /download suffix
-    box_url = (
-        str(data.get("fid"))
-        .replace("\\/", "/")
-        .strip()
-    )
-
+    box_url = str(data.get("fid")).replace("\\/", "/").strip()
     if not box_url.startswith("http"):
         raise RuntimeError(f"AJAX did not return a valid download URL: {box_url}")
 
@@ -383,7 +381,6 @@ def run_scrape(
         f"per_download_delay={per_delay}"
     )
 
-    # Load CSV of non-criminal cases
     cases = load_cases_from_csv(config.CSV_URL)
     meta = load_metadata()
 
@@ -424,9 +421,8 @@ def run_scrape(
         candidates = _collect_buttons(page)
 
         if not candidates:
-            # Extra diagnostics if nothing was found
             log_line("No valid download buttons discovered on page.")
-            # Log frames to help debug where the app lives
+            # Extra diagnostics: list frames & a snippet of HTML
             try:
                 for f in page.frames:
                     try:
@@ -436,7 +432,6 @@ def run_scrape(
             except PWError:
                 pass
 
-            # Log a small snippet of main HTML
             try:
                 html = page.content()
                 snippet = html[:2000].replace("\n", " ")
@@ -453,16 +448,14 @@ def run_scrape(
             if summary["processed"] >= entry_cap:
                 break
 
-            # Normalise filename from fname
             safe_root = sanitize_filename(raw_fname)
-            if not safe_root.lower().endswith(".pdf"):
-                safe_name = f"{safe_root}.pdf"
-            else:
-                safe_name = safe_root
-
+            safe_name = (
+                f"{safe_root}.pdf"
+                if not safe_root.lower().endswith(".pdf")
+                else safe_root
+            )
             out_path = config.PDF_DIR / safe_name
 
-            # Match against CSV-derived non-criminal cases
             case = cases_by_fname.get(raw_fname) or cases_by_fname.get(safe_root)
             if not case:
                 log_line(

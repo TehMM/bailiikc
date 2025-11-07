@@ -13,6 +13,7 @@ from flask import (
     redirect,
     render_template,
     request,
+    send_from_directory,
     send_file,
     url_for,
 )
@@ -71,9 +72,6 @@ ensure_dirs()
 
 @app.route("/debug/unreported_judgments.png")
 def debug_unreported_png():
-    """
-    Serve the headless screenshot so we can see what Playwright rendered.
-    """
     return send_from_directory(
         scraper_config.PDF_DIR,
         "unreported_judgments.png",

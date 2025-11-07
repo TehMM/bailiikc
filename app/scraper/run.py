@@ -108,9 +108,10 @@ def _guess_download_locators() -> List[str]:
     """
     Locators that should hit the real Unreported Judgments download buttons.
 
-    Based on observed markup:
+    The page uses markup like:
 
-        <button ... data-dl="FSD0151202511062025ATPLIFESCIENCE">
+        <button class="btn p-2 btn-outline-primary lh-1"
+                data-dl="FSD0151202511062025ATPLIFESCIENCE">
             <i class="icon-dl fs-6 lh-1"></i>
         </button>
     """
@@ -119,11 +120,11 @@ def _guess_download_locators() -> List[str]:
         "button[data-dl]",
         "[data-dl]",
 
-        # Icon-based: buttons/links containing the download icon
+        # Icon-based: anything containing the download icon
         "button:has(i.icon-dl)",
         "a:has(i.icon-dl)",
 
-        # Fallbacks for future changes / older markup
+        # Fallbacks in case markup changes
         "a:has-text('Download')",
         "button:has-text('Download')",
         "a:has-text(/download/i)",
@@ -250,6 +251,9 @@ def run_scrape(
             qs = urllib.parse.parse_qs(body)
 
             action = (qs.get("action", [""])[0] or "").strip()
+
+            log_line(f"admin-ajax POST body parsed: action={action}, raw={body!r}")
+
             if action != "dl_bfile":
                 return
 
@@ -391,15 +395,31 @@ def run_scrape(
                     if not el.is_visible():
                         continue
 
-                    el.click(timeout=2000)
+                    # Try normal Playwright click first
+                    try:
+                        el.click(timeout=2000)
+                    except Exception as exc_click:
+                        # Fall back to JS-driven click if Playwright's helper explodes
+                        log_line(
+                            f"Playwright click failed for {sel!r} index {i}: "
+                            f"{exc_click}; trying JS click."
+                        )
+                        try:
+                            el.evaluate("el => el.click()")
+                        except Exception as exc_js:
+                            log_line(
+                                f"JS click also failed for {sel!r} index {i}: {exc_js}"
+                            )
+                            continue  # give up on this element
+
                     clicked += 1
                     log_line(f"Clicked element {i} for selector {sel!r}")
-
                     # Let dl_bfile AJAX fire and our on_response handler run.
                     time.sleep(per_delay + 0.4)
+
                 except Exception as exc:
                     log_line(
-                        f"Click failed for selector {sel!r} index {i}: {exc}"
+                        f"Unexpected error for selector {sel!r} index {i}: {exc}"
                     )
                     continue
 

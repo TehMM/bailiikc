@@ -220,7 +220,7 @@ def run_scrape(
             viewport={"width": 1368, "height": 900},
         )
 
-        # Basic stealth: drop webdriver flag
+        # Basic stealth
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
@@ -239,8 +239,7 @@ def run_scrape(
                 return
 
             req: Request = resp.request
-            method = req.method
-            if method != "POST":
+            if req.method != "POST":
                 return
 
             # Parse POST body for fname (and other fields)
@@ -256,15 +255,12 @@ def run_scrape(
 
             fid_param = (qs.get("fid", [""])[0] or "").strip()
             fname_param = (qs.get("fname", [""])[0] or "").strip()
-            security_param = (qs.get("security", [""])[0] or "").strip()
 
             if not fname_param:
-                # Without fname we can't map to CSV metadata; skip
                 log_line("dl_bfile response without fname in request; skipping.")
                 return
 
             if fname_param in seen_fnames_in_run:
-                # Already handled in this run
                 return
 
             # Parse JSON to get Box URL
@@ -274,28 +270,39 @@ def run_scrape(
                 log_line(f"dl_bfile non-JSON response: {exc}")
                 return
 
-            if payload in (-1, "-1") or not isinstance(payload, dict) or not payload.get("success"):
+            if (
+                payload in (-1, "-1")
+                or not isinstance(payload, dict)
+                or not payload.get("success")
+            ):
                 log_line(f"dl_bfile returned failure for fname={fname_param}: {payload}")
                 return
 
             data = payload.get("data") or {}
             box_url = str(data.get("fid") or "").replace("\\/", "/").strip()
             if not box_url.startswith("http"):
-                log_line(f"dl_bfile returned invalid URL for fname={fname_param}: {box_url}")
+                log_line(
+                    f"dl_bfile returned invalid URL for fname={fname_param}: {box_url}"
+                )
                 return
 
             # Join to CSV metadata
-            case = cases_by_fname.get(fname_param)
+            case = cases_by_fname.get(fname_param) or cases_by_fname.get(
+                sanitize_filename(fname_param)
+            )
             if not case:
-                # If the DOM used a slightly different fname casing, try a sanitized key
-                case = cases_by_fname.get(sanitize_filename(fname_param))
-            if not case:
-                log_line(f"fname not found in CSV (non-criminal): {fname_param}; skipping.")
+                log_line(
+                    f"fname not found in CSV (non-criminal): {fname_param}; skipping."
+                )
                 return
 
             # Determine output filename
             safe_root = sanitize_filename(fname_param)
-            safe_name = safe_root if safe_root.lower().endswith(".pdf") else f"{safe_root}.pdf"
+            safe_name = (
+                safe_root
+                if safe_root.lower().endswith(".pdf")
+                else f"{safe_root}.pdf"
+            )
             out_path = config.PDF_DIR / safe_name
 
             # Idempotency across runs
@@ -304,7 +311,7 @@ def run_scrape(
                 seen_fnames_in_run.add(fname_param)
                 return
 
-            # Download
+            # Download PDF
             try:
                 log_line(f"Streaming PDF for {fname_param} from {box_url}")
                 r = context.request.get(box_url, timeout=120_000)
@@ -354,41 +361,47 @@ def run_scrape(
         _accept_cookies(page)
         _load_all_results(page)
 
-        # Debug screenshot so you can inspect what headless sees
         _screenshot(page, "unreported_judgments.png")
 
         # ---------- Click likely Download controls to trigger AJAX ----------
 
         locators = _guess_download_locators()
         clicked = 0
-        max_clicks = entry_cap  # keep overall limit consistent
+        max_clicks = entry_cap
 
         for sel in locators:
             try:
                 items = page.locator(sel)
                 count = items.count()
-            except Exception:
+            except Exception as exc:
+                log_line(f"Locator {sel!r} lookup failed: {exc}")
                 continue
 
             if not count:
                 continue
 
-                    for i in range(count):
-            if clicked >= max_clicks:
-                break
+            log_line(f"Locator {sel!r} matched {count} elements")
 
-            try:
-                el = items.nth(i)
-                if not el.is_visible():
+            for i in range(count):
+                if clicked >= max_clicks:
+                    break
+
+                try:
+                    el = items.nth(i)
+                    if not el.is_visible():
+                        continue
+
+                    el.click(timeout=2000)
+                    clicked += 1
+                    log_line(f"Clicked element {i} for selector {sel!r}")
+
+                    # Let dl_bfile AJAX fire and our on_response handler run.
+                    time.sleep(per_delay + 0.4)
+                except Exception as exc:
+                    log_line(
+                        f"Click failed for selector {sel!r} index {i}: {exc}"
+                    )
                     continue
-
-                el.click(timeout=2000)
-                clicked += 1
-
-                # Let the dl_bfile AJAX fire and the response handler run
-                time.sleep(per_delay + 0.4)
-            except Exception:
-                continue
 
             if clicked >= max_clicks:
                 break
@@ -397,18 +410,12 @@ def run_scrape(
 
         time.sleep(2.5)
 
-        # Summarize from metadata diff: we don't mutate summary counters live because
-        # downloads happen in the response hook. Instead, compute a cheap delta:
-        # (We keep the prior behavior minimal and rely on UI/metadata/report for totals.)
-        # But to keep a similar shape:
         summary["processed"] = clicked
-        # Can't know exact counts without reloading metadata; just log.
         log_line(f"Clicks attempted: {clicked}. See report/metadata for results.")
 
         browser.close()
 
     log_line("Completed run (response-capture strategy).")
     return summary
-
 
 __all__ = ["run_scrape"]

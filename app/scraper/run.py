@@ -105,30 +105,36 @@ def _load_all_results(page: Page, max_scrolls: int = 40) -> None:
 
 
 def _guess_download_locators() -> List[str]:
-    """A broad set of locators that often match the site's Download controls."""
+    """
+    Locators that should hit the real Unreported Judgments download buttons.
+
+    Based on observed markup:
+
+        <button class="btn p-2 btn-outline-primary lh-1"
+                data-dl="FSD0151202511062025ATPLIFESCIENCE">
+            <i class="icon-dl fs-6 lh-1"></i>
+        </button>
+    """
     return [
-        # Obvious text
+        # Primary: explicit data-dl buttons
+        "button[data-dl]",
+        "[data-dl]",
+
+        # Icon-based buttons
+        "button:has(i.icon-dl)",
+        "a:has(i.icon-dl)",
+
+        # Fallbacks: text / generic download semantics / older patterns
         "a:has-text('Download')",
         "button:has-text('Download')",
-
-        # Case-insensitive-ish via regex
         "a:has-text(/download/i)",
         "button:has-text(/download/i)",
-
-        # Icon buttons with semantics
         "[aria-label*='Download' i]",
         "[title*='Download' i]",
-
-        # Common button class names
         "a[class*='download' i]",
         "button[class*='download' i]",
-
-        # Fallback: any link with data-fname or onclick mentioning dl_bfile
-        "a[data-fname]",
-        "button[data-fname]",
         "[onclick*='dl_bfile']",
     ]
-
 
 def _screenshot(page: Page, name: str = "page.png") -> Optional[Path]:
     """Save a screenshot to data/pdfs for out-of-band inspection."""

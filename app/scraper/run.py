@@ -45,8 +45,17 @@ from .cases_index import (
     CASES_BY_ACTION,
     find_case_by_fname,
     load_cases_from_csv as load_cases_index,
+    normalize_action_token,
 )
-from .utils import ensure_dirs, find_metadata_entry, load_metadata, log_line, record_result
+from .utils import (
+    ensure_dirs,
+    find_metadata_entry,
+    has_local_pdf,
+    load_metadata,
+    log_line,
+    record_result,
+    setup_run_logger,
+)
 
 ADMIN_AJAX = "https://judicial.ky/wp-admin/admin-ajax.php"
 
@@ -142,8 +151,6 @@ def _guess_download_locators() -> List[str]:
         # Fallbacks for possible future HTML tweaks
         "a:has-text('Download')",
         "button:has-text('Download')",
-        "a:has-text(/download/i)",
-        "button:has-text(/download/i)",
         "[aria-label*='Download' i]",
         "[title*='Download' i]",
         "a[class*='download' i]",
@@ -283,7 +290,11 @@ def _compute_output_filename(fname: str, case: Optional["CaseRow"]) -> str:
     """Return a deterministic PDF filename for the provided case/fname."""
 
     token = (fname or "").strip()
-    title = case.title if case and case.title else token or "Document"
+    if case:
+        title_candidate = case.subject or case.title
+    else:
+        title_candidate = None
+    title = title_candidate if title_candidate else token or "Document"
     safe_title = _sanitize_title_for_filename(title)
 
     if not token:
@@ -317,27 +328,6 @@ def _label_for_entry(
     return fname
 
 
-def is_already_downloaded(dest_path: Path, case_meta: Optional[Dict[str, Any]]) -> bool:
-    """Return True when the file for this case already exists locally."""
-
-    try:
-        if dest_path is None:
-            return False
-        if not dest_path.is_file():
-            return False
-        if dest_path.stat().st_size < 1024:
-            return False
-    except OSError:
-        return False
-
-    if case_meta is not None:
-        downloaded_flag = case_meta.get("downloaded") or case_meta.get("downloaded_pdf")
-        if bool(downloaded_flag):
-            return True
-
-    return True
-
-
 def handle_dl_bfile_from_ajax(
     post_body: str,
     payload: Any,
@@ -367,8 +357,14 @@ def handle_dl_bfile_from_ajax(
         return "ignored"
 
     fname_value = urllib.parse.unquote_plus(fname_raw).strip()
-    fname_key = fname_value.upper() or fname_raw.upper()
-    fname_display = fname_value or fname_key
+    fname_key = normalize_action_token(fname_value or fname_raw)
+    fname_display = fname_value or fname_raw or fname_key
+
+    if not fname_key:
+        log_line(
+            f"[AJAX][WARN] Unable to normalise fname token '{fname_display}'; skipping."
+        )
+        return "failed"
 
     if seen is not None and fname_key in seen:
         log_line(f"[AJAX] fname {fname_display} already processed this run.")
@@ -411,15 +407,10 @@ def handle_dl_bfile_from_ajax(
         case_context = pending.get(fname_key)
 
     case = case_context.get("case") if case_context else None
-    slug: str
-    if case_context and case_context.get("slug"):
-        slug = case_context["slug"]
-    else:
-        slug = fname_key
-
-    entry: Optional[Dict[str, Any]] = None
+    slug = case_context.get("slug") if case_context and case_context.get("slug") else fname_key
+    meta_entry: Optional[Dict[str, Any]] = None
     if case_context:
-        entry = case_context.get("metadata_entry")
+        meta_entry = case_context.get("metadata_entry")
 
     if case is None:
         case = find_case_by_fname(fname_key, strict=True)
@@ -432,9 +423,9 @@ def handle_dl_bfile_from_ajax(
             "not skipping based on other cases."
         )
     else:
+        case_subject = case.subject or case.title or fname_key
         log_line(
-            f'[AJAX] dl_bfile request fname={fname_display} → matched case="{case.title}" '
-            f'(action={case.action})'
+            f"[AJAX] dl_bfile fname={fname_display} resolved to case='{case_subject}'"
         )
         slug = case.action
 
@@ -447,55 +438,43 @@ def handle_dl_bfile_from_ajax(
     else:
         fid_for_log = str(raw_fid_value)
     if fid_for_log:
-        short_fid = fid_for_log
-        if len(short_fid) > 96:
-            short_fid = f"{short_fid[:93]}..."
+        short_fid = fid_for_log if len(fid_for_log) <= 96 else f"{fid_for_log[:93]}..."
         log_line(
             f"[AJAX] dl_bfile fname={fname_display} using download fid={short_fid}"
         )
 
-    entry_candidate = entry
+    resolved_entry = meta_entry
     if meta is not None:
-        meta_entry, _ = find_metadata_entry(meta, slug=slug, filename=dest_path.name)
-        if meta_entry is not None:
-            entry_candidate = meta_entry
-
-    candidates: List[Dict[str, Any]] = []
-    if entry_candidate:
-        candidates.append(entry_candidate)
-    context_entry = case_context.get("metadata_entry") if case_context else None
-    if context_entry and context_entry not in candidates:
-        candidates.append(context_entry)
-
-    entry = None
-    for candidate in candidates:
-        if not candidate:
-            continue
-        stored_name = (candidate.get("local_filename") or candidate.get("filename") or "").strip()
-        if stored_name and stored_name != dest_path.name:
-            log_line(
-                f"[AJAX][WARN] Metadata filename mismatch for fname={fname_display}: "
-                f"stored={stored_name!r} expected={dest_path.name!r}; ignoring stored path."
+        lookup_entry, _ = find_metadata_entry(meta, slug=slug, filename=dest_path.name)
+        if lookup_entry is None and slug != fname_key:
+            lookup_entry, _ = find_metadata_entry(
+                meta, slug=fname_key, filename=dest_path.name
             )
-            continue
-        entry = candidate
-        break
+        if lookup_entry is not None:
+            resolved_entry = lookup_entry
 
     log_line(
         f"[AJAX] dl_bfile fname={fname_display} expected_path='{dest_path}'"
     )
 
-    label = _label_for_entry(fname_key, case, entry)
-
-    if is_already_downloaded(dest_path, entry):
+    if resolved_entry and has_local_pdf(resolved_entry):
+        label = resolved_entry.get("title") or resolved_entry.get("slug") or fname_display
         log_line(
-            f"[AJAX] Local file exists for fname={fname_display}, case=\"{label}\"; skipping download."
+            f"[AJAX] Metadata and local file confirm {label}; skipping download."
         )
         if seen is not None:
             seen.add(fname_key)
         if pending is not None:
             pending.pop(fname_key, None)
         return "duplicate"
+
+    if resolved_entry:
+        stored_name = (resolved_entry.get("local_filename") or "").strip()
+        if stored_name and stored_name != dest_path.name:
+            log_line(
+                f"[AJAX][WARN] Metadata filename mismatch for fname={fname_display}: "
+                f"stored={stored_name!r} expected={dest_path.name!r}; proceeding to download."
+            )
 
     success, error = queue_or_download_file(
         box_url,
@@ -517,19 +496,43 @@ def handle_dl_bfile_from_ajax(
     )
 
     if meta is not None:
+        subject_value = (
+            (case.subject if case else None)
+            or (resolved_entry.get("title") if resolved_entry else None)
+            or fname_display
+        )
+        category_value = None
+        judgment_value = None
+        court_value = None
+        cause_value = None
+        if case is not None:
+            category_value = case.category or case.extra.get("Category")
+            judgment_value = (
+                case.judgment_date
+                or case.extra.get("Judgment Date")
+                or case.extra.get("Date")
+            )
+            court_value = case.court or case.extra.get("Court") or case.extra.get("Court file")
+            cause_value = case.cause_number or case.extra.get("Cause Number")
+        elif resolved_entry:
+            category_value = resolved_entry.get("category")
+            judgment_value = resolved_entry.get("judgment_date")
+            court_value = resolved_entry.get("court")
+            cause_value = resolved_entry.get("cause_number")
+
         record_result(
             meta,
             slug=slug,
             fid=fid_param or fname_key,
-            title=label,
+            title=subject_value or fname_key,
             local_filename=dest_path.name,
             source_url=box_url,
             size_bytes=size_bytes,
-            category=(case.extra.get("Category") if case else None),
-            judgment_date=(
-                case.extra.get("Judgment Date") if case else None
-            )
-            or (case.extra.get("Date") if case else None),
+            category=category_value,
+            judgment_date=judgment_value,
+            court=court_value,
+            cause_number=cause_value,
+            subject=subject_value,
             local_path=str(dest_path.resolve()),
         )
 
@@ -550,11 +553,16 @@ def run_scrape(
     entry_cap: Optional[int] = None,
     page_wait: Optional[int] = None,
     per_delay: Optional[float] = None,
+    start_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Execute a scraping run using Playwright + captured dl_bfile AJAX responses.
     """
     ensure_dirs()
+
+    log_path = setup_run_logger()
+    if start_message:
+        log_line(start_message)
 
     base_url = (base_url or config.DEFAULT_BASE_URL).strip()
     entry_cap = entry_cap or config.ENTRY_CAP
@@ -572,6 +580,16 @@ def run_scrape(
     load_cases_index("data/judgments.csv")
     meta = load_metadata()
 
+    downloaded_index: Dict[str, Dict[str, Any]] = {}
+    for entry in meta.get("downloads", []):
+        if not isinstance(entry, dict):
+            continue
+        slug_value = normalize_action_token(entry.get("slug") or entry.get("fid") or "")
+        if not slug_value:
+            continue
+        if entry.get("downloaded") and has_local_pdf(entry):
+            downloaded_index[slug_value] = entry
+
     summary: Dict[str, Any] = {
         "base_url": base_url,
         "processed": 0,
@@ -579,6 +597,7 @@ def run_scrape(
         "failed": 0,
         "skipped": 0,
         "total_cases": len(CASES_BY_ACTION),
+        "log_file": str(log_path),
     }
 
     if not CASES_BY_ACTION:
@@ -729,36 +748,48 @@ def run_scrape(
 
             # ---------- Click download buttons to trigger dl_bfile ----------
 
-            locators = _guess_download_locators()
-            clicked = 0
-            max_clicks = entry_cap
+            total_clicks = 0
+            page_number = 1
 
-            for sel in locators:
-                if clicked >= max_clicks:
-                    break
-
-                try:
-                    items = page.locator(sel)
-                    count = items.count()
-                except Exception as exc:
-                    log_line(f"Locator {sel!r} lookup failed: {exc}")
-                    continue
-
-                if not count:
-                    continue
-
-                log_line(f"Locator {sel!r} matched {count} elements")
-
-                for i in range(count):
-                    if clicked >= max_clicks:
+            try:
+                page.wait_for_selector("button:has(i.icon-dl)", timeout=25_000)
+            except PWTimeout:
+                log_line("No download buttons detected within timeout; aborting run.")
+            else:
+                while True:
+                    try:
+                        buttons = page.locator("button:has(i.icon-dl)")
+                        count = buttons.count()
+                    except Exception as exc:
+                        log_line(f"Failed to enumerate download buttons: {exc}")
                         break
 
-                    try:
-                        el = items.nth(i)
+                    if not count:
+                        log_line(f"No download buttons found on page {page_number}; stopping.")
+                        break
 
-                        # Resolve fname so the AJAX handler can associate responses precisely.
+                    log_line(
+                        f"Processing pagination page {page_number}: {count} download button(s)"
+                    )
+
+                    for i in range(count):
+                        if entry_cap is not None and total_clicks >= entry_cap:
+                            log_line("Entry cap reached; stopping pagination loop.")
+                            break
+
+                        try:
+                            el = buttons.nth(i)
+                        except Exception as exc:
+                            log_line(f"Failed to access button index {i}: {exc}")
+                            continue
+
                         fname_token: Optional[str] = None
-                        for attr_name in ("data-dl", "data-fname", "data-filename", "data-target"):
+                        for attr_name in (
+                            "data-dl",
+                            "data-fname",
+                            "data-filename",
+                            "data-target",
+                        ):
                             try:
                                 raw_value = el.get_attribute(attr_name)
                             except Exception:
@@ -777,62 +808,99 @@ def run_scrape(
                                 if match:
                                     fname_token = match.group(1).strip()
 
-                        if fname_token:
-                            fname_token_key = fname_token.strip().upper()
-                            case_for_fname = find_case_by_fname(fname_token_key, strict=True)
-                            if case_for_fname is not None:
-                                slug = case_for_fname.action
-                            else:
-                                slug = fname_token_key
-                            entry_for_fname: Optional[Dict[str, Any]] = None
-                            if meta is not None:
-                                entry_for_fname, _ = find_metadata_entry(
-                                    meta,
-                                    slug=slug,
-                                    filename=None,
-                                )
-                            pending_by_fname[fname_token_key] = {
-                                "case": case_for_fname,
-                                "metadata_entry": entry_for_fname,
-                                "slug": slug,
-                                "raw": fname_token,
-                            }
+                        fname_key = normalize_action_token(fname_token or "")
+                        if not fname_key:
+                            log_line(
+                                f"[AJAX][WARN] Skipping button index {i} on page {page_number}: "
+                                "unable to normalise fname token."
+                            )
+                            continue
 
-                        # Try normal click; if Playwright internals are broken, fall back to JS.
+                        metadata_entry = downloaded_index.get(fname_key)
+                        if metadata_entry and has_local_pdf(metadata_entry):
+                            label = metadata_entry.get("title") or fname_key
+                            log_line(
+                                f"[SKIP] fname={fname_token} already downloaded as {label}; skipping click."
+                            )
+                            seen_fnames_in_run.add(fname_key)
+                            summary["skipped"] += 1
+                            continue
+
+                        case_for_fname = CASES_BY_ACTION.get(fname_key)
+                        slug_value = (
+                            case_for_fname.action if case_for_fname else fname_key
+                        )
+
+                        pending_by_fname[fname_key] = {
+                            "case": case_for_fname,
+                            "metadata_entry": metadata_entry,
+                            "slug": slug_value,
+                            "raw": fname_token,
+                        }
+
                         try:
                             el.click(timeout=2000)
                         except Exception as exc_click:
                             log_line(
-                                f"Playwright click failed for {sel!r} index {i}: "
+                                f"Playwright click failed for button index {i} on page {page_number}: "
                                 f"{exc_click}; trying JS click."
                             )
                             try:
                                 el.evaluate("el => el.click()")
                             except Exception as exc_js:
                                 log_line(
-                                    f"JS click also failed for {sel!r} index {i}: "
-                                    f"{exc_js}"
+                                    f"JS click also failed for button index {i} on page {page_number}: {exc_js}"
                                 )
+                                pending_by_fname.pop(fname_key, None)
                                 continue
 
-                        clicked += 1
-                        summary["processed"] = clicked
-                        log_line(f"Clicked element {i} for selector {sel!r}")
-
-                        # Wait a bit so dl_bfile AJAX + handler can run.
-                        time.sleep(per_delay + 0.4)
-
-                    except Exception as exc:
+                        total_clicks += 1
+                        summary["processed"] = total_clicks
                         log_line(
-                            f"Unexpected error for selector {sel!r} index {i}: {exc}"
+                            f"Clicked download button index {i} on page {page_number} (fname={fname_token})."
                         )
-                        continue
+
+                        time.sleep((per_delay or 0) + 0.4)
+
+                    if entry_cap is not None and total_clicks >= entry_cap:
+                        break
+
+                    next_button = page.locator(
+                        "ul.pagination li.dt-paging-button button.page-link.next"
+                    )
+                    if next_button.count() == 0:
+                        log_line("No pagination 'next' button found; ending traversal.")
+                        break
+
+                    parent = next_button.first.locator("xpath=..")
+                    classes = (parent.get_attribute("class") or "") if parent else ""
+                    aria_disabled = next_button.first.get_attribute("aria-disabled")
+                    if "disabled" in classes or aria_disabled == "true":
+                        log_line("Reached final pagination page.")
+                        break
+
+                    log_line(f"Advancing to pagination page {page_number + 1}")
+                    try:
+                        next_button.first.click()
+                    except Exception as exc:
+                        log_line(f"Failed to click pagination 'next' button: {exc}")
+                        break
+
+                    wait_seconds(page, float(page_wait) if page_wait else 1.0)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10_000)
+                    except PWTimeout:
+                        log_line("Pagination networkidle wait timed out; continuing.")
+
+                    page_number += 1
+                    wait_seconds(page, 0.5)
 
             # Final grace period for late AJAX responses
             time.sleep(2.5)
 
+            summary["processed"] = total_clicks
             log_line(
-                f"Clicks attempted: {clicked}. "
+                f"Clicks attempted: {total_clicks}. "
                 f"Downloads={summary['downloaded']}, "
                 f"Failed={summary['failed']}, "
                 f"Skipped={summary['skipped']}"
@@ -868,7 +936,11 @@ if __name__ == "__main__":  # pragma: no cover - quick manual verification
         code="FSD0151202511062025",
         suffix="ATPLIFESCIENCE",
         title="Re ATP Life Science Ventures LP - Judgment",
-        extra={"Category": "Grand Court", "Judgment Date": "2025-Nov-06"},
+        subject="Re ATP Life Science Ventures LP - Judgment",
+        court="Grand Court",
+        category="Financial Services",
+        judgment_date="2025-Nov-06",
+        extra={"Category": "Financial Services", "Judgment Date": "2025-Nov-06"},
     )
     CASES_BY_ACTION[sample_case.action] = sample_case
     AJAX_FNAME_INDEX[sample_case.action] = sample_case
@@ -878,6 +950,10 @@ if __name__ == "__main__":  # pragma: no cover - quick manual verification
         code="1J1CB5JDVWQJ1DE60AG13020",
         suffix="A37E6E68EADE88BE7AE51E57A648",
         title="Embedded Token Fixture",
+        subject="Embedded Token Fixture",
+        court="Example Court",
+        category="Example",
+        judgment_date="2024-Jun-01",
         extra={"Category": "Example", "Judgment Date": "2024-Jun-01"},
     )
     CASES_BY_ACTION[embedded_case.action] = embedded_case

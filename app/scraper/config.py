@@ -6,7 +6,8 @@ from pathlib import Path
 
 DATA_DIR: Path = Path("/app/data")
 PDF_DIR: Path = DATA_DIR / "pdfs"
-LOG_FILE: Path = PDF_DIR / "scrape_log.txt"
+LOG_DIR: Path = DATA_DIR / "logs"
+LOG_FILE: Path = LOG_DIR / "latest.log"
 METADATA_FILE: Path = DATA_DIR / "metadata.json"
 CONFIG_FILE: Path = DATA_DIR / "config.txt"
 

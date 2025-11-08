@@ -145,6 +145,9 @@ def attempt_download_case(
             size_bytes=out_path.stat().st_size,
             category=case.get("category"),
             judgment_date=case.get("judgment_date"),
+            court=case.get("court"),
+            cause_number=case.get("cause_number"),
+            subject=case.get("subject") or case.get("title"),
             local_path=str(out_path.resolve()),
         )
         result = {"status": "downloaded", "fid": fid, "filename": out_path.name}

@@ -1,8 +1,8 @@
-"""Utility helpers for filesystem, logging, and metadata management."""
-
 from __future__ import annotations
 
 import json
+import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Tuple
@@ -10,14 +10,80 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from . import config
 
+LOGGER = logging.getLogger("bailiikc")
+_LOGGER_INITIALISED = False
+_CURRENT_LOG_FILE: Path = config.LOG_FILE
+
+
+def _configure_logger(log_path: Path) -> None:
+    """Configure the shared application logger to write to ``log_path``."""
+
+    global _LOGGER_INITIALISED, _CURRENT_LOG_FILE
+
+    ensure_dirs()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for handler in list(LOGGER.handlers):
+        LOGGER.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:  # noqa: BLE001
+            continue
+
+    formatter = logging.Formatter(
+        fmt="[%(asctime)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.addHandler(stream_handler)
+    LOGGER.addHandler(file_handler)
+    LOGGER.propagate = False
+
+    _CURRENT_LOG_FILE = log_path
+    _LOGGER_INITIALISED = True
+
+
+def _ensure_logger() -> None:
+    """Initialise the logger lazily using the default log file."""
+
+    if _LOGGER_INITIALISED:
+        return
+
+    default_log = config.LOG_FILE
+    default_log.parent.mkdir(parents=True, exist_ok=True)
+    _configure_logger(default_log)
+
+
+def setup_run_logger() -> Path:
+    """Rotate to a fresh timestamped log file for the current run."""
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    log_path = config.LOG_DIR / f"scrape_{timestamp}.log"
+    _configure_logger(log_path)
+    LOGGER.info("Logging to %s", log_path)
+    return log_path
+
+
+def get_current_log_path() -> Path:
+    """Return the path to the log file currently receiving log lines."""
+
+    _ensure_logger()
+    return _CURRENT_LOG_FILE
+
 
 def ensure_dirs() -> None:
     """Ensure that the application's expected directory structure exists."""
+
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     config.PDF_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not config.LOG_FILE.exists():
-        config.LOG_FILE.touch()
+    config.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     if not config.METADATA_FILE.exists():
         config.METADATA_FILE.write_text(
@@ -27,15 +93,10 @@ def ensure_dirs() -> None:
 
 
 def log_line(message: str) -> None:
-    """
-    Write a timestamped log line to stdout and the scrape log file.
-    """
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {message}"
-    print(line, flush=True)
+    """Write a timestamped log line to stdout and the active log file."""
 
-    with config.LOG_FILE.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
+    _ensure_logger()
+    LOGGER.info(message)
 
 
 def sanitize_filename(name: str) -> str:
@@ -65,14 +126,14 @@ def load_metadata() -> dict[str, Any]:
     except (json.JSONDecodeError, FileNotFoundError):
         data = {"downloads": []}
 
-    data.setdefault("downloads", [])
+    downloads = data.setdefault("downloads", [])
+    if not isinstance(downloads, list):
+        data["downloads"] = []
     return data
 
 
 def save_metadata(meta: dict[str, Any]) -> None:
-    """
-    Persist metadata to disk atomically.
-    """
+    """Persist metadata to disk atomically."""
     tmp_path = config.METADATA_FILE.with_suffix(".tmp")
 
     with tmp_path.open("w", encoding="utf-8") as handle:
@@ -149,7 +210,6 @@ def is_duplicate(
 ) -> bool:
     """Return ``True`` when metadata confirms the file is already downloaded."""
 
-    downloads = meta.get("downloads", [])
     entry, index = find_metadata_entry(meta, slug=slug, fid=fid, filename=filename)
 
     if entry is None:
@@ -199,7 +259,7 @@ def is_duplicate(
     log_line(
         "Metadata entry for %s exists but no valid PDF is present; refreshing." % title
     )
-
+    downloads = meta.get("downloads", [])
     if 0 <= index < len(downloads):
         downloads.pop(index)
         save_metadata(meta)
@@ -218,13 +278,14 @@ def record_result(
     size_bytes: int,
     category: str | None = None,
     judgment_date: str | None = None,
+    court: str | None = None,
+    cause_number: str | None = None,
+    subject: str | None = None,
     downloaded_at: str | None = None,
     extra_fields: dict[str, Any] | None = None,
     local_path: str | None = None,
 ) -> None:
-    """
-    Persist download metadata for a successfully saved PDF.
-    """
+    """Persist download metadata for a successfully saved PDF."""
 
     downloads = meta.setdefault("downloads", [])
     entry, _ = find_metadata_entry(
@@ -257,6 +318,12 @@ def record_result(
         entry["category"] = category
     if judgment_date is not None:
         entry["judgment_date"] = judgment_date
+    if court is not None:
+        entry["court"] = court
+    if cause_number is not None:
+        entry["cause_number"] = cause_number
+    if subject is not None:
+        entry["subject"] = subject
     if extra_fields:
         entry.update(extra_fields)
 
@@ -264,9 +331,7 @@ def record_result(
 
 
 def list_pdfs() -> list[Path]:
-    """
-    Return all PDF files currently stored in the PDF directory.
-    """
+    """Return all PDF files currently stored in the PDF directory."""
     ensure_dirs()
     return sorted(
         p for p in config.PDF_DIR.glob("*.pdf")
@@ -275,11 +340,7 @@ def list_pdfs() -> list[Path]:
 
 
 def build_zip(zip_name: str = config.ZIP_NAME) -> Path:
-    """
-    Create a ZIP archive containing all downloaded PDFs.
-
-    Returns the path to the generated archive.
-    """
+    """Create a ZIP archive containing all downloaded PDFs."""
     ensure_dirs()
     archive_path = config.DATA_DIR / zip_name
 
@@ -291,9 +352,7 @@ def build_zip(zip_name: str = config.ZIP_NAME) -> Path:
 
 
 def load_base_url() -> str:
-    """
-    Load the persisted base URL, or fall back to DEFAULT_BASE_URL.
-    """
+    """Load the persisted base URL, or fall back to DEFAULT_BASE_URL."""
     ensure_dirs()
 
     if config.CONFIG_FILE.exists():
@@ -305,15 +364,52 @@ def load_base_url() -> str:
 
 
 def save_base_url(url: str) -> None:
-    """
-    Persist the base URL to the configuration file.
-    """
+    """Persist the base URL to the configuration file."""
     ensure_dirs()
     config.CONFIG_FILE.write_text(url.strip(), encoding="utf-8")
 
 
+def reset_state(*, delete_pdfs: bool = False, delete_logs: bool = False) -> None:
+    """Reset metadata and optionally remove downloaded assets."""
+
+    ensure_dirs()
+
+    if config.METADATA_FILE.exists():
+        try:
+            config.METADATA_FILE.unlink()
+        except OSError:
+            pass
+
+    if delete_pdfs:
+        for path in config.PDF_DIR.glob("*.pdf"):
+            try:
+                path.unlink()
+            except OSError:
+                continue
+
+    if delete_logs:
+        for path in config.LOG_DIR.glob("scrape_*.log"):
+            try:
+                path.unlink()
+            except OSError:
+                continue
+
+        latest = config.LOG_FILE
+        if latest.exists():
+            try:
+                latest.unlink()
+            except OSError:
+                pass
+
+    # Recreate required files and reset logger to a clean default file.
+    ensure_dirs()
+    _configure_logger(config.LOG_FILE)
+
+
 __all__ = [
     "ensure_dirs",
+    "setup_run_logger",
+    "get_current_log_path",
     "log_line",
     "sanitize_filename",
     "load_metadata",
@@ -326,4 +422,5 @@ __all__ = [
     "build_zip",
     "load_base_url",
     "save_base_url",
+    "reset_state",
 ]

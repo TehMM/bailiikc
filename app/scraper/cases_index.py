@@ -1,9 +1,10 @@
-"""Central index mapping AJAX fname tokens to case metadata from judgments CSV."""
 from __future__ import annotations
 
 import csv
+import html
 import io
 import re
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -18,6 +19,26 @@ ACTION_SPLIT_RE = re.compile(r"^([A-Z]+[0-9]+[0-9]{8})([A-Z0-9]+)?$")
 TOKEN_SPLIT_RE = re.compile(r"[|,;/\\\s]+")
 
 
+def normalize_action_token(raw: str) -> str:
+    """Return the canonical representation of an action token."""
+
+    if raw is None:
+        return ""
+
+    token = html.unescape(str(raw))
+    token = urllib.parse.unquote_plus(token)
+    token = token.replace("\u00a0", " ")
+    token = token.strip()
+    if not token:
+        return ""
+
+    if token.lower().endswith(".pdf"):
+        token = token[:-4]
+
+    token = re.sub(r"\s+", "", token)
+    return token.upper()
+
+
 @dataclass(frozen=True)
 class CaseRow:
     """Lightweight representation of a case row from the judgments CSV."""
@@ -26,6 +47,11 @@ class CaseRow:
     code: str
     suffix: str
     title: str
+    subject: str = ""
+    court: str = ""
+    category: str = ""
+    judgment_date: str = ""
+    cause_number: str = ""
     extra: Dict[str, str] = field(default_factory=dict)
 
 
@@ -96,39 +122,67 @@ def load_cases_from_csv(csv_path: str) -> None:
     skipped_blank = 0
 
     for row in reader:
-        actions_raw = (row.get("Actions") or row.get("Action") or "").strip()
+        actions_raw = html.unescape((row.get("Actions") or row.get("Action") or "").strip())
         if not actions_raw:
             skipped_blank += 1
             continue
 
-        title = (row.get("Title") or row.get("Case Title") or "").strip()
-        tokens = [tok.strip() for tok in TOKEN_SPLIT_RE.split(actions_raw) if tok.strip()]
-        if not tokens:
+        title = (row.get("Title") or row.get("Case Title") or row.get("Subject") or "").strip()
+        subject = (row.get("Subject") or title or "").strip()
+        court = (row.get("Court") or row.get("Court file") or "").strip()
+        category = (row.get("Category") or "").strip()
+        judgment_date = (row.get("Judgment Date") or row.get("Date") or "").strip()
+        cause_number = (
+            row.get("Cause Number")
+            or row.get("Cause number")
+            or row.get("Cause No.")
+            or row.get("Cause")
+            or ""
+        ).strip()
+
+        raw_tokens = [tok.strip() for tok in TOKEN_SPLIT_RE.split(actions_raw) if tok.strip()]
+        if not raw_tokens:
             skipped_blank += 1
             continue
 
         row_extra = {k: (v or "").strip() for k, v in row.items()}
+        row_extra["_raw_actions"] = actions_raw
 
-        for token in tokens:
-            full = token.upper()
-            match = ACTION_SPLIT_RE.match(full)
+        for token in raw_tokens:
+            normalized = normalize_action_token(token)
+            if not normalized:
+                continue
+
+            match = ACTION_SPLIT_RE.match(normalized)
             if match:
                 code = match.group(1)
                 suffix = match.group(2) or ""
             else:
-                code = full
+                code = normalized
                 suffix = ""
 
-            case = CaseRow(action=full, code=code, suffix=suffix, title=title, extra=row_extra)
-            existing = CASES_BY_ACTION.get(full)
+            case_title = title or subject or normalized
+            case = CaseRow(
+                action=normalized,
+                code=code,
+                suffix=suffix,
+                title=case_title,
+                subject=subject or case_title,
+                court=court,
+                category=category,
+                judgment_date=judgment_date,
+                cause_number=cause_number,
+                extra=row_extra,
+            )
+            existing = CASES_BY_ACTION.get(normalized)
             if existing and existing.extra != case.extra:
                 log_line(
-                    f"[CSV] Duplicate action token {full} encountered; keeping first occurrence."
+                    f"[CSV] Duplicate action token {normalized} encountered; keeping first occurrence."
                 )
                 continue
 
-            CASES_BY_ACTION[full] = case
-            AJAX_FNAME_INDEX[full] = case
+            CASES_BY_ACTION[normalized] = case
+            AJAX_FNAME_INDEX[normalized] = case
             CASES_ALL.append(case)
             loaded += 1
 
@@ -144,7 +198,7 @@ def find_case_by_fname(fname: str, *, strict: bool = False) -> Optional[CaseRow]
     if not fname:
         return None
 
-    candidate = fname.strip().upper()
+    candidate = normalize_action_token(fname)
     if not candidate:
         return None
 
@@ -202,29 +256,39 @@ if __name__ == "__main__":  # pragma: no cover - manual verification aid
 
     stream = io.StringIO(sample_csv)
     CASES_BY_ACTION.clear()
+    AJAX_FNAME_INDEX.clear()
     CASES_ALL.clear()
     reader = csv.DictReader(stream)
     for row in reader:
-        actions_raw = (row.get("Actions") or "").strip()
-        tokens = [tok.strip() for tok in TOKEN_SPLIT_RE.split(actions_raw) if tok.strip()]
+        actions_raw = row.get("Actions") or ""
+        tokens = [
+            normalize_action_token(part)
+            for part in TOKEN_SPLIT_RE.split(actions_raw)
+            if part.strip()
+        ]
         row_extra = {k: (v or "").strip() for k, v in row.items()}
-        for token in tokens:
-            full = token.upper()
-            match = ACTION_SPLIT_RE.match(full)
+        for token in filter(None, tokens):
+            match = ACTION_SPLIT_RE.match(token)
             if match:
                 code = match.group(1)
                 suffix = match.group(2) or ""
             else:
-                code = full
+                code = token
                 suffix = ""
-            CASES_BY_ACTION[full] = CaseRow(
-                action=full,
+            case = CaseRow(
+                action=token,
                 code=code,
                 suffix=suffix,
                 title=(row.get("Title") or "").strip(),
+                subject=(row.get("Subject") or row.get("Title") or "").strip(),
+                court=(row.get("Court file") or "").strip(),
+                category=(row.get("Category") or "").strip(),
+                judgment_date=(row.get("Date") or "").strip(),
                 extra=row_extra,
             )
-    CASES_ALL.extend(CASES_BY_ACTION.values())
+            CASES_BY_ACTION[token] = case
+            AJAX_FNAME_INDEX[token] = case
+            CASES_ALL.append(case)
 
     print("Exact lookup:", find_case_by_fname("FSD0151202511062025ATPLIFESCIENCE"))
     print("Embedded lookup:", find_case_by_fname("AG13020"))

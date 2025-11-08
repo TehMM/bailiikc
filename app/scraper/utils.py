@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Tuple
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from . import config
@@ -81,32 +81,104 @@ def save_metadata(meta: dict[str, Any]) -> None:
     tmp_path.replace(config.METADATA_FILE)
 
 
-def is_duplicate(fid: str, filename: str, meta: dict[str, Any]) -> bool:
-    """Return ``True`` when the metadata indicates we already have the file."""
+def find_metadata_entry(
+    meta: dict[str, Any],
+    *,
+    slug: str | None = None,
+    fid: str | None = None,
+    filename: str | None = None,
+) -> Tuple[dict[str, Any] | None, int]:
+    """Return the matching metadata entry (and its index) if present."""
 
-    downloads = meta.get("downloads", [])
-    stale_indexes: list[int] = []
+    downloads = meta.get("downloads") or []
 
     for index, entry in enumerate(downloads):
-        if entry.get("fid") != fid and entry.get("filename") != filename:
-            continue
+        identifiers = {
+            entry.get("slug"),
+            entry.get("fid"),
+            entry.get("filename"),
+            entry.get("local_filename"),
+        }
 
-        stored_name = entry.get("filename") or filename
-        pdf_path = config.PDF_DIR / stored_name
+        if slug and slug in identifiers:
+            return entry, index
+        if fid and fid in identifiers:
+            return entry, index
+        if filename and filename in identifiers:
+            return entry, index
 
-        if not pdf_path.exists() or pdf_path.stat().st_size == 0:
-            log_line(
-                "Metadata claims %s is downloaded but file is missing; removing stale "
-                "entry" % stored_name
-            )
-            stale_indexes.append(index)
-            continue
+    return None, -1
 
+
+def has_local_pdf(meta_entry: dict[str, Any] | None) -> bool:
+    """Return ``True`` if *meta_entry* points to a valid local PDF file."""
+
+    if not meta_entry:
+        return False
+
+    stored_name = meta_entry.get("local_filename") or meta_entry.get("filename")
+    if not stored_name:
+        return False
+
+    pdf_path = config.PDF_DIR / stored_name
+    if not pdf_path.is_file():
+        return False
+
+    try:
+        size = pdf_path.stat().st_size
+    except OSError:
+        return False
+
+    return size > 1024
+
+
+def is_duplicate(
+    fid: str,
+    filename: str,
+    meta: dict[str, Any],
+    slug: str | None = None,
+) -> bool:
+    """Return ``True`` when metadata confirms the file is already downloaded."""
+
+    downloads = meta.get("downloads", [])
+    entry, index = find_metadata_entry(meta, slug=slug, fid=fid, filename=filename)
+
+    if entry is None:
+        return False
+
+    if entry.get("downloaded") and has_local_pdf(entry):
         return True
 
-    if stale_indexes:
-        for idx in reversed(stale_indexes):
-            downloads.pop(idx)
+    stored_name = (
+        entry.get("local_filename")
+        or entry.get("filename")
+        or filename
+    )
+    pdf_path = config.PDF_DIR / stored_name
+
+    if pdf_path.is_file() and pdf_path.stat().st_size > 1024:
+        entry.update(
+            {
+                "slug": slug or entry.get("slug") or fid,
+                "fid": entry.get("fid") or fid,
+                "local_filename": stored_name,
+                "filename": stored_name,
+                "downloaded": True,
+                "filesize": pdf_path.stat().st_size,
+                "downloaded_at": datetime.utcnow().isoformat(timespec="seconds")
+                + "Z",
+            }
+        )
+        save_metadata(meta)
+        return True
+
+    title = entry.get("title") or slug or fid or filename
+    log_line(
+        "Metadata entry for %s exists but no valid PDF is present; refreshing." % title
+    )
+
+    if 0 <= index < len(downloads):
+        downloads.pop(index)
         save_metadata(meta)
 
     return False
@@ -114,21 +186,53 @@ def is_duplicate(fid: str, filename: str, meta: dict[str, Any]) -> bool:
 
 def record_result(
     meta: dict[str, Any],
+    *,
+    slug: str,
     fid: str,
-    filename: str,
-    fields: dict[str, Any],
+    title: str,
+    local_filename: str,
+    source_url: str,
+    size_bytes: int,
+    category: str | None = None,
+    judgment_date: str | None = None,
+    downloaded_at: str | None = None,
+    extra_fields: dict[str, Any] | None = None,
 ) -> None:
     """
-    Append a successful download record to metadata and save.
+    Persist download metadata for a successfully saved PDF.
     """
-    record = {
-        "fid": fid,
-        "filename": filename,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-    }
-    record.update(fields)
 
-    meta.setdefault("downloads", []).append(record)
+    downloads = meta.setdefault("downloads", [])
+    entry, _ = find_metadata_entry(
+        meta, slug=slug, fid=fid, filename=local_filename
+    )
+
+    if entry is None:
+        entry = {}
+        downloads.append(entry)
+
+    entry.update(
+        {
+            "slug": slug,
+            "fid": fid,
+            "title": title,
+            "local_filename": local_filename,
+            "filename": local_filename,
+            "downloaded": True,
+            "filesize": int(size_bytes),
+            "downloaded_at": downloaded_at
+            or datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "source_url": source_url,
+        }
+    )
+
+    if category is not None:
+        entry["category"] = category
+    if judgment_date is not None:
+        entry["judgment_date"] = judgment_date
+    if extra_fields:
+        entry.update(extra_fields)
+
     save_metadata(meta)
 
 
@@ -187,6 +291,8 @@ __all__ = [
     "sanitize_filename",
     "load_metadata",
     "save_metadata",
+    "find_metadata_entry",
+    "has_local_pdf",
     "is_duplicate",
     "record_result",
     "list_pdfs",

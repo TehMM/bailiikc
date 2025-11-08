@@ -46,16 +46,11 @@ from .cases_index import (
     find_case_by_fname,
     load_cases_from_csv as load_cases_index,
 )
-from .utils import (
-    ensure_dirs,
-    find_metadata_entry,
-    is_duplicate,
-    load_metadata,
-    log_line,
-    record_result,
-)
+from .utils import ensure_dirs, find_metadata_entry, load_metadata, log_line, record_result
 
 ADMIN_AJAX = "https://judicial.ky/wp-admin/admin-ajax.php"
+
+_ONCLICK_FNAME_RE = re.compile(r"dl_bfile[^'\"]*['\"]([A-Za-z0-9]+)['\"]", re.IGNORECASE)
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -257,6 +252,71 @@ def queue_or_download_file(
     return False, last_error
 
 
+def _compute_output_filename(
+    fname: str,
+    case: Optional["CaseRow"],
+    entry: Optional[Dict[str, Any]],
+) -> str:
+    """Return a safe filename for the target download."""
+
+    if entry:
+        existing = entry.get("local_filename") or entry.get("filename")
+        if isinstance(existing, str) and existing.strip():
+            return existing.strip()
+
+    base_name: str
+    if case and case.code and case.title:
+        base_name = f"{case.code} - {case.title}"
+    elif case and case.action and case.title:
+        base_name = f"{case.action} - {case.title}"
+    else:
+        base_name = fname
+
+    safe_title = re.sub(r"[^\w\s\-\.,()]+", "_", base_name).strip(" _") or fname
+    if safe_title.lower().endswith(".pdf"):
+        return safe_title
+    return f"{safe_title}.pdf"
+
+
+def _label_for_entry(
+    fname: str,
+    case: Optional["CaseRow"],
+    entry: Optional[Dict[str, Any]],
+) -> str:
+    """Build a human-readable label for logging."""
+
+    if entry:
+        title = entry.get("title") or entry.get("slug")
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+
+    if case and case.title:
+        return case.title
+
+    return fname
+
+
+def is_already_downloaded(dest_path: Path, case_meta: Optional[Dict[str, Any]]) -> bool:
+    """Return True when the file for this case already exists locally."""
+
+    try:
+        if dest_path is None:
+            return False
+        if not dest_path.is_file():
+            return False
+        if dest_path.stat().st_size < 1024:
+            return False
+    except OSError:
+        return False
+
+    if case_meta is not None:
+        downloaded_flag = case_meta.get("downloaded") or case_meta.get("downloaded_pdf")
+        if bool(downloaded_flag):
+            return True
+
+    return True
+
+
 def handle_dl_bfile_from_ajax(
     post_body: str,
     payload: Any,
@@ -265,6 +325,7 @@ def handle_dl_bfile_from_ajax(
     meta: Optional[Dict[str, Any]] = None,
     seen: Optional[Set[str]] = None,
     http_client: Optional[Any] = None,
+    pending: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> str:
     """Process a dl_bfile AJAX response and download the corresponding PDF."""
 
@@ -278,6 +339,8 @@ def handle_dl_bfile_from_ajax(
 
     if seen is not None and fname in seen:
         log_line(f"[AJAX] fname {fname} already processed this run.")
+        if pending is not None:
+            pending.pop(fname, None)
         return "duplicate"
 
     if not isinstance(payload, dict):
@@ -286,12 +349,16 @@ def handle_dl_bfile_from_ajax(
         )
         if seen is not None:
             seen.add(fname)
+        if pending is not None:
+            pending.pop(fname, None)
         return "failed"
 
     if payload in (-1, "-1") or not payload.get("success"):
         log_line(f"[AJAX][WARN] dl_bfile failure for fname={fname}: {payload!r}")
         if seen is not None:
             seen.add(fname)
+        if pending is not None:
+            pending.pop(fname, None)
         return "failed"
 
     data = payload.get("data") or {}
@@ -302,52 +369,52 @@ def handle_dl_bfile_from_ajax(
         )
         if seen is not None:
             seen.add(fname)
+        if pending is not None:
+            pending.pop(fname, None)
         return "failed"
 
-    case = find_case_by_fname(fname)
-    if not case:
-        log_line(f"[AJAX] fname not found in CSV: {fname}; skipping.")
-        if seen is not None:
-            seen.add(fname)
-        return "unknown"
+    case_context: Optional[Dict[str, Any]] = None
+    if pending is not None:
+        case_context = pending.get(fname)
 
-    slug = fname or fid_param or case.action
-    entry: Dict[str, Any] | None = None
-    if meta is not None:
+    case = case_context.get("case") if case_context else None
+    slug = (case_context.get("slug") if case_context else None) or fname or fid_param
+
+    entry: Optional[Dict[str, Any]] = None
+    if case_context:
+        entry = case_context.get("metadata_entry")
+
+    if case is None:
+        case = find_case_by_fname(fname)
+        if case is None:
+            log_line(
+                f"[AJAX] No case mapping resolved for fname={fname}; proceeding with generic naming."
+            )
+
+    if meta is not None and entry is None:
         entry, _ = find_metadata_entry(meta, slug=slug, fid=fid_param or None)
 
-    if case.code and case.title:
-        base_name = f"{case.code} - {case.title}"
-    elif case.action and case.title:
-        base_name = f"{case.action} - {case.title}"
-    else:
-        base_name = case.action or fname
-
-    safe_title = re.sub(r"[^\w\s\-\.,()]+", "_", base_name).strip(" _") or case.action or fname
-    filename = safe_title if safe_title.lower().endswith(".pdf") else f"{safe_title}.pdf"
-    if entry and (entry.get("local_filename") or entry.get("filename")):
-        filename = entry.get("local_filename") or entry.get("filename")  # type: ignore[assignment]
-
+    filename = _compute_output_filename(fname, case, entry)
     dest_path = Path(downloads_dir) / filename
 
-    if meta is not None and is_duplicate(
-        fid_param or fname,
-        dest_path.name,
-        meta,
-        slug=slug,
-    ):
-        refreshed, _ = find_metadata_entry(
+    if meta is not None and entry is None and filename:
+        entry, _ = find_metadata_entry(
             meta,
             slug=slug,
             fid=fid_param or None,
-            filename=dest_path.name,
+            filename=filename,
         )
-        title_for_log = (refreshed or {}).get("title") or base_name
+
+    label = _label_for_entry(fname, case, entry)
+
+    if is_already_downloaded(dest_path, entry):
         log_line(
-            f"[AJAX] Metadata and local file confirm {title_for_log}; skipping download."
+            f"[AJAX] Metadata and local file confirm {label}; skipping download."
         )
         if seen is not None:
             seen.add(fname)
+        if pending is not None:
+            pending.pop(fname, None)
         return "duplicate"
 
     success, error = queue_or_download_file(
@@ -359,31 +426,35 @@ def handle_dl_bfile_from_ajax(
         log_line(f"[AJAX] Failed to save {fname} to {dest_path}: {error}")
         if seen is not None:
             seen.add(fname)
+        if pending is not None:
+            pending.pop(fname, None)
         dest_path.unlink(missing_ok=True)
         return "failed"
 
     size_bytes = dest_path.stat().st_size
-    log_line(
-        f"[AJAX] Saved {fname} -> {dest_path} ({size_bytes/1024:.1f} KiB)"
-    )
+    log_line(f"[AJAX] Saved {fname} -> {dest_path} ({size_bytes/1024:.1f} KiB)")
 
     if meta is not None:
         record_result(
             meta,
             slug=slug,
             fid=fid_param or fname,
-            title=case.title or base_name,
+            title=label,
             local_filename=dest_path.name,
             source_url=box_url,
             size_bytes=size_bytes,
-            category=case.extra.get("Category"),
-            judgment_date=case.extra.get("Judgment Date")
-            or case.extra.get("Date"),
+            category=(case.extra.get("Category") if case else None),
+            judgment_date=(
+                case.extra.get("Judgment Date") if case else None
+            )
+            or (case.extra.get("Date") if case else None),
             local_path=str(dest_path.resolve()),
         )
 
     if seen is not None:
         seen.add(fname)
+    if pending is not None:
+        pending.pop(fname, None)
 
     return "downloaded"
 
@@ -433,6 +504,7 @@ def run_scrape(
         return summary
 
     seen_fnames_in_run: Set[str] = set()
+    pending_by_fname: Dict[str, Dict[str, Any]] = {}
 
     active = True
     browser: Optional[Browser] = None
@@ -541,6 +613,7 @@ def run_scrape(
                         meta=meta,
                         seen=seen_fnames_in_run,
                         http_client=http_fetcher,
+                        pending=pending_by_fname,
                     )
 
                     if result == "downloaded":
@@ -600,6 +673,44 @@ def run_scrape(
 
                     try:
                         el = items.nth(i)
+
+                        # Resolve fname so the AJAX handler can associate responses precisely.
+                        fname_token: Optional[str] = None
+                        for attr_name in ("data-dl", "data-fname", "data-filename", "data-target"):
+                            try:
+                                raw_value = el.get_attribute(attr_name)
+                            except Exception:
+                                raw_value = None
+                            if raw_value and raw_value.strip():
+                                fname_token = raw_value.strip()
+                                break
+
+                        if not fname_token:
+                            try:
+                                onclick_raw = el.get_attribute("onclick") or ""
+                            except Exception:
+                                onclick_raw = ""
+                            if onclick_raw:
+                                match = _ONCLICK_FNAME_RE.search(onclick_raw)
+                                if match:
+                                    fname_token = match.group(1).strip()
+
+                        if fname_token:
+                            slug = fname_token
+                            case_for_fname = find_case_by_fname(fname_token)
+                            entry_for_fname: Optional[Dict[str, Any]] = None
+                            if meta is not None:
+                                entry_for_fname, _ = find_metadata_entry(
+                                    meta,
+                                    slug=slug,
+                                    fid=None,
+                                    filename=None,
+                                )
+                            pending_by_fname[fname_token] = {
+                                "case": case_for_fname,
+                                "metadata_entry": entry_for_fname,
+                                "slug": slug,
+                            }
 
                         # Try normal click; if Playwright internals are broken, fall back to JS.
                         try:
@@ -713,6 +824,7 @@ if __name__ == "__main__":  # pragma: no cover - quick manual verification
             meta={},
             seen=set(),
             http_client=_DummyClient(),
+            pending={},
         )
         print("[Demo] Handler result:", result)
 

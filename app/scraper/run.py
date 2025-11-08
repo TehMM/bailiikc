@@ -68,6 +68,20 @@ UA = (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+def wait_seconds(page: Optional[Page], seconds: float) -> None:
+    """Wait safely for ``seconds`` only if *page* remains open."""
+
+    if page is None:
+        return
+
+    if seconds is None or seconds <= 0:
+        return
+
+    if not page.is_closed():
+        page.wait_for_timeout(int(seconds * 1000))
+
+
 def _accept_cookies(page: Page) -> None:
     """Best-effort click-through for cookie banners."""
     selectors = [
@@ -82,7 +96,7 @@ def _accept_cookies(page: Page) -> None:
             loc = page.locator(sel).first
             if loc.count():
                 loc.click(timeout=1500)
-                page.wait_for_timeout(400)
+                wait_seconds(page, 0.4)
                 log_line(f"Clicked cookie banner via {sel}")
                 return
         except Exception:
@@ -100,7 +114,7 @@ def _load_all_results(page: Page, max_scrolls: int = 40) -> None:
     for i in range(max_scrolls):
         try:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(500)
+            wait_seconds(page, 0.5)
             page.wait_for_load_state("networkidle", timeout=10_000)
             height = page.evaluate("document.body.scrollHeight")
         except PWError:
@@ -330,7 +344,7 @@ def handle_dl_bfile_from_ajax(
         )
         title_for_log = (refreshed or {}).get("title") or base_name
         log_line(
-            f"[AJAX] Already downloaded {title_for_log}; skipping download."
+            f"[AJAX] Metadata and local file confirm {title_for_log}; skipping download."
         )
         if seen is not None:
             seen.add(fname)
@@ -365,6 +379,7 @@ def handle_dl_bfile_from_ajax(
             category=case.extra.get("Category"),
             judgment_date=case.extra.get("Judgment Date")
             or case.extra.get("Date"),
+            local_path=str(dest_path.resolve()),
         )
 
     if seen is not None:
@@ -419,211 +434,222 @@ def run_scrape(
 
     seen_fnames_in_run: Set[str] = set()
 
-    browser_active = True
+    active = True
+    browser: Optional[Browser] = None
+    context: Optional[BrowserContext] = None
+    page: Optional[Page] = None
 
     with sync_playwright() as pw:
-        browser: Browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        context: BrowserContext = browser.new_context(
-            user_agent=UA,
-            locale="en-US",
-            viewport={"width": 1368, "height": 900},
-        )
-
-        # Mild stealth
-        context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-
-        page: Page = context.new_page()
-
-        # ---------- RESPONSE HOOK ----------
-
-        def on_response(resp: Response) -> None:
-            try:
-                url = resp.url
-            except Exception as exc:
-                log_line(f"[AJAX] error reading url: {exc}")
-                return
-
-            if "admin-ajax.php" in url:
-                try:
-                    method = resp.request.method
-                except Exception as exc:
-                    method = f"? ({exc})"
-                log_line(
-                    f"[AJAX] url={url} status={resp.status} method={method}"
-                )
-
-            if not browser_active or context.is_closed():
-                log_line(
-                    f"[AJAX] Context closed; ignoring response for {url}"
-                )
-                return
-
-            if not url.startswith(ADMIN_AJAX):
-                return
-
-            try:
-                req: Request = resp.request
-                if req.method != "POST":
-                    return
-
-                body = req.post_data or ""
-                log_line(f"[AJAX] raw POST body={body!r}")
-
-                qs = urllib.parse.parse_qs(body)
-                action = (qs.get("action", [""])[0] or "").strip()
-                fid_param = (qs.get("fid", [""])[0] or "").strip()
-                fname_param = (qs.get("fname", [""])[0] or "").strip()
-                security = (qs.get("security", [""])[0] or "").strip()
-
-                log_line(
-                    f"[AJAX] parsed action={action!r} fid={fid_param!r} "
-                    f"fname={fname_param!r} security={security!r}"
-                )
-
-                if action != "dl_bfile":
-                    # Other admin-ajax actions are noise for us
-                    return
-
-                payload: Any
-                try:
-                    payload = resp.json()
-                except Exception as exc:
-                    log_line(f"[AJAX][WARN] dl_bfile non-JSON response: {exc}")
-                    payload = None
-
-                log_line(f"[AJAX] dl_bfile payload={payload!r}")
-
-                if context.is_closed():
-                    log_line(
-                        f"[AJAX] Context closed before download for fname={fname_param}; skipping"
-                    )
-                    return
-
-                http_fetcher = (
-                    lambda download_url, timeout=120: context.request.get(
-                        download_url,
-                        timeout=timeout * 1000,
-                    )
-                )
-
-                result = handle_dl_bfile_from_ajax(
-                    post_body=body,
-                    payload=payload,
-                    downloads_dir=config.PDF_DIR,
-                    meta=meta,
-                    seen=seen_fnames_in_run,
-                    http_client=http_fetcher,
-                )
-
-                if result == "downloaded":
-                    summary["downloaded"] += 1
-                elif result == "failed":
-                    summary["failed"] += 1
-                elif result in {"duplicate", "unknown", "ignored"}:
-                    summary["skipped"] += 1
-
-            except Exception as exc:
-                # Catch any bug in our handler so it never kills Playwright
-                log_line(f"[AJAX] handler error: {exc}")
-
-        context.on("response", on_response)
-
-        # ---------- Navigate & initialise ----------
-
-        log_line("Opening judgments page in Playwright...")
-        page.goto(base_url, wait_until="domcontentloaded")
         try:
-            page.wait_for_load_state("networkidle", timeout=20_000)
-        except PWTimeout:
-            log_line("Timed out waiting for full load; continuing.")
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=UA,
+                locale="en-US",
+                viewport={"width": 1368, "height": 900},
+            )
 
-        if page_wait:
-            page.wait_for_timeout(page_wait * 1000)
+            # Mild stealth
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
 
-        _accept_cookies(page)
-        _load_all_results(page)
-        _screenshot(page)
+            page = context.new_page()
+            if page is None:
+                raise RuntimeError("Failed to create Playwright page")
 
-        # ---------- Click download buttons to trigger dl_bfile ----------
+            # ---------- RESPONSE HOOK ----------
 
-        locators = _guess_download_locators()
-        clicked = 0
-        max_clicks = entry_cap
+            def on_response(resp: Response) -> None:
+                try:
+                    url = resp.url
+                except Exception as exc:
+                    log_line(f"[AJAX] error reading url: {exc}")
+                    return
 
-        for sel in locators:
-            if clicked >= max_clicks:
-                break
+                if "admin-ajax.php" in url:
+                    try:
+                        method = resp.request.method
+                    except Exception as exc:
+                        method = f"? ({exc})"
+                    log_line(
+                        f"[AJAX] url={url} status={resp.status} method={method}"
+                    )
 
+                if not active:
+                    return
+
+                page_ref = page
+                if page_ref is not None and page_ref.is_closed():
+                    return
+
+                if not url.startswith(ADMIN_AJAX):
+                    return
+
+                try:
+                    req: Request = resp.request
+                    if req.method != "POST":
+                        return
+
+                    body = req.post_data or ""
+                    log_line(f"[AJAX] raw POST body={body!r}")
+
+                    qs = urllib.parse.parse_qs(body)
+                    action = (qs.get("action", [""])[0] or "").strip()
+                    fid_param = (qs.get("fid", [""])[0] or "").strip()
+                    fname_param = (qs.get("fname", [""])[0] or "").strip()
+                    security = (qs.get("security", [""])[0] or "").strip()
+
+                    log_line(
+                        f"[AJAX] parsed action={action!r} fid={fid_param!r} "
+                        f"fname={fname_param!r} security={security!r}"
+                    )
+
+                    if action != "dl_bfile":
+                        # Other admin-ajax actions are noise for us
+                        return
+
+                    payload: Any
+                    try:
+                        payload = resp.json()
+                    except Exception as exc:
+                        log_line(f"[AJAX][WARN] dl_bfile non-JSON response: {exc}")
+                        payload = None
+
+                    log_line(f"[AJAX] dl_bfile payload={payload!r}")
+
+                    if not active:
+                        return
+
+                    http_fetcher = (
+                        lambda download_url, timeout=120: context.request.get(
+                            download_url,
+                            timeout=timeout * 1000,
+                        )
+                    )
+
+                    result = handle_dl_bfile_from_ajax(
+                        post_body=body,
+                        payload=payload,
+                        downloads_dir=config.PDF_DIR,
+                        meta=meta,
+                        seen=seen_fnames_in_run,
+                        http_client=http_fetcher,
+                    )
+
+                    if result == "downloaded":
+                        summary["downloaded"] += 1
+                    elif result == "failed":
+                        summary["failed"] += 1
+                    elif result in {"duplicate", "unknown", "ignored"}:
+                        summary["skipped"] += 1
+
+                except Exception as exc:
+                    # Catch any bug in our handler so it never kills Playwright
+                    log_line(f"[AJAX] handler error: {exc}")
+
+            context.on("response", on_response)
+
+            # ---------- Navigate & initialise ----------
+
+            log_line("Opening judgments page in Playwright...")
+            page.goto(base_url, wait_until="domcontentloaded")
             try:
-                items = page.locator(sel)
-                count = items.count()
-            except Exception as exc:
-                log_line(f"Locator {sel!r} lookup failed: {exc}")
-                continue
+                page.wait_for_load_state("networkidle", timeout=20_000)
+            except PWTimeout:
+                log_line("Timed out waiting for full load; continuing.")
 
-            if not count:
-                continue
+            if page_wait:
+                wait_seconds(page, float(page_wait))
 
-            log_line(f"Locator {sel!r} matched {count} elements")
+            _accept_cookies(page)
+            _load_all_results(page)
+            _screenshot(page)
 
-            for i in range(count):
+            # ---------- Click download buttons to trigger dl_bfile ----------
+
+            locators = _guess_download_locators()
+            clicked = 0
+            max_clicks = entry_cap
+
+            for sel in locators:
                 if clicked >= max_clicks:
                     break
 
                 try:
-                    el = items.nth(i)
-
-                    # Try normal click; if Playwright internals are broken, fall back to JS.
-                    try:
-                        el.click(timeout=2000)
-                    except Exception as exc_click:
-                        log_line(
-                            f"Playwright click failed for {sel!r} index {i}: "
-                            f"{exc_click}; trying JS click."
-                        )
-                        try:
-                            el.evaluate("el => el.click()")
-                        except Exception as exc_js:
-                            log_line(
-                                f"JS click also failed for {sel!r} index {i}: "
-                                f"{exc_js}"
-                            )
-                            continue
-
-                    clicked += 1
-                    summary["processed"] = clicked
-                    log_line(f"Clicked element {i} for selector {sel!r}")
-
-                    # Wait a bit so dl_bfile AJAX + handler can run.
-                    time.sleep(per_delay + 0.4)
-
+                    items = page.locator(sel)
+                    count = items.count()
                 except Exception as exc:
-                    log_line(
-                        f"Unexpected error for selector {sel!r} index {i}: {exc}"
-                    )
+                    log_line(f"Locator {sel!r} lookup failed: {exc}")
                     continue
 
-        # Final grace period for late AJAX responses
-        time.sleep(2.5)
+                if not count:
+                    continue
 
-        log_line(
-            f"Clicks attempted: {clicked}. "
-            f"Downloads={summary['downloaded']}, "
-            f"Failed={summary['failed']}, "
-            f"Skipped={summary['skipped']}"
-        )
+                log_line(f"Locator {sel!r} matched {count} elements")
 
-        browser_active = False
-        browser.close()
+                for i in range(count):
+                    if clicked >= max_clicks:
+                        break
+
+                    try:
+                        el = items.nth(i)
+
+                        # Try normal click; if Playwright internals are broken, fall back to JS.
+                        try:
+                            el.click(timeout=2000)
+                        except Exception as exc_click:
+                            log_line(
+                                f"Playwright click failed for {sel!r} index {i}: "
+                                f"{exc_click}; trying JS click."
+                            )
+                            try:
+                                el.evaluate("el => el.click()")
+                            except Exception as exc_js:
+                                log_line(
+                                    f"JS click also failed for {sel!r} index {i}: "
+                                    f"{exc_js}"
+                                )
+                                continue
+
+                        clicked += 1
+                        summary["processed"] = clicked
+                        log_line(f"Clicked element {i} for selector {sel!r}")
+
+                        # Wait a bit so dl_bfile AJAX + handler can run.
+                        time.sleep(per_delay + 0.4)
+
+                    except Exception as exc:
+                        log_line(
+                            f"Unexpected error for selector {sel!r} index {i}: {exc}"
+                        )
+                        continue
+
+            # Final grace period for late AJAX responses
+            time.sleep(2.5)
+
+            log_line(
+                f"Clicks attempted: {clicked}. "
+                f"Downloads={summary['downloaded']}, "
+                f"Failed={summary['failed']}, "
+                f"Skipped={summary['skipped']}"
+            )
+        finally:
+            active = False
+            for closable in (page, context, browser):
+                try:
+                    if closable is None:
+                        continue
+                    closable.close()
+                except Exception as exc:
+                    name = type(closable).__name__ if closable is not None else "Unknown"
+                    log_line(f"Error closing Playwright object {name}: {exc}")
 
     log_line("Completed run (response-capture strategy).")
     return summary

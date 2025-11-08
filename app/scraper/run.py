@@ -51,6 +51,7 @@ from .utils import ensure_dirs, find_metadata_entry, load_metadata, log_line, re
 ADMIN_AJAX = "https://judicial.ky/wp-admin/admin-ajax.php"
 
 _ONCLICK_FNAME_RE = re.compile(r"dl_bfile[^'\"]*['\"]([A-Za-z0-9]+)['\"]", re.IGNORECASE)
+_FORM_FIELD_SPLIT_RE = re.compile(r"&(?=[A-Za-z0-9_]+=)")
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -182,6 +183,22 @@ def _extract_box_url(data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _extract_form_value(body: str, field: str) -> str:
+    """Extract *field* from an ``application/x-www-form-urlencoded`` body."""
+
+    if not body or not field:
+        return ""
+
+    marker = f"{field}="
+    if marker not in body:
+        return ""
+
+    tail = body.split(marker, 1)[1]
+    parts = _FORM_FIELD_SPLIT_RE.split(tail, 1)
+    value = parts[0]
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Download + AJAX helpers
 # ---------------------------------------------------------------------------
@@ -252,30 +269,34 @@ def queue_or_download_file(
     return False, last_error
 
 
-def _compute_output_filename(
-    fname: str,
-    case: Optional["CaseRow"],
-    entry: Optional[Dict[str, Any]],
-) -> str:
-    """Return a safe filename for the target download."""
+def _sanitize_title_for_filename(title: str) -> str:
+    """Return a stable, filesystem-safe representation of *title*."""
 
-    if entry:
-        existing = entry.get("local_filename") or entry.get("filename")
-        if isinstance(existing, str) and existing.strip():
-            return existing.strip()
+    cleaned = re.sub(r"[\r\n]+", " ", (title or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", cleaned)
+    cleaned = cleaned.strip(" _")
+    return cleaned or "Document"
 
-    base_name: str
-    if case and case.code and case.title:
-        base_name = f"{case.code} - {case.title}"
-    elif case and case.action and case.title:
-        base_name = f"{case.action} - {case.title}"
-    else:
-        base_name = fname
 
-    safe_title = re.sub(r"[^\w\s\-\.,()]+", "_", base_name).strip(" _") or fname
-    if safe_title.lower().endswith(".pdf"):
-        return safe_title
-    return f"{safe_title}.pdf"
+def _compute_output_filename(fname: str, case: Optional["CaseRow"]) -> str:
+    """Return a deterministic PDF filename for the provided case/fname."""
+
+    token = (fname or "").strip()
+    title = case.title if case and case.title else token or "Document"
+    safe_title = _sanitize_title_for_filename(title)
+
+    if not token:
+        token = safe_title
+
+    filename = f"{token} - {safe_title}"
+    filename = re.sub(r"\s+", " ", filename).strip()
+    filename = re.sub(r"[\\/:*?\"<>|]+", "_", filename)
+
+    if not filename.lower().endswith(".pdf"):
+        filename = f"{filename}.pdf"
+
+    return filename
 
 
 def _label_for_entry(
@@ -334,6 +355,8 @@ def handle_dl_bfile_from_ajax(
     }
     action_param = (params.get("action") or "").strip()
     fname_raw = (params.get("fname") or "").strip()
+    if not fname_raw:
+        fname_raw = _extract_form_value(post_body or "", "fname").strip()
     fid_param = (params.get("fid") or "").strip()
 
     if action_param and action_param != "dl_bfile":
@@ -343,10 +366,12 @@ def handle_dl_bfile_from_ajax(
         log_line(f"[AJAX] dl_bfile without fname; params={params!r}")
         return "ignored"
 
-    fname_key = fname_raw.upper()
+    fname_value = urllib.parse.unquote_plus(fname_raw).strip()
+    fname_key = fname_value.upper() or fname_raw.upper()
+    fname_display = fname_value or fname_key
 
     if seen is not None and fname_key in seen:
-        log_line(f"[AJAX] fname {fname_key} already processed this run.")
+        log_line(f"[AJAX] fname {fname_display} already processed this run.")
         if pending is not None:
             pending.pop(fname_key, None)
         return "duplicate"
@@ -403,37 +428,68 @@ def handle_dl_bfile_from_ajax(
 
     if case is None:
         log_line(
-            f"[AJAX] dl_bfile fname={fname_key} has no metadata match; not mapped to any existing case."
+            f"[AJAX][WARN] No case mapping found for fname={fname_display}; "
+            "not skipping based on other cases."
         )
     else:
         log_line(
-            f"[AJAX] dl_bfile fname={fname_key} resolved to case='{case.title}'"
+            f'[AJAX] dl_bfile request fname={fname_display} → matched case="{case.title}" '
+            f'(action={case.action})'
         )
         slug = case.action
 
-    if meta is not None and entry is None:
-        entry, _ = find_metadata_entry(meta, slug=slug, filename=None)
-
-    filename = _compute_output_filename(fname_key, case, entry)
+    filename = _compute_output_filename(fname_key, case)
     dest_path = Path(downloads_dir) / filename
 
-    if case is not None:
+    raw_fid_value = data.get("fid") or box_url
+    if isinstance(raw_fid_value, str):
+        fid_for_log = raw_fid_value.strip()
+    else:
+        fid_for_log = str(raw_fid_value)
+    if fid_for_log:
+        short_fid = fid_for_log
+        if len(short_fid) > 96:
+            short_fid = f"{short_fid[:93]}..."
         log_line(
-            f"[AJAX] dl_bfile fname={fname_key} expected_path='{dest_path}' for case='{case.title}'"
+            f"[AJAX] dl_bfile fname={fname_display} using download fid={short_fid}"
         )
 
-    if meta is not None and entry is None and filename:
-        entry, _ = find_metadata_entry(
-            meta,
-            slug=slug,
-            filename=filename,
-        )
+    entry_candidate = entry
+    if meta is not None:
+        meta_entry, _ = find_metadata_entry(meta, slug=slug, filename=dest_path.name)
+        if meta_entry is not None:
+            entry_candidate = meta_entry
+
+    candidates: List[Dict[str, Any]] = []
+    if entry_candidate:
+        candidates.append(entry_candidate)
+    context_entry = case_context.get("metadata_entry") if case_context else None
+    if context_entry and context_entry not in candidates:
+        candidates.append(context_entry)
+
+    entry = None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        stored_name = (candidate.get("local_filename") or candidate.get("filename") or "").strip()
+        if stored_name and stored_name != dest_path.name:
+            log_line(
+                f"[AJAX][WARN] Metadata filename mismatch for fname={fname_display}: "
+                f"stored={stored_name!r} expected={dest_path.name!r}; ignoring stored path."
+            )
+            continue
+        entry = candidate
+        break
+
+    log_line(
+        f"[AJAX] dl_bfile fname={fname_display} expected_path='{dest_path}'"
+    )
 
     label = _label_for_entry(fname_key, case, entry)
 
     if is_already_downloaded(dest_path, entry):
         log_line(
-            f"[AJAX] Metadata and local file confirm {label}; skipping download."
+            f"[AJAX] Local file exists for fname={fname_display}, case=\"{label}\"; skipping download."
         )
         if seen is not None:
             seen.add(fname_key)
@@ -456,7 +512,9 @@ def handle_dl_bfile_from_ajax(
         return "failed"
 
     size_bytes = dest_path.stat().st_size
-    log_line(f"[AJAX] Saved {fname_key} -> {dest_path} ({size_bytes/1024:.1f} KiB)")
+    log_line(
+        f"[AJAX] Saved fname={fname_display} -> {dest_path} ({size_bytes/1024:.1f} KiB)"
+    )
 
     if meta is not None:
         record_result(

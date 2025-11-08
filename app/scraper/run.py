@@ -48,6 +48,7 @@ from .cases_index import (
 )
 from .utils import (
     ensure_dirs,
+    find_metadata_entry,
     is_duplicate,
     load_metadata,
     log_line,
@@ -267,14 +268,14 @@ def handle_dl_bfile_from_ajax(
 
     if not isinstance(payload, dict):
         log_line(
-            f"[AJAX] dl_bfile payload is not a dict for fname={fname}: {payload!r}"
+            f"[AJAX][WARN] dl_bfile payload is not a dict for fname={fname}: {payload!r}"
         )
         if seen is not None:
             seen.add(fname)
         return "failed"
 
     if payload in (-1, "-1") or not payload.get("success"):
-        log_line(f"[AJAX] dl_bfile failure for fname={fname}: {payload!r}")
+        log_line(f"[AJAX][WARN] dl_bfile failure for fname={fname}: {payload!r}")
         if seen is not None:
             seen.add(fname)
         return "failed"
@@ -296,6 +297,11 @@ def handle_dl_bfile_from_ajax(
             seen.add(fname)
         return "unknown"
 
+    slug = fname or fid_param or case.action
+    entry: Dict[str, Any] | None = None
+    if meta is not None:
+        entry, _ = find_metadata_entry(meta, slug=slug, fid=fid_param or None)
+
     if case.code and case.title:
         base_name = f"{case.code} - {case.title}"
     elif case.action and case.title:
@@ -305,16 +311,27 @@ def handle_dl_bfile_from_ajax(
 
     safe_title = re.sub(r"[^\w\s\-\.,()]+", "_", base_name).strip(" _") or case.action or fname
     filename = safe_title if safe_title.lower().endswith(".pdf") else f"{safe_title}.pdf"
+    if entry and (entry.get("local_filename") or entry.get("filename")):
+        filename = entry.get("local_filename") or entry.get("filename")  # type: ignore[assignment]
+
     dest_path = Path(downloads_dir) / filename
 
-    if dest_path.exists():
-        log_line(f"[AJAX] Already have {filename}; skipping download.")
-        if seen is not None:
-            seen.add(fname)
-        return "duplicate"
-
-    if meta is not None and is_duplicate(fid_param or fname, filename, meta):
-        log_line(f"[AJAX] Metadata already records {filename}; skipping download.")
+    if meta is not None and is_duplicate(
+        fid_param or fname,
+        dest_path.name,
+        meta,
+        slug=slug,
+    ):
+        refreshed, _ = find_metadata_entry(
+            meta,
+            slug=slug,
+            fid=fid_param or None,
+            filename=dest_path.name,
+        )
+        title_for_log = (refreshed or {}).get("title") or base_name
+        log_line(
+            f"[AJAX] Already downloaded {title_for_log}; skipping download."
+        )
         if seen is not None:
             seen.add(fname)
         return "duplicate"
@@ -339,16 +356,15 @@ def handle_dl_bfile_from_ajax(
     if meta is not None:
         record_result(
             meta,
+            slug=slug,
             fid=fid_param or fname,
-            filename=dest_path.name,
-            fields={
-                "title": case.title,
-                "category": case.extra.get("Category", ""),
-                "judgment_date": case.extra.get("Judgment Date")
-                or case.extra.get("Date", ""),
-                "source_url": box_url,
-                "size_bytes": size_bytes,
-            },
+            title=case.title or base_name,
+            local_filename=dest_path.name,
+            source_url=box_url,
+            size_bytes=size_bytes,
+            category=case.extra.get("Category"),
+            judgment_date=case.extra.get("Judgment Date")
+            or case.extra.get("Date"),
         )
 
     if seen is not None:
@@ -403,6 +419,8 @@ def run_scrape(
 
     seen_fnames_in_run: Set[str] = set()
 
+    browser_active = True
+
     with sync_playwright() as pw:
         browser: Browser = pw.chromium.launch(
             headless=True,
@@ -443,6 +461,12 @@ def run_scrape(
                     f"[AJAX] url={url} status={resp.status} method={method}"
                 )
 
+            if not browser_active or context.is_closed():
+                log_line(
+                    f"[AJAX] Context closed; ignoring response for {url}"
+                )
+                return
+
             if not url.startswith(ADMIN_AJAX):
                 return
 
@@ -473,10 +497,16 @@ def run_scrape(
                 try:
                     payload = resp.json()
                 except Exception as exc:
-                    log_line(f"[AJAX] dl_bfile non-JSON response: {exc}")
+                    log_line(f"[AJAX][WARN] dl_bfile non-JSON response: {exc}")
                     payload = None
 
                 log_line(f"[AJAX] dl_bfile payload={payload!r}")
+
+                if context.is_closed():
+                    log_line(
+                        f"[AJAX] Context closed before download for fname={fname_param}; skipping"
+                    )
+                    return
 
                 http_fetcher = (
                     lambda download_url, timeout=120: context.request.get(
@@ -592,6 +622,7 @@ def run_scrape(
             f"Skipped={summary['skipped']}"
         )
 
+        browser_active = False
         browser.close()
 
     log_line("Completed run (response-capture strategy).")

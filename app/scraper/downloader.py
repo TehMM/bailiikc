@@ -11,7 +11,14 @@ from selenium.webdriver.remote.webdriver import WebDriver
 
 from . import config
 from .selenium_client import selenium_ajax_get_box_url
-from .utils import ensure_dirs, is_duplicate, log_line, record_result, sanitize_filename
+from .utils import (
+    ensure_dirs,
+    find_metadata_entry,
+    is_duplicate,
+    log_line,
+    record_result,
+    sanitize_filename,
+)
 
 
 def cookies_to_requests_session(cookies: dict[str, str], referer: str | None = None) -> requests.Session:
@@ -92,18 +99,27 @@ def attempt_download_case(
     """
     ensure_dirs()
     fid = case["fid"]
+    slug = case.get("fname") or fid
     log_line(f"Processing case {fid}: {case.get('title', 'Untitled')}")
     sanitized = sanitize_filename(case["fname"])
     filename = sanitized if sanitized.lower().endswith(".pdf") else f"{sanitized}.pdf"
+
+    entry, _ = find_metadata_entry(meta, slug=slug, fid=fid, filename=filename)
+    if entry and (entry.get("local_filename") or entry.get("filename")):
+        filename = entry.get("local_filename") or entry.get("filename")  # type: ignore[assignment]
+
     out_path = config.PDF_DIR / filename
 
-    if out_path.exists():
-        log_line(f"Skipping {fid} because file already exists")
-        return {"status": "skipped", "reason": "exists", "fid": fid, "filename": filename}
-
-    if is_duplicate(fid, filename, meta):
-        log_line(f"Skipping {fid} because metadata marks as downloaded")
-        return {"status": "skipped", "reason": "duplicate", "fid": fid, "filename": filename}
+    if is_duplicate(fid, out_path.name, meta, slug=slug):
+        log_line(
+            f"Skipping {fid} because a verified download already exists"
+        )
+        return {
+            "status": "skipped",
+            "reason": "duplicate",
+            "fid": fid,
+            "filename": out_path.name,
+        }
 
     box_url = selenium_ajax_get_box_url(driver, fid, case["fname"], nonce)
     if not box_url:
@@ -121,17 +137,16 @@ def attempt_download_case(
         log_line(f"Saved {filename} ({size_kb:.1f} KiB)")
         record_result(
             meta,
+            slug=slug,
             fid=fid,
-            filename=filename,
-            fields={
-                "title": case.get("title"),
-                "category": case.get("category"),
-                "judgment_date": case.get("judgment_date"),
-                "source_url": box_url,
-                "size_bytes": out_path.stat().st_size,
-            },
+            title=case.get("title") or slug,
+            local_filename=out_path.name,
+            source_url=box_url,
+            size_bytes=out_path.stat().st_size,
+            category=case.get("category"),
+            judgment_date=case.get("judgment_date"),
         )
-        result = {"status": "downloaded", "fid": fid, "filename": filename}
+        result = {"status": "downloaded", "fid": fid, "filename": out_path.name}
     else:
         log_line(f"Failed to download {fid}: {error}")
         out_path.unlink(missing_ok=True)

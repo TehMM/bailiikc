@@ -82,12 +82,33 @@ def save_metadata(meta: dict[str, Any]) -> None:
 
 
 def is_duplicate(fid: str, filename: str, meta: dict[str, Any]) -> bool:
-    """
-    Return True if this fid or filename already exists in metadata.
-    """
-    for entry in meta.get("downloads", []):
-        if entry.get("fid") == fid or entry.get("filename") == filename:
-            return True
+    """Return ``True`` when the metadata indicates we already have the file."""
+
+    downloads = meta.get("downloads", [])
+    stale_indexes: list[int] = []
+
+    for index, entry in enumerate(downloads):
+        if entry.get("fid") != fid and entry.get("filename") != filename:
+            continue
+
+        stored_name = entry.get("filename") or filename
+        pdf_path = config.PDF_DIR / stored_name
+
+        if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+            log_line(
+                "Metadata claims %s is downloaded but file is missing; removing stale "
+                "entry" % stored_name
+            )
+            stale_indexes.append(index)
+            continue
+
+        return True
+
+    if stale_indexes:
+        for idx in reversed(stale_indexes):
+            downloads.pop(idx)
+        save_metadata(meta)
+
     return False
 
 

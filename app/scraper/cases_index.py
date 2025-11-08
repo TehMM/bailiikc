@@ -30,6 +30,7 @@ class CaseRow:
 
 
 CASES_BY_ACTION: Dict[str, CaseRow] = {}
+AJAX_FNAME_INDEX: Dict[str, CaseRow] = {}
 CASES_ALL: List[CaseRow] = []
 
 
@@ -78,6 +79,7 @@ def load_cases_from_csv(csv_path: str) -> None:
         log_line("[CSV] Primary CSV path %r unavailable; attempting %s" % (csv_path, config.CSV_URL))
         stream, description = _resolve_csv_stream(config.CSV_URL)
     CASES_BY_ACTION.clear()
+    AJAX_FNAME_INDEX.clear()
     CASES_ALL.clear()
 
     if not stream:
@@ -126,6 +128,7 @@ def load_cases_from_csv(csv_path: str) -> None:
                 continue
 
             CASES_BY_ACTION[full] = case
+            AJAX_FNAME_INDEX[full] = case
             CASES_ALL.append(case)
             loaded += 1
 
@@ -135,7 +138,7 @@ def load_cases_from_csv(csv_path: str) -> None:
     )
 
 
-def find_case_by_fname(fname: str) -> Optional[CaseRow]:
+def find_case_by_fname(fname: str, *, strict: bool = False) -> Optional[CaseRow]:
     """Locate the CaseRow that best matches the AJAX fname token."""
 
     if not fname:
@@ -145,16 +148,16 @@ def find_case_by_fname(fname: str) -> Optional[CaseRow]:
     if not candidate:
         return None
 
-    if not CASES_BY_ACTION:
+    if not AJAX_FNAME_INDEX:
         log_line("[CSV] Case index is empty; call load_cases_from_csv() first.")
         return None
 
-    direct = CASES_BY_ACTION.get(candidate)
-    if direct:
+    direct = AJAX_FNAME_INDEX.get(candidate)
+    if direct or strict:
         return direct
 
     matches: List[Tuple[int, int, str, CaseRow]] = []
-    for action, case in CASES_BY_ACTION.items():
+    for action, case in AJAX_FNAME_INDEX.items():
         if candidate in action:
             start = action.find(candidate)
             overlap = len(candidate)

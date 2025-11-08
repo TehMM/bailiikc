@@ -20,12 +20,78 @@
         <li><strong>Failed:</strong> {{ last_summary.failed }}</li>
     </ul>
     {% endif %}
+    <p><strong>Current Log File:</strong> <a href="{{ url_for('download_log', filename=current_log_name) }}">{{ current_log_name }}</a></p>
     <form id="run-again-form" method="post" action="{{ url_for('start_scrape') }}" hidden>
         <input type="hidden" name="base_url" value="{{ last_params.base_url | default(base_url) }}">
         <input type="hidden" name="page_wait" value="{{ last_params.page_wait | default(config.PAGE_WAIT_SECONDS) }}">
         <input type="hidden" name="entry_cap" value="{{ last_params.entry_cap | default(config.ENTRY_CAP) }}">
         <input type="hidden" name="per_download_delay" value="{{ last_params.per_download_delay | default(config.PER_DOWNLOAD_DELAY) }}">
     </form>
+</section>
+
+<section class="card">
+    <h3>Downloaded Cases</h3>
+    {% if downloads %}
+    <div class="table-controls">
+        <label>
+            Court
+            <select id="filter-court">
+                <option value="">All Courts</option>
+                {% for court in courts %}
+                <option value="{{ court }}">{{ court }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Category
+            <select id="filter-category">
+                <option value="">All Categories</option>
+                {% for category in categories %}
+                <option value="{{ category }}">{{ category }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label class="grow">
+            Search
+            <input type="search" id="filter-search" placeholder="Subject or Cause Number">
+        </label>
+        <form method="post" action="{{ url_for('reset_view') }}" class="reset-form">
+            <label><input type="checkbox" name="delete_pdfs" value="1"> Delete PDFs</label>
+            <label><input type="checkbox" name="delete_logs" value="1"> Delete logs</label>
+            <button type="submit" class="button danger">Reset State</button>
+        </form>
+    </div>
+    <div class="table-scroll">
+        <table id="downloads-table">
+            <thead>
+                <tr>
+                    <th data-sort-key="judgment-date">Judgment Date</th>
+                    <th data-sort-key="cause-number">Cause Number</th>
+                    <th data-sort-key="subject">Subject</th>
+                    <th data-sort-key="court">Court</th>
+                    <th data-sort-key="category">Category</th>
+                    <th data-sort-key="filename">PDF</th>
+                    <th data-sort-key="downloaded-at">Downloaded At</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in downloads %}
+                <tr data-court="{{ row.court }}" data-category="{{ row.category }}" data-search="{{ (row.subject ~ ' ' ~ row.cause_number ~ ' ' ~ row.title)|lower }}">
+                    <td data-column="judgment-date" data-sort="{{ row.sort_judgment_date }}">{{ row.judgment_date or '—' }}</td>
+                    <td data-column="cause-number" data-sort="{{ row.cause_number|lower }}">{{ row.cause_number or '—' }}</td>
+                    <td data-column="subject" data-sort="{{ row.subject|lower }}">{{ row.subject or row.title }}</td>
+                    <td data-column="court" data-sort="{{ row.court|lower }}">{{ row.court or '—' }}</td>
+                    <td data-column="category" data-sort="{{ row.category|lower }}">{{ row.category or '—' }}</td>
+                    <td data-column="filename" data-sort="{{ row.local_filename|lower }}" class="mono"><a href="{{ url_for('download_file', filename=row.local_filename) }}">{{ row.local_filename }}</a></td>
+                    <td data-column="downloaded-at" data-sort="{{ row.downloaded_at or '' }}">{{ row.downloaded_at or '—' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p>No downloads recorded yet.</p>
+    {% endif %}
 </section>
 
 <section class="card">
@@ -72,6 +138,72 @@ if (window.EventSource) {
         logOutput.textContent += event.data + "\n";
         logOutput.scrollTop = logOutput.scrollHeight;
     };
+}
+
+const table = document.getElementById('downloads-table');
+if (table) {
+    const tbody = table.querySelector('tbody');
+    const courtSelect = document.getElementById('filter-court');
+    const categorySelect = document.getElementById('filter-category');
+    const searchInput = document.getElementById('filter-search');
+    const headers = table.querySelectorAll('th[data-sort-key]');
+    let currentSortKey = null;
+    let sortDirection = 1;
+
+    function applyFilters() {
+        const court = courtSelect.value;
+        const category = categorySelect.value;
+        const term = searchInput.value.trim().toLowerCase();
+
+        tbody.querySelectorAll('tr').forEach((row) => {
+            const matchesCourt = !court || row.dataset.court === court;
+            const matchesCategory = !category || row.dataset.category === category;
+            const matchesSearch = !term || (row.dataset.search || '').includes(term);
+            row.style.display = matchesCourt && matchesCategory && matchesSearch ? '' : 'none';
+        });
+    }
+
+    function getSortValue(row, key) {
+        const cell = row.querySelector(`[data-column="${key}"]`);
+        if (!cell) {
+            return '';
+        }
+        return (cell.getAttribute('data-sort') || cell.textContent || '').toLowerCase();
+    }
+
+    function sortRows(key) {
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        rows.sort((a, b) => {
+            const aVal = getSortValue(a, key);
+            const bVal = getSortValue(b, key);
+            if (aVal === bVal) {
+                return 0;
+            }
+            return aVal > bVal ? sortDirection : -sortDirection;
+        });
+        rows.forEach((row) => tbody.appendChild(row));
+    }
+
+    headers.forEach((header) => {
+        header.addEventListener('click', () => {
+            const key = header.dataset.sortKey;
+            if (currentSortKey === key) {
+                sortDirection = -sortDirection;
+            } else {
+                currentSortKey = key;
+                sortDirection = 1;
+            }
+
+            headers.forEach((h) => h.classList.remove('sorted-asc', 'sorted-desc'));
+            header.classList.add(sortDirection === 1 ? 'sorted-asc' : 'sorted-desc');
+
+            sortRows(key);
+        });
+    });
+
+    courtSelect.addEventListener('change', applyFilters);
+    categorySelect.addEventListener('change', applyFilters);
+    searchInput.addEventListener('input', applyFilters);
 }
 </script>
 {% endblock %}

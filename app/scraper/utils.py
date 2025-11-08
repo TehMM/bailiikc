@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -110,6 +112,68 @@ def sanitize_filename(name: str) -> str:
     ).strip("._")
 
     return cleaned or "file"
+
+
+def sanitize_filename_component(component: str | None) -> str:
+    """Sanitise a filename component by removing unsafe characters."""
+
+    if not component:
+        return ""
+
+    cleaned = "".join(ch if ord(ch) >= 32 else " " for ch in component)
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = cleaned.strip(" .")
+
+    return cleaned
+
+
+def truncate_to_max_bytes(value: str, max_bytes: int) -> str:
+    """Truncate *value* so its UTF-8 byte length does not exceed *max_bytes*."""
+
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+
+    encoded = encoded[:max_bytes]
+    while encoded and (encoded[-1] & 0b11000000) == 0b10000000:
+        encoded = encoded[:-1]
+
+    return encoded.decode("utf-8", "ignore")
+
+
+def build_pdf_path(pdf_dir: Path, case_token: str | None, title: str) -> Path:
+    """Construct a safe PDF path under *pdf_dir* for the given case."""
+
+    pdf_dir = Path(pdf_dir)
+    safe_title = sanitize_filename_component(title) or "Judgment"
+
+    short_token = sanitize_filename_component((case_token or "").strip())
+    if short_token:
+        short_token = truncate_to_max_bytes(short_token, 32)
+
+    base = safe_title
+    filename = truncate_to_max_bytes(base, 200 - len(".pdf")) + ".pdf"
+    path = pdf_dir / filename
+
+    if path.exists() and short_token:
+        base = f"{safe_title} - {short_token}"
+        filename = truncate_to_max_bytes(base, 200 - len(".pdf")) + ".pdf"
+        path = pdf_dir / filename
+
+    if path.exists() or len(path.name.encode("utf-8")) > 255:
+        digest_source = case_token or title or safe_title
+        digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()[:8]
+        max_base_bytes = max(1, 200 - len(".pdf") - len(digest) - 3)
+        base = truncate_to_max_bytes(safe_title, max_base_bytes)
+        filename = f"{base} - {digest}.pdf"
+        path = pdf_dir / filename
+
+    if len(path.name.encode("utf-8")) > 255:
+        trimmed_name = truncate_to_max_bytes(path.stem, 200 - len(".pdf"))
+        path = pdf_dir / f"{trimmed_name}.pdf"
+
+    return path
 
 
 def load_metadata() -> dict[str, Any]:
@@ -412,6 +476,9 @@ __all__ = [
     "get_current_log_path",
     "log_line",
     "sanitize_filename",
+    "sanitize_filename_component",
+    "truncate_to_max_bytes",
+    "build_pdf_path",
     "load_metadata",
     "save_metadata",
     "find_metadata_entry",

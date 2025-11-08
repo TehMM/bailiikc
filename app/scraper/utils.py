@@ -116,20 +116,29 @@ def has_local_pdf(meta_entry: dict[str, Any] | None) -> bool:
     if not meta_entry:
         return False
 
+    candidate_paths: list[Path] = []
+
+    stored_path = meta_entry.get("local_path")
+    if isinstance(stored_path, str) and stored_path.strip():
+        candidate = Path(stored_path)
+        if candidate.is_absolute():
+            candidate_paths.append(candidate)
+        else:
+            candidate_paths.append((config.DATA_DIR / candidate).resolve())
+            candidate_paths.append(config.PDF_DIR / candidate.name)
+
     stored_name = meta_entry.get("local_filename") or meta_entry.get("filename")
-    if not stored_name:
-        return False
+    if stored_name:
+        candidate_paths.append(config.PDF_DIR / stored_name)
 
-    pdf_path = config.PDF_DIR / stored_name
-    if not pdf_path.is_file():
-        return False
+    for path in candidate_paths:
+        try:
+            if path.is_file() and path.stat().st_size > 1024:
+                return True
+        except OSError:
+            continue
 
-    try:
-        size = pdf_path.stat().st_size
-    except OSError:
-        return False
-
-    return size > 1024
+    return False
 
 
 def is_duplicate(
@@ -149,28 +158,42 @@ def is_duplicate(
     if entry.get("downloaded") and has_local_pdf(entry):
         return True
 
+    candidate_paths: list[Path] = []
+
+    stored_path = entry.get("local_path")
+    if isinstance(stored_path, str) and stored_path.strip():
+        path_obj = Path(stored_path)
+        if path_obj.is_file():
+            candidate_paths.append(path_obj)
+
     stored_name = (
         entry.get("local_filename")
         or entry.get("filename")
         or filename
     )
-    pdf_path = config.PDF_DIR / stored_name
+    if stored_name:
+        candidate_paths.append(config.PDF_DIR / stored_name)
 
-    if pdf_path.is_file() and pdf_path.stat().st_size > 1024:
-        entry.update(
-            {
-                "slug": slug or entry.get("slug") or fid,
-                "fid": entry.get("fid") or fid,
-                "local_filename": stored_name,
-                "filename": stored_name,
-                "downloaded": True,
-                "filesize": pdf_path.stat().st_size,
-                "downloaded_at": datetime.utcnow().isoformat(timespec="seconds")
-                + "Z",
-            }
-        )
-        save_metadata(meta)
-        return True
+    for path in candidate_paths:
+        try:
+            if path.is_file() and path.stat().st_size > 1024:
+                entry.update(
+                    {
+                        "slug": slug or entry.get("slug") or fid,
+                        "fid": entry.get("fid") or fid,
+                        "local_filename": path.name,
+                        "filename": path.name,
+                        "local_path": str(path.resolve()),
+                        "downloaded": True,
+                        "filesize": path.stat().st_size,
+                        "downloaded_at": datetime.utcnow().isoformat(timespec="seconds")
+                        + "Z",
+                    }
+                )
+                save_metadata(meta)
+                return True
+        except OSError:
+            continue
 
     title = entry.get("title") or slug or fid or filename
     log_line(
@@ -197,6 +220,7 @@ def record_result(
     judgment_date: str | None = None,
     downloaded_at: str | None = None,
     extra_fields: dict[str, Any] | None = None,
+    local_path: str | None = None,
 ) -> None:
     """
     Persist download metadata for a successfully saved PDF.
@@ -225,6 +249,9 @@ def record_result(
             "source_url": source_url,
         }
     )
+
+    if local_path is not None:
+        entry["local_path"] = local_path
 
     if category is not None:
         entry["category"] = category

@@ -21,6 +21,7 @@ This is wired to /scrape via run_scrape().
 
 from __future__ import annotations
 
+import json
 import re
 import time
 import urllib.parse
@@ -51,6 +52,7 @@ from .utils import (
     build_pdf_path,
     ensure_dirs,
     find_metadata_entry,
+    hashed_fallback_path,
     has_local_pdf,
     load_metadata,
     log_line,
@@ -68,6 +70,105 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
+
+
+MAX_RESTART_ATTEMPTS = 3
+RESTART_BACKOFF_SECONDS = [5, 15, 45]
+
+
+class Checkpoint:
+    """Persist and restore scraper progress between browser restarts."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.data: Dict[str, Any] = {
+            "last_page_index": 0,
+            "last_row_index": -1,
+            "processed_tokens": [],
+            "completed_downloads": [],
+        }
+
+        if self.path.exists():
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    for key in self.data:
+                        if key in loaded:
+                            self.data[key] = loaded[key]
+            except Exception as exc:  # noqa: BLE001
+                log_line(f"[CHECKPOINT] Failed to read checkpoint: {exc}")
+
+        tokens = self.data.get("processed_tokens") or []
+        self._processed_tokens: Set[str] = {
+            normalize_action_token(token)
+            for token in tokens
+            if isinstance(token, str) and normalize_action_token(token)
+        }
+        self.data["processed_tokens"] = sorted(self._processed_tokens)
+
+        downloads = self.data.get("completed_downloads") or []
+        self._completed_downloads: Set[str] = {
+            str(name)
+            for name in downloads
+            if isinstance(name, str) and name.strip()
+        }
+        self.data["completed_downloads"] = sorted(self._completed_downloads)
+
+    @property
+    def page_index(self) -> int:
+        try:
+            return int(self.data.get("last_page_index", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def row_index(self) -> int:
+        try:
+            return int(self.data.get("last_row_index", -1))
+        except (TypeError, ValueError):
+            return -1
+
+    @property
+    def processed_tokens(self) -> Set[str]:
+        return set(self._processed_tokens)
+
+    def save(self) -> None:
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self.path)
+
+    def mark_page(self, page_index: int, *, reset_row: bool = True) -> None:
+        self.data["last_page_index"] = int(max(0, page_index))
+        if reset_row:
+            self.data["last_row_index"] = -1
+        self.save()
+
+    def mark_row(self, row_index: int) -> None:
+        self.data["last_row_index"] = int(max(-1, row_index))
+        self.save()
+
+    def mark_position(self, page_index: int, row_index: int) -> None:
+        self.data["last_page_index"] = int(max(0, page_index))
+        self.data["last_row_index"] = int(max(-1, row_index))
+        self.save()
+
+    def record_download(self, token: str, filename: str) -> None:
+        norm = normalize_action_token(token)
+        if norm:
+            if norm not in self._processed_tokens:
+                self._processed_tokens.add(norm)
+                tokens = self.data.setdefault("processed_tokens", [])
+                tokens.append(norm)
+        if filename:
+            if filename not in self._completed_downloads:
+                self._completed_downloads.add(filename)
+                downloads = self.data.setdefault("completed_downloads", [])
+                downloads.append(filename)
+        self.save()
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +235,66 @@ def _load_all_results(page: Page, max_scrolls: int = 40) -> None:
 
         last_height = int(height)
         log_line(f"Scroll {i+1}: document height now {last_height}")
+
+
+def _set_datatable_page(page: Page, page_index: int) -> bool:
+    """Attempt to switch the DataTable to *page_index* (0-based)."""
+
+    if page_index <= 0:
+        return True
+
+    try:
+        switched = page.evaluate(
+            """
+            (idx) => {
+                const $ = window.jQuery;
+                if (!$ || !$.fn || !$.fn.dataTable) {
+                    return false;
+                }
+                const table = $('#judgment-registers').DataTable();
+                if (!table) {
+                    return false;
+                }
+                const info = table.page.info();
+                if (!info || idx < 0 || idx >= info.pages) {
+                    return false;
+                }
+                table.page(idx).draw('page');
+                return true;
+            }
+            """,
+            page_index,
+        )
+        return bool(switched)
+    except Exception as exc:  # noqa: BLE001
+        log_line(f"[RUN] Failed to set DataTable page via JS: {exc}")
+        return False
+
+
+def _refresh_datatable_page(page: Page, page_index: int) -> None:
+    """Force the current DataTable page to redraw."""
+
+    try:
+        page.evaluate(
+            """
+            (idx) => {
+                const $ = window.jQuery;
+                if (!$ || !$.fn || !$.fn.dataTable) {
+                    return false;
+                }
+                const table = $('#judgment-registers').DataTable();
+                if (!table) {
+                    return false;
+                }
+                table.page(idx).draw(false);
+                return true;
+            }
+            """,
+            page_index,
+        )
+    except Exception:
+        # Silently ignore; best effort.
+        pass
 
 
 def _guess_download_locators() -> List[str]:
@@ -319,6 +480,8 @@ def handle_dl_bfile_from_ajax(
     seen: Optional[Set[str]] = None,
     http_client: Optional[Any] = None,
     pending: Optional[Dict[str, Dict[str, Any]]] = None,
+    checkpoint: Optional[Checkpoint] = None,
+    processed_tokens: Optional[Set[str]] = None,
 ) -> str:
     """Process a dl_bfile AJAX response and download the corresponding PDF."""
 
@@ -348,25 +511,53 @@ def handle_dl_bfile_from_ajax(
         )
         return "failed"
 
-    if seen is not None and fname_key in seen:
-        log_line(f"[AJAX] fname {fname_display} already processed this run.")
+    def _finalise(
+        result: str,
+        final_path: Optional[Path] = None,
+        *,
+        mark_token: bool = True,
+        mark_seen: bool = True,
+    ) -> str:
+        context = pending.get(fname_key) if pending is not None else None
+        if checkpoint is not None and context:
+            page_idx = context.get("page_index")
+            row_idx = context.get("row_index")
+            if page_idx is not None and row_idx is not None:
+                try:
+                    checkpoint.mark_position(int(page_idx), int(row_idx))
+                except Exception as exc:  # noqa: BLE001
+                    log_line(f"[CHECKPOINT] Failed to record position: {exc}")
+        if mark_token and result in {"downloaded", "duplicate"}:
+            if processed_tokens is not None:
+                processed_tokens.add(fname_key)
+            if checkpoint is not None:
+                checkpoint.record_download(
+                    fname_key,
+                    final_path.name if final_path is not None else "",
+                )
+        if mark_seen and seen is not None:
+            seen.add(fname_key)
         if pending is not None:
             pending.pop(fname_key, None)
-        return "duplicate"
+        return result
+
+    if processed_tokens is not None and fname_key in processed_tokens:
+        log_line(f"[AJAX] fname {fname_display} already persisted in checkpoint.")
+        return _finalise("duplicate", mark_token=False)
+
+    if seen is not None and fname_key in seen:
+        log_line(f"[AJAX] fname {fname_display} already processed this run.")
+        return _finalise("duplicate", mark_token=False)
 
     if not isinstance(payload, dict):
         log_line(
             f"[AJAX][WARN] dl_bfile payload is not a dict for fname={fname_key}: {payload!r}"
         )
-        if pending is not None:
-            pending.pop(fname_key, None)
-        return "failed"
+        return _finalise("failed", mark_token=False)
 
     if payload in (-1, "-1") or not payload.get("success"):
         log_line(f"[AJAX][WARN] dl_bfile failure for fname={fname_key}: {payload!r}")
-        if pending is not None:
-            pending.pop(fname_key, None)
-        return "failed"
+        return _finalise("failed", mark_token=False)
 
     data = payload.get("data") or {}
     box_url = _extract_box_url(data)
@@ -374,9 +565,7 @@ def handle_dl_bfile_from_ajax(
         log_line(
             f"[AJAX] Could not find Box URL in payload for fname={fname_key}: {data!r}"
         )
-        if pending is not None:
-            pending.pop(fname_key, None)
-        return "failed"
+        return _finalise("failed", mark_token=False)
 
     case_context: Optional[Dict[str, Any]] = None
     if pending is not None:
@@ -405,13 +594,16 @@ def handle_dl_bfile_from_ajax(
         )
         slug = case.action
 
-    downloads_dir = Path(downloads_dir)
+    downloads_dir = Path(downloads_dir).resolve()
     title_source = (
-        (case.subject if case else None)
-        or (case.title if case else None)
+        (case.title if case and case.title else None)
+        or (case.subject if case and case.subject else None)
         or fname_display
     )
-    dest_path = build_pdf_path(downloads_dir, fname_key, title_source)
+    cause_number: Optional[str] = None
+    if case is not None:
+        cause_number = case.cause_number or case.extra.get("Cause Number")
+    dest_path = build_pdf_path(downloads_dir, title_source, cause_number=cause_number)
 
     raw_fid_value = data.get("fid") or box_url
     if isinstance(raw_fid_value, str):
@@ -443,11 +635,7 @@ def handle_dl_bfile_from_ajax(
         log_line(
             f"[AJAX] Metadata and local file confirm {label}; skipping download."
         )
-        if seen is not None:
-            seen.add(fname_key)
-        if pending is not None:
-            pending.pop(fname_key, None)
-        return "duplicate"
+        return _finalise("duplicate", dest_path)
 
     if resolved_entry:
         stored_name = (resolved_entry.get("local_filename") or "").strip()
@@ -465,8 +653,8 @@ def handle_dl_bfile_from_ajax(
                 )
                 if meta is not None:
                     subject_value = (
-                        (case.subject if case else None)
-                        or (case.title if case else None)
+                        (case.title if case and case.title else None)
+                        or (case.subject if case and case.subject else None)
                         or fname_display
                     )
                     category_value = None
@@ -501,11 +689,7 @@ def handle_dl_bfile_from_ajax(
                         subject=subject_value,
                         local_path=str(dest_path.resolve()),
                     )
-                if seen is not None:
-                    seen.add(fname_key)
-                if pending is not None:
-                    pending.pop(fname_key, None)
-                return "duplicate"
+                return _finalise("duplicate", dest_path)
         except OSError:
             pass
 
@@ -530,10 +714,10 @@ def handle_dl_bfile_from_ajax(
         return "file name too long" in lowered or "errno 36" in lowered or "errno 63" in lowered
 
     if not success and _filename_error_matches(error):
-        fallback_path = build_pdf_path(downloads_dir, None, title_source)
+        fallback_path = hashed_fallback_path(downloads_dir, title_source)
         if fallback_path != dest_path:
             log_line(
-                f"[AJAX] Retrying save for fname={fname_display} with shortened filename {fallback_path.name}"
+                f"[AJAX] Retrying save for fname={fname_display} with fallback {fallback_path.name}"
             )
             final_path = fallback_path
             try:
@@ -548,10 +732,8 @@ def handle_dl_bfile_from_ajax(
 
     if not success:
         log_line(f"[AJAX] Failed to save {fname_key} to {final_path}: {error}")
-        if pending is not None:
-            pending.pop(fname_key, None)
         final_path.unlink(missing_ok=True)
-        return "failed"
+        return _finalise("failed", mark_token=False)
 
     size_bytes = final_path.stat().st_size
     log_line(
@@ -560,8 +742,8 @@ def handle_dl_bfile_from_ajax(
 
     if meta is not None:
         subject_value = (
-            (case.subject if case else None)
-            or (resolved_entry.get("title") if resolved_entry else None)
+            (case.title if case and case.title else None)
+            or (case.subject if case and case.subject else None)
             or fname_display
         )
         category_value = None
@@ -599,17 +781,14 @@ def handle_dl_bfile_from_ajax(
             local_path=str(final_path.resolve()),
         )
 
-    if seen is not None:
-        seen.add(fname_key)
-    if pending is not None:
-        pending.pop(fname_key, None)
-
-    return "downloaded"
+    return _finalise("downloaded", final_path)
 
 
 # ---------------------------------------------------------------------------
 # Main entrypoint
 # ---------------------------------------------------------------------------
+
+
 
 def run_scrape(
     base_url: Optional[str] = None,
@@ -618,9 +797,8 @@ def run_scrape(
     per_delay: Optional[float] = None,
     start_message: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Execute a scraping run using Playwright + captured dl_bfile AJAX responses.
-    """
+    """Execute a scraping run with automatic restart/resume support."""
+
     ensure_dirs()
 
     log_path = setup_run_logger()
@@ -639,9 +817,9 @@ def run_scrape(
         f"per_download_delay={per_delay}"
     )
 
-    # Load case index from CSV once per run
     load_cases_index("data/judgments.csv")
     meta = load_metadata()
+    checkpoint = Checkpoint(config.DATA_DIR / "state.json")
 
     downloaded_index: Dict[str, Dict[str, Any]] = {}
     for entry in meta.get("downloads", []):
@@ -652,6 +830,9 @@ def run_scrape(
             continue
         if entry.get("downloaded") and has_local_pdf(entry):
             downloaded_index[slug_value] = entry
+
+    processed_tokens: Set[str] = set(checkpoint.processed_tokens)
+    processed_tokens.update(downloaded_index.keys())
 
     summary: Dict[str, Any] = {
         "base_url": base_url,
@@ -667,536 +848,552 @@ def run_scrape(
         log_line("No cases loaded from judgments CSV; aborting.")
         return summary
 
-    seen_fnames_in_run: Set[str] = set()
-    pending_by_fname: Dict[str, Dict[str, Any]] = {}
+    attempt = 0
+    while attempt <= MAX_RESTART_ATTEMPTS:
+        seen_fnames_in_run: Set[str] = set(processed_tokens)
+        pending_by_fname: Dict[str, Dict[str, Any]] = {}
+        active = True
+        browser: Optional[Browser] = None
+        context: Optional[BrowserContext] = None
+        page: Optional[Page] = None
+        resume_page_index = max(0, checkpoint.page_index)
+        resume_row_index = checkpoint.row_index
+        crash_stop = False
 
-    active = True
-    browser: Optional[Browser] = None
-    context: Optional[BrowserContext] = None
-    page: Optional[Page] = None
+        log_line(
+            f"[RUN] Resume checkpoint -> page_index={resume_page_index}, row_index={resume_row_index}"
+        )
 
-    with sync_playwright() as pw:
         try:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
-            context = browser.new_context(
-                user_agent=UA,
-                locale="en-US",
-                viewport={"width": 1368, "height": 900},
-            )
-
-            # Mild stealth
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            )
-
-            page = context.new_page()
-            if page is None:
-                raise RuntimeError("Failed to create Playwright page")
-
-            # ---------- RESPONSE HOOK ----------
-
-            def on_response(resp: Response) -> None:
+            with sync_playwright() as pw:
                 try:
-                    url = resp.url
-                except Exception as exc:
-                    log_line(f"[AJAX] error reading url: {exc}")
-                    return
+                    browser = pw.chromium.launch(
+                        headless=True,
+                        args=[
+                            "--disable-blink-features=AutomationControlled",
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                        ],
+                    )
+                    context = browser.new_context(
+                        user_agent=UA,
+                        locale="en-US",
+                        viewport={"width": 1368, "height": 900},
+                    )
 
-                if "admin-ajax.php" in url:
+                    context.add_init_script(
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                    )
+
+                    page = context.new_page()
+                    if page is None:
+                        raise RuntimeError("Failed to create Playwright page")
+
+                    def on_response(resp: Response) -> None:
+                        try:
+                            url = resp.url
+                        except Exception as exc:
+                            log_line(f"[AJAX] error reading url: {exc}")
+                            return
+
+                        if "admin-ajax.php" in url:
+                            try:
+                                method = resp.request.method
+                            except Exception as exc:
+                                method = f"? ({exc})"
+                            log_line(
+                                f"[AJAX] url={url} status={resp.status} method={method}"
+                            )
+
+                        if not active:
+                            return
+
+                        page_ref = page
+                        if page_ref is not None and page_ref.is_closed():
+                            return
+
+                        if not url.startswith(ADMIN_AJAX):
+                            return
+
+                        try:
+                            req: Request = resp.request
+                            if req.method != "POST":
+                                return
+
+                            body = req.post_data or ""
+                            log_line(f"[AJAX] raw POST body={body!r}")
+
+                            qs = urllib.parse.parse_qs(body)
+                            action = (qs.get("action", [""])[0] or "").strip()
+                            fid_param = (qs.get("fid", [""])[0] or "").strip()
+                            fname_param = (qs.get("fname", [""])[0] or "").strip()
+                            security = (qs.get("security", [""])[0] or "").strip()
+
+                            log_line(
+                                f"[AJAX] parsed action={action!r} fid={fid_param!r} "
+                                f"fname={fname_param!r} security={security!r}"
+                            )
+
+                            if action != "dl_bfile":
+                                return
+
+                            payload: Any
+                            try:
+                                payload = resp.json()
+                            except Exception as exc:
+                                log_line(f"[AJAX][WARN] dl_bfile non-JSON response: {exc}")
+                                payload = None
+
+                            log_line(f"[AJAX] dl_bfile payload={payload!r}")
+
+                            if not active:
+                                return
+
+                            http_fetcher = (
+                                lambda download_url, timeout=120: context.request.get(
+                                    download_url,
+                                    timeout=timeout * 1000,
+                                )
+                            )
+
+                            result = handle_dl_bfile_from_ajax(
+                                post_body=body,
+                                payload=payload,
+                                downloads_dir=config.PDF_DIR,
+                                meta=meta,
+                                seen=seen_fnames_in_run,
+                                http_client=http_fetcher,
+                                pending=pending_by_fname,
+                                checkpoint=checkpoint,
+                                processed_tokens=processed_tokens,
+                            )
+
+                            if result == "downloaded":
+                                summary["downloaded"] += 1
+                            elif result == "failed":
+                                summary["failed"] += 1
+                            elif result in {"duplicate", "unknown", "ignored"}:
+                                summary["skipped"] += 1
+
+                        except Exception as exc:
+                            log_line(f"[AJAX] handler error: {exc}")
+
+                    context.on("response", on_response)
+
+                    log_line("Opening judgments page in Playwright...")
+                    page.goto(base_url, wait_until="domcontentloaded")
                     try:
-                        method = resp.request.method
-                    except Exception as exc:
-                        method = f"? ({exc})"
-                    log_line(
-                        f"[AJAX] url={url} status={resp.status} method={method}"
-                    )
+                        page.wait_for_load_state("networkidle", timeout=20_000)
+                    except PWTimeout:
+                        log_line("Initial networkidle timeout; continuing.")
 
-                if not active:
-                    return
+                    if page_wait:
+                        wait_seconds(page, float(page_wait))
 
-                page_ref = page
-                if page_ref is not None and page_ref.is_closed():
-                    return
+                    _accept_cookies(page)
+                    _load_all_results(page)
+                    _screenshot(page)
 
-                if not url.startswith(ADMIN_AJAX):
-                    return
+                    total_clicks = summary.get("processed", 0)
+                    entry_cap_reached = False
+                    resume_consumed = False
+                    page_number = max(1, resume_page_index + 1)
 
-                try:
-                    req: Request = resp.request
-                    if req.method != "POST":
-                        return
-
-                    body = req.post_data or ""
-                    log_line(f"[AJAX] raw POST body={body!r}")
-
-                    qs = urllib.parse.parse_qs(body)
-                    action = (qs.get("action", [""])[0] or "").strip()
-                    fid_param = (qs.get("fid", [""])[0] or "").strip()
-                    fname_param = (qs.get("fname", [""])[0] or "").strip()
-                    security = (qs.get("security", [""])[0] or "").strip()
-
-                    log_line(
-                        f"[AJAX] parsed action={action!r} fid={fid_param!r} "
-                        f"fname={fname_param!r} security={security!r}"
-                    )
-
-                    if action != "dl_bfile":
-                        # Other admin-ajax actions are noise for us
-                        return
-
-                    payload: Any
                     try:
-                        payload = resp.json()
-                    except Exception as exc:
-                        log_line(f"[AJAX][WARN] dl_bfile non-JSON response: {exc}")
-                        payload = None
-
-                    log_line(f"[AJAX] dl_bfile payload={payload!r}")
-
-                    if not active:
-                        return
-
-                    http_fetcher = (
-                        lambda download_url, timeout=120: context.request.get(
-                            download_url,
-                            timeout=timeout * 1000,
-                        )
-                    )
-
-                    result = handle_dl_bfile_from_ajax(
-                        post_body=body,
-                        payload=payload,
-                        downloads_dir=config.PDF_DIR,
-                        meta=meta,
-                        seen=seen_fnames_in_run,
-                        http_client=http_fetcher,
-                        pending=pending_by_fname,
-                    )
-
-                    if result == "downloaded":
-                        summary["downloaded"] += 1
-                    elif result == "failed":
-                        summary["failed"] += 1
-                    elif result in {"duplicate", "unknown", "ignored"}:
-                        summary["skipped"] += 1
-
-                except Exception as exc:
-                    # Catch any bug in our handler so it never kills Playwright
-                    log_line(f"[AJAX] handler error: {exc}")
-
-            context.on("response", on_response)
-
-            # ---------- Navigate & initialise ----------
-
-            log_line("Opening judgments page in Playwright...")
-            page.goto(base_url, wait_until="domcontentloaded")
-            try:
-                page.wait_for_load_state("networkidle", timeout=20_000)
-            except PWTimeout:
-                log_line("Timed out waiting for full load; continuing.")
-
-            if page_wait:
-                wait_seconds(page, float(page_wait))
-
-            _accept_cookies(page)
-            _load_all_results(page)
-            _screenshot(page)
-
-            # ---------- Click download buttons to trigger dl_bfile ----------
-
-            total_clicks = 0
-            page_number = 1
-
-            crash_stop = False
-            entry_cap_reached = False
-            try:
-                page.wait_for_selector("button:has(i.icon-dl)", timeout=25_000)
-            except PWTimeout:
-                log_line("No download buttons detected within timeout; aborting run.")
-            except PWError as exc:
-                if _is_target_closed_error(exc):
-                    log_line(
-                        "[RUN] Browser target crashed while waiting for download buttons; stopping scrape gracefully."
-                    )
-                    crash_stop = True
-                    active = False
-                else:
-                    log_line(f"Failed waiting for download buttons: {exc}")
-            else:
-                while not crash_stop:
-                    try:
-                        buttons = page.locator("button:has(i.icon-dl)")
-                        count = buttons.count()
+                        page.wait_for_selector("button:has(i.icon-dl)", timeout=25_000)
+                    except PWTimeout:
+                        log_line("No download buttons detected within timeout; aborting run.")
                     except PWError as exc:
                         if _is_target_closed_error(exc):
                             log_line(
-                                "[RUN] Browser target crashed while enumerating download buttons; stopping scrape gracefully."
+                                "[RUN] Browser target crashed while waiting for download buttons; stopping scrape gracefully."
                             )
                             crash_stop = True
                             active = False
-                            break
-                        log_line(f"Failed to enumerate download buttons: {exc}")
-                        break
-                    except Exception as exc:
-                        log_line(f"Failed to enumerate download buttons: {exc}")
-                        break
-
-                    if crash_stop:
-                        break
-
-                    if not count:
-                        log_line(f"No download buttons found on page {page_number}; stopping.")
-                        break
-
-                    log_line(
-                        f"Processing pagination page {page_number}: {count} download button(s)"
-                    )
-
-                    for i in range(count):
-                        if crash_stop:
-                            break
-
-                        if entry_cap is not None and total_clicks >= entry_cap:
-                            log_line("Entry cap reached; stopping pagination loop.")
-                            entry_cap_reached = True
-                            break
-
-                        try:
-                            el = buttons.nth(i)
-                        except PWError as exc:
-                            if _is_target_closed_error(exc):
+                        else:
+                            log_line(f"Failed waiting for download buttons: {exc}")
+                    else:
+                        if resume_page_index > 0:
+                            if _set_datatable_page(page, resume_page_index):
                                 log_line(
-                                    "[RUN] Browser target crashed while accessing a download button; stopping scrape gracefully."
+                                    f"[RUN] Jumped to DataTable page index {resume_page_index}"
                                 )
-                                crash_stop = True
-                                active = False
-                                break
-                            log_line(f"Failed to access button index {i}: {exc}")
-                            continue
-                        except Exception as exc:
-                            log_line(f"Failed to access button index {i}: {exc}")
-                            continue
+                                page_number = resume_page_index + 1
+                            else:
+                                log_line(
+                                    "[RUN] Unable to set DataTable page via JS; advancing manually."
+                                )
+                                for step in range(resume_page_index):
+                                    try:
+                                        next_button = page.locator(
+                                            "ul.pagination li.dt-paging-button button.page-link.next"
+                                        )
+                                        if next_button.count() == 0:
+                                            break
+                                        next_button.first.click(timeout=2000)
+                                        wait_seconds(page, 0.4)
+                                        page.wait_for_load_state("networkidle", timeout=10_000)
+                                    except Exception as exc:
+                                        log_line(
+                                            f"[RUN][WARN] Manual pagination advance failed on step {step+1}: {exc}"
+                                        )
+                                        break
+                                page_number = resume_page_index + 1
 
-                        fname_token: Optional[str] = None
-                        for attr_name in (
-                            "data-dl",
-                            "data-fname",
-                            "data-filename",
-                            "data-target",
-                        ):
+                        while not crash_stop:
+                            page_index_zero = max(0, page_number - 1)
+                            checkpoint.mark_page(page_index_zero, reset_row=False)
                             try:
-                                raw_value = el.get_attribute(attr_name)
-                            except PWError as exc_attr:
-                                if _is_target_closed_error(exc_attr):
+                                buttons = page.locator("button:has(i.icon-dl)")
+                                count = buttons.count()
+                            except PWError as exc:
+                                if _is_target_closed_error(exc):
                                     log_line(
-                                        "[RUN] Browser target crashed while reading button attributes; stopping scrape gracefully."
+                                        "[RUN] Browser target crashed while enumerating download buttons; stopping scrape gracefully."
                                     )
                                     crash_stop = True
                                     active = False
                                     break
-                                raw_value = None
-                            except Exception:
-                                raw_value = None
-                            if raw_value and raw_value.strip():
-                                fname_token = raw_value.strip()
+                                log_line(f"Failed to enumerate download buttons: {exc}")
                                 break
-                        if crash_stop or entry_cap_reached:
-                            break
+                            except Exception as exc:
+                                log_line(f"Failed to enumerate download buttons: {exc}")
+                                break
 
-                        if not fname_token:
-                            try:
-                                onclick_raw = el.get_attribute("onclick") or ""
-                            except PWError as exc_attr:
-                                if _is_target_closed_error(exc_attr):
-                                    log_line(
-                                        "[RUN] Browser target crashed while reading onclick attribute; stopping scrape gracefully."
-                                    )
-                                    crash_stop = True
-                                    active = False
-                                    onclick_raw = ""
-                                else:
-                                    onclick_raw = ""
-                            except Exception:
-                                onclick_raw = ""
                             if crash_stop:
                                 break
-                            if onclick_raw:
-                                match = _ONCLICK_FNAME_RE.search(onclick_raw)
-                                if match:
-                                    fname_token = match.group(1).strip()
 
-                        if crash_stop:
-                            break
-
-                        fname_key = normalize_action_token(fname_token or "")
-                        if not fname_key:
-                            log_line(
-                                f"[AJAX][WARN] Skipping button index {i} on page {page_number}: "
-                                "unable to normalise fname token."
-                            )
-                            continue
-
-                        metadata_entry = downloaded_index.get(fname_key)
-                        if metadata_entry and has_local_pdf(metadata_entry):
-                            label = metadata_entry.get("title") or fname_key
-                            log_line(
-                                f"[SKIP] fname={fname_token} already downloaded as {label}; skipping click."
-                            )
-                            seen_fnames_in_run.add(fname_key)
-                            summary["skipped"] += 1
-                            continue
-
-                        case_for_fname = CASES_BY_ACTION.get(fname_key)
-                        slug_value = (
-                            case_for_fname.action if case_for_fname else fname_key
-                        )
-
-                        pending_by_fname[fname_key] = {
-                            "case": case_for_fname,
-                            "metadata_entry": metadata_entry,
-                            "slug": slug_value,
-                            "raw": fname_token,
-                        }
-
-                        try:
-                            el.click(timeout=2000)
-                        except PWError as exc_click:
-                            if _is_target_closed_error(exc_click):
+                            if count == 0:
                                 log_line(
-                                    "[RUN] Target crashed during click; stopping scrape gracefully."
+                                    f"No download buttons found on page {page_number}; stopping."
                                 )
-                                crash_stop = True
-                                active = False
-                                pending_by_fname.pop(fname_key, None)
                                 break
+
                             log_line(
-                                f"Playwright click failed for button index {i} on page {page_number}: "
-                                f"{exc_click}; trying JS click."
+                                f"Processing pagination page {page_number}: {count} download button(s)"
                             )
-                            try:
-                                el.evaluate("el => el.click()")
-                            except PWError as exc_js:
-                                if _is_target_closed_error(exc_js):
+
+                            start_row = 0
+                            if (
+                                not resume_consumed
+                                and page_index_zero == resume_page_index
+                                and resume_row_index >= -1
+                            ):
+                                start_row = max(0, resume_row_index + 1)
+                                if start_row > 0:
                                     log_line(
-                                        "[RUN] Target crashed during JS click; stopping scrape gracefully."
+                                        f"[RUN] Resuming from row index {start_row} on page {page_number}"
+                                    )
+                            resume_consumed = True
+
+                            for i in range(start_row, count):
+                                if crash_stop:
+                                    break
+
+                                if entry_cap is not None and total_clicks >= entry_cap:
+                                    log_line("Entry cap reached; stopping pagination loop.")
+                                    entry_cap_reached = True
+                                    break
+
+                                try:
+                                    el = page.locator("button:has(i.icon-dl)").nth(i)
+                                except PWError as exc:
+                                    if _is_target_closed_error(exc):
+                                        log_line(
+                                            "[RUN] Browser target crashed while accessing a download button; stopping scrape gracefully."
+                                        )
+                                        crash_stop = True
+                                        active = False
+                                        break
+                                    log_line(f"Failed to access button index {i}: {exc}")
+                                    continue
+                                except Exception as exc:
+                                    log_line(f"Failed to access button index {i}: {exc}")
+                                    continue
+
+                                fname_token: Optional[str] = None
+                                for attr_name in (
+                                    "data-dl",
+                                    "data-fname",
+                                    "data-filename",
+                                    "data-target",
+                                ):
+                                    try:
+                                        raw_value = el.get_attribute(attr_name)
+                                    except PWError as exc_attr:
+                                        if _is_target_closed_error(exc_attr):
+                                            log_line(
+                                                "[RUN] Browser target crashed while reading button attributes; stopping scrape gracefully."
+                                            )
+                                            crash_stop = True
+                                            active = False
+                                            break
+                                        raw_value = None
+                                    except Exception:
+                                        raw_value = None
+                                    if raw_value and raw_value.strip():
+                                        fname_token = raw_value.strip()
+                                        break
+                                if crash_stop:
+                                    break
+
+                                if not fname_token:
+                                    try:
+                                        onclick_raw = el.get_attribute("onclick") or ""
+                                    except PWError as exc_attr:
+                                        if _is_target_closed_error(exc_attr):
+                                            log_line(
+                                                "[RUN] Browser target crashed while reading onclick attribute; stopping scrape gracefully."
+                                            )
+                                            crash_stop = True
+                                            active = False
+                                            onclick_raw = ""
+                                        else:
+                                            onclick_raw = ""
+                                    except Exception:
+                                        onclick_raw = ""
+                                    if crash_stop:
+                                        break
+                                    if onclick_raw:
+                                        match = _ONCLICK_FNAME_RE.search(onclick_raw)
+                                        if match:
+                                            fname_token = match.group(1).strip()
+
+                                if crash_stop:
+                                    break
+
+                                fname_key = normalize_action_token(fname_token or "")
+                                if not fname_key:
+                                    log_line(
+                                        f"[AJAX][WARN] Skipping button index {i} on page {page_number}: unable to normalise fname token."
+                                    )
+                                    checkpoint.mark_position(page_index_zero, i)
+                                    continue
+
+                                if fname_key in processed_tokens:
+                                    log_line(
+                                        f"[SKIP] fname={fname_token} already processed according to checkpoint; skipping click."
+                                    )
+                                    checkpoint.mark_position(page_index_zero, i)
+                                    summary["skipped"] += 1
+                                    seen_fnames_in_run.add(fname_key)
+                                    continue
+
+                                metadata_entry = downloaded_index.get(fname_key)
+                                if metadata_entry and has_local_pdf(metadata_entry):
+                                    label = metadata_entry.get("title") or fname_key
+                                    log_line(
+                                        f"[SKIP] fname={fname_token} already downloaded as {label}; skipping click."
+                                    )
+                                    processed_tokens.add(fname_key)
+                                    checkpoint.record_download(
+                                        fname_key,
+                                        metadata_entry.get("local_filename")
+                                        or metadata_entry.get("filename")
+                                        or "",
+                                    )
+                                    checkpoint.mark_position(page_index_zero, i)
+                                    summary["skipped"] += 1
+                                    seen_fnames_in_run.add(fname_key)
+                                    continue
+
+                                case_for_fname = CASES_BY_ACTION.get(fname_key)
+                                slug_value = (
+                                    case_for_fname.action if case_for_fname else fname_key
+                                )
+
+                                pending_by_fname[fname_key] = {
+                                    "case": case_for_fname,
+                                    "metadata_entry": metadata_entry,
+                                    "slug": slug_value,
+                                    "raw": fname_token,
+                                    "page_index": page_index_zero,
+                                    "row_index": i,
+                                }
+
+                                click_success = False
+                                for attempt_idx in range(3):
+                                    try:
+                                        el.click(timeout=2000)
+                                        click_success = True
+                                        break
+                                    except PWError as exc_click:
+                                        if _is_target_closed_error(exc_click):
+                                            log_line(
+                                                "[RUN] Target crashed during click; stopping scrape gracefully."
+                                            )
+                                            crash_stop = True
+                                            active = False
+                                            break
+                                        log_line(
+                                            f"Playwright click failed for button index {i} on page {page_number}: {exc_click}; trying JS click."
+                                        )
+                                        try:
+                                            el.evaluate("el => el.click()")
+                                            click_success = True
+                                            break
+                                        except PWError as exc_js:
+                                            if _is_target_closed_error(exc_js):
+                                                log_line(
+                                                    "[RUN] Target crashed during JS click; stopping scrape gracefully."
+                                                )
+                                                crash_stop = True
+                                                active = False
+                                                break
+                                            log_line(
+                                                f"JS click also failed for button index {i} on page {page_number}: {exc_js}"
+                                            )
+                                        except Exception as exc_js:
+                                            log_line(
+                                                f"JS click also failed for button index {i} on page {page_number}: {exc_js}"
+                                            )
+                                    except Exception as exc_click:
+                                        log_line(
+                                            f"Playwright click failed for button index {i} on page {page_number}: {exc_click}; trying JS click."
+                                        )
+                                        try:
+                                            el.evaluate("el => el.click()")
+                                            click_success = True
+                                            break
+                                        except Exception as exc_js:
+                                            log_line(
+                                                f"JS click also failed for button index {i} on page {page_number}: {exc_js}"
+                                            )
+                                    if crash_stop:
+                                        break
+                                    if not click_success and attempt_idx < 2:
+                                        _refresh_datatable_page(page, page_index_zero)
+                                        wait_seconds(page, 0.3)
+
+                                if crash_stop:
+                                    break
+
+                                if not click_success:
+                                    log_line(
+                                        f"[RUN][WARN] Unable to click download button index {i} on page {page_number} after retries; marking as failed."
+                                    )
+                                    pending_by_fname.pop(fname_key, None)
+                                    summary["failed"] += 1
+                                    checkpoint.mark_position(page_index_zero, i)
+                                    continue
+
+                                seen_fnames_in_run.add(fname_key)
+                                total_clicks += 1
+                                summary["processed"] = total_clicks
+                                log_line(
+                                    f"Clicked download button index {i} on page {page_number} (fname={fname_token})."
+                                )
+
+                                time.sleep((per_delay or 0) + 0.4)
+
+                            if crash_stop or entry_cap_reached:
+                                break
+
+                            try:
+                                next_button = page.locator(
+                                    "ul.pagination li.dt-paging-button button.page-link.next"
+                                )
+                                next_count = next_button.count()
+                            except PWError as exc:
+                                if _is_target_closed_error(exc):
+                                    log_line(
+                                        "[RUN] Browser target crashed while locating pagination controls; stopping scrape gracefully."
                                     )
                                     crash_stop = True
                                     active = False
-                                    pending_by_fname.pop(fname_key, None)
                                     break
-                                log_line(
-                                    f"JS click also failed for button index {i} on page {page_number}: {exc_js}"
-                                )
-                                pending_by_fname.pop(fname_key, None)
-                                continue
-                            except Exception as exc_js:
-                                log_line(
-                                    f"JS click also failed for button index {i} on page {page_number}: {exc_js}"
-                                )
-                                pending_by_fname.pop(fname_key, None)
-                                continue
-                        except Exception as exc_click:
-                            log_line(
-                                f"Playwright click failed for button index {i} on page {page_number}: "
-                                f"{exc_click}; trying JS click."
-                            )
+                                log_line(f"Failed to locate pagination controls: {exc}")
+                                break
+                            except Exception as exc:
+                                log_line(f"Failed to locate pagination controls: {exc}")
+                                break
+
+                            if crash_stop or entry_cap_reached:
+                                break
+
+                            if next_count == 0:
+                                log_line("No pagination 'next' button found; ending traversal.")
+                                break
+
                             try:
-                                el.evaluate("el => el.click()")
-                            except PWError as exc_js:
-                                if _is_target_closed_error(exc_js):
+                                next_button.first.click(timeout=2000)
+                            except PWError as exc:
+                                if _is_target_closed_error(exc):
                                     log_line(
-                                        "[RUN] Target crashed during JS click; stopping scrape gracefully."
+                                        "[RUN] Target crashed during pagination; stopping scrape gracefully."
                                     )
                                     crash_stop = True
                                     active = False
-                                    pending_by_fname.pop(fname_key, None)
                                     break
-                                log_line(
-                                    f"JS click also failed for button index {i} on page {page_number}: {exc_js}"
-                                )
-                                pending_by_fname.pop(fname_key, None)
-                                continue
-                            except Exception as exc_js:
-                                log_line(
-                                    f"JS click also failed for button index {i} on page {page_number}: {exc_js}"
-                                )
-                                pending_by_fname.pop(fname_key, None)
-                                continue
+                                log_line(f"Pagination click failed: {exc}")
+                                break
+                            except Exception as exc:
+                                log_line(f"Pagination click failed: {exc}")
+                                break
+
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=20_000)
+                            except PWError as exc:
+                                if _is_target_closed_error(exc):
+                                    log_line(
+                                        "[RUN] Target crashed while waiting after pagination; stopping scrape gracefully."
+                                    )
+                                    crash_stop = True
+                                    active = False
+                                    break
+                                log_line(f"Pagination load state wait failed: {exc}")
+                                break
+
+                            checkpoint.mark_page(page_index_zero + 1)
+                            page_number += 1
+                            wait_seconds(page, 0.5)
 
                         if crash_stop:
-                            break
-
-                        total_clicks += 1
-                        summary["processed"] = total_clicks
-                        log_line(
-                            f"Clicked download button index {i} on page {page_number} (fname={fname_token})."
-                        )
-
-                        time.sleep((per_delay or 0) + 0.4)
-
-                    if crash_stop:
-                        break
-
-                    if (
-                        entry_cap is not None
-                        and total_clicks >= entry_cap
-                        and not entry_cap_reached
-                    ):
-                        log_line("Entry cap reached; stopping pagination loop.")
-                        entry_cap_reached = True
-                        break
-
-                    try:
-                        next_button = page.locator(
-                            "ul.pagination li.dt-paging-button button.page-link.next"
-                        )
-                        next_count = next_button.count()
-                    except PWError as exc:
-                        if _is_target_closed_error(exc):
                             log_line(
-                                "[RUN] Browser target crashed while locating pagination controls; stopping scrape gracefully."
+                                "[RUN] Pagination loop terminated early due to browser crash; collected downloads will be preserved."
                             )
-                            crash_stop = True
-                            active = False
-                            break
-                        log_line(f"Failed to locate pagination controls: {exc}")
-                        break
-                    except Exception as exc:
-                        log_line(f"Failed to locate pagination controls: {exc}")
-                        break
 
-                    if crash_stop or entry_cap_reached:
-                        break
+                    time.sleep(2.5)
 
-                    if next_count == 0:
-                        log_line("No pagination 'next' button found; ending traversal.")
-                        break
-
-                    try:
-                        parent = next_button.first.locator("xpath=..")
-                    except PWError as exc:
-                        if _is_target_closed_error(exc):
-                            log_line(
-                                "[RUN] Browser target crashed while inspecting pagination; stopping scrape gracefully."
-                            )
-                            crash_stop = True
-                            active = False
-                            break
-                        parent = None
-                    except Exception:
-                        parent = None
-
-                    if crash_stop or entry_cap_reached:
-                        break
-
-                    try:
-                        classes = (parent.get_attribute("class") or "") if parent else ""
-                    except PWError as exc:
-                        if _is_target_closed_error(exc):
-                            log_line(
-                                "[RUN] Browser target crashed while reading pagination classes; stopping scrape gracefully."
-                            )
-                            crash_stop = True
-                            active = False
-                            break
-                        classes = ""
-                    except Exception:
-                        classes = ""
-
-                    try:
-                        aria_disabled = next_button.first.get_attribute("aria-disabled")
-                    except PWError as exc:
-                        if _is_target_closed_error(exc):
-                            log_line(
-                                "[RUN] Browser target crashed while reading pagination attributes; stopping scrape gracefully."
-                            )
-                            crash_stop = True
-                            active = False
-                            break
-                        aria_disabled = None
-                    except Exception:
-                        aria_disabled = None
-
-                    if crash_stop or entry_cap_reached:
-                        break
-
-                    if "disabled" in classes or aria_disabled == "true":
-                        log_line("Reached final pagination page.")
-                        break
-
-                    log_line(f"Advancing to pagination page {page_number + 1}")
-                    try:
-                        next_button.first.click()
-                    except PWError as exc:
-                        if _is_target_closed_error(exc):
-                            log_line(
-                                "[RUN] Target crashed during pagination click; stopping scrape gracefully."
-                            )
-                            crash_stop = True
-                            active = False
-                            break
-                        log_line(f"Failed to click pagination 'next' button: {exc}")
-                        break
-                    except Exception as exc:
-                        log_line(f"Failed to click pagination 'next' button: {exc}")
-                        break
-
-                    wait_seconds(page, float(page_wait) if page_wait else 1.0)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=10_000)
-                    except PWTimeout:
-                        log_line("Pagination networkidle wait timed out; continuing.")
-                    except PWError as exc:
-                        if _is_target_closed_error(exc):
-                            log_line(
-                                "[RUN] Target crashed while waiting after pagination; stopping scrape gracefully."
-                            )
-                            crash_stop = True
-                            active = False
-                            break
-                        log_line(f"Pagination load state wait failed: {exc}")
-                        break
-
-                    page_number += 1
-                    wait_seconds(page, 0.5)
-
-                if crash_stop:
+                    summary["processed"] = total_clicks
                     log_line(
-                        "[RUN] Pagination loop terminated early due to browser crash; collected downloads will be preserved."
+                        f"Clicks attempted: {total_clicks}. "
+                        f"Downloads={summary['downloaded']}, "
+                        f"Failed={summary['failed']}, "
+                        f"Skipped={summary['skipped']}"
                     )
-
-            # Final grace period for late AJAX responses
-            time.sleep(2.5)
-
-            summary["processed"] = total_clicks
+                finally:
+                    active = False
+                    for closable in (page, context, browser):
+                        try:
+                            if closable is None:
+                                continue
+                            closable.close()
+                        except Exception as exc:
+                            name = type(closable).__name__ if closable is not None else "Unknown"
+                            log_line(f"Error closing Playwright object {name}: {exc}")
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            attempt += 1
+            log_line(f"[RUN] Top-level scrape error: {exc}")
+            if attempt > MAX_RESTART_ATTEMPTS:
+                log_line("[RUN] Exhausted restart attempts; aborting scrape.")
+                raise
+            delay = RESTART_BACKOFF_SECONDS[min(
+                attempt - 1,
+                len(RESTART_BACKOFF_SECONDS) - 1,
+            )]
             log_line(
-                f"Clicks attempted: {total_clicks}. "
-                f"Downloads={summary['downloaded']}, "
-                f"Failed={summary['failed']}, "
-                f"Skipped={summary['skipped']}"
+                f"[RUN] Restarting browser in {delay}s (attempt {attempt}/{MAX_RESTART_ATTEMPTS})"
             )
-        finally:
-            active = False
-            for closable in (page, context, browser):
-                try:
-                    if closable is None:
-                        continue
-                    closable.close()
-                except Exception as exc:
-                    name = type(closable).__name__ if closable is not None else "Unknown"
-                    log_line(f"Error closing Playwright object {name}: {exc}")
+            time.sleep(delay)
+            continue
+        else:
+            break
 
     log_line("Completed run (response-capture strategy).")
     return summary
-
-
 
 
 if __name__ == "__main__":  # pragma: no cover - quick manual verification

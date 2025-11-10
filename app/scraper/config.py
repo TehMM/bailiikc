@@ -16,8 +16,13 @@ CSV_URL: str = "https://judicial.ky/wp-content/uploads/box_files/judgments.csv"
 ZIP_NAME: str = "all_pdfs.zip"
 
 PAGE_WAIT_SECONDS: int = int(os.getenv("PAGE_WAIT_SECONDS", "15"))
-ENTRY_CAP: int = int(os.getenv("ENTRY_CAP", "25"))
 PER_DOWNLOAD_DELAY: float = float(os.getenv("PER_DOWNLOAD_DELAY", "1.0"))
+
+SCRAPE_MODE_DEFAULT: str = (
+    os.getenv("SCRAPE_MODE", "new").strip().lower() or "new"
+)
+SCRAPE_NEW_LIMIT: int = int(os.getenv("SCRAPE_NEW_LIMIT", "50"))
+SCRAPER_MAX_RETRIES: int = int(os.getenv("SCRAPER_MAX_RETRIES", "3"))
 
 COMMON_HEADERS: dict[str, str] = {
     "User-Agent": (

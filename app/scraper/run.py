@@ -26,7 +26,7 @@ import re
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import requests
 
@@ -72,7 +72,6 @@ UA = (
 )
 
 
-MAX_RESTART_ATTEMPTS = 3
 RESTART_BACKOFF_SECONDS = [5, 15, 45]
 
 
@@ -481,7 +480,7 @@ def handle_dl_bfile_from_ajax(
     http_client: Optional[Any] = None,
     pending: Optional[Dict[str, Dict[str, Any]]] = None,
     checkpoint: Optional[Checkpoint] = None,
-    processed_tokens: Optional[Set[str]] = None,
+    persisted_tokens: Optional[Set[str]] = None,
 ) -> str:
     """Process a dl_bfile AJAX response and download the corresponding PDF."""
 
@@ -528,8 +527,8 @@ def handle_dl_bfile_from_ajax(
                 except Exception as exc:  # noqa: BLE001
                     log_line(f"[CHECKPOINT] Failed to record position: {exc}")
         if mark_token and result in {"downloaded", "duplicate"}:
-            if processed_tokens is not None:
-                processed_tokens.add(fname_key)
+            if persisted_tokens is not None:
+                persisted_tokens.add(fname_key)
             if checkpoint is not None:
                 checkpoint.record_download(
                     fname_key,
@@ -541,12 +540,14 @@ def handle_dl_bfile_from_ajax(
             pending.pop(fname_key, None)
         return result
 
-    if processed_tokens is not None and fname_key in processed_tokens:
-        log_line(f"[AJAX] fname {fname_display} already persisted in checkpoint.")
+    if persisted_tokens is not None and fname_key in persisted_tokens:
+        log_line(
+            f"[AJAX] fname {fname_display} already downloaded previously (metadata+file present); skipping."
+        )
         return _finalise("duplicate", mark_token=False)
 
     if seen is not None and fname_key in seen:
-        log_line(f"[AJAX] fname {fname_display} already processed this run.")
+        log_line(f"[AJAX] fname {fname_display} already processed in this run; skipping.")
         return _finalise("duplicate", mark_token=False)
 
     if not isinstance(payload, dict):
@@ -595,15 +596,42 @@ def handle_dl_bfile_from_ajax(
         slug = case.action
 
     downloads_dir = Path(downloads_dir).resolve()
-    title_source = (
-        (case.title if case and case.title else None)
-        or (case.subject if case and case.subject else None)
-        or fname_display
-    )
+    title_source: Optional[str] = None
+    if case and case.title:
+        title_source = case.title
+    elif resolved_entry and isinstance(resolved_entry.get("title"), str):
+        stored_title = resolved_entry.get("title")
+        if stored_title:
+            title_source = str(stored_title)
+    if not title_source:
+        title_source = fname_display
     cause_number: Optional[str] = None
     if case is not None:
         cause_number = case.cause_number or case.extra.get("Cause Number")
-    dest_path = build_pdf_path(downloads_dir, title_source, cause_number=cause_number)
+    dest_path = build_pdf_path(
+        downloads_dir,
+        title_source,
+        action=fname_key,
+        cause_number=cause_number,
+    )
+
+    if meta is not None:
+        conflict_entry, _ = find_metadata_entry(meta, filename=dest_path.name)
+        if conflict_entry is not None:
+            conflict_slug = normalize_action_token(
+                conflict_entry.get("slug") or conflict_entry.get("fid") or ""
+            )
+            current_slug = normalize_action_token(slug)
+            if conflict_slug and current_slug and conflict_slug != current_slug:
+                safe_suffix = re.sub(r"[\\/*?:\"<>|]+", " ", current_slug)[:10]
+                safe_suffix = safe_suffix.strip() or current_slug[:10]
+                alt_name = f"{dest_path.stem} [{safe_suffix.strip()}].pdf"
+                alt_path = (downloads_dir / alt_name).resolve()
+                if alt_path != dest_path:
+                    log_line(
+                        f"[AJAX] Filename collision detected; using alternate name '{alt_path.name}'."
+                    )
+                    dest_path = alt_path
 
     raw_fid_value = data.get("fid") or box_url
     if isinstance(raw_fid_value, str):
@@ -633,7 +661,7 @@ def handle_dl_bfile_from_ajax(
     if resolved_entry and has_local_pdf(resolved_entry):
         label = resolved_entry.get("title") or resolved_entry.get("slug") or fname_display
         log_line(
-            f"[AJAX] Metadata and local file confirm {label}; skipping download."
+            f"[AJAX] fname {fname_display} already downloaded previously (metadata+file present); skipping."
         )
         return _finalise("duplicate", dest_path)
 
@@ -649,7 +677,7 @@ def handle_dl_bfile_from_ajax(
         try:
             if dest_path.exists() and dest_path.is_file() and dest_path.stat().st_size > 0:
                 log_line(
-                    f"[AJAX] Existing file detected for fname={fname_display}; skipping download."
+                    f"[AJAX] fname {fname_display} already downloaded previously (metadata+file present); skipping."
                 )
                 if meta is not None:
                     subject_value = (
@@ -790,31 +818,65 @@ def handle_dl_bfile_from_ajax(
 
 
 
-def run_scrape(
+def run_with_retries(
+    run_callable: Callable[[], Dict[str, Any]],
+    *,
+    max_retries: int,
+) -> Dict[str, Any]:
+    """Execute ``run_callable`` with retries for Playwright crashes."""
+
+    effective_retries = max(1, max_retries)
+    for attempt in range(1, effective_retries + 1):
+        try:
+            log_line(
+                f"[RUN] Starting scraping run attempt {attempt}/{effective_retries}..."
+            )
+            result = run_callable()
+            log_line("[RUN] Scraping run completed successfully.")
+            return result
+        except PWError as exc:
+            log_line(f"[RUN] Playwright error on attempt {attempt}: {exc}")
+            if attempt >= effective_retries:
+                log_line("[RUN] Max retries reached; aborting after repeated crashes.")
+                raise
+            delay = RESTART_BACKOFF_SECONDS[
+                min(attempt - 1, len(RESTART_BACKOFF_SECONDS) - 1)
+            ]
+            log_line(f"[RUN] Retrying in {delay}s after Playwright error...")
+            time.sleep(delay)
+        except Exception:
+            log_line("[RUN] Unexpected non-Playwright error; aborting without retry.")
+            raise
+
+    raise RuntimeError("run_with_retries exhausted without returning a result")
+
+
+def _run_scrape_attempt(
     base_url: Optional[str] = None,
-    entry_cap: Optional[int] = None,
     page_wait: Optional[int] = None,
     per_delay: Optional[float] = None,
     start_message: Optional[str] = None,
+    *,
+    scrape_mode: str,
+    new_limit: Optional[int],
+    log_path: Path,
+    max_retries: int,
 ) -> Dict[str, Any]:
     """Execute a scraping run with automatic restart/resume support."""
 
-    ensure_dirs()
-
-    log_path = setup_run_logger()
     if start_message:
         log_line(start_message)
 
     base_url = (base_url or config.DEFAULT_BASE_URL).strip()
-    entry_cap = entry_cap or config.ENTRY_CAP
     page_wait = page_wait or config.PAGE_WAIT_SECONDS
     per_delay = per_delay if per_delay is not None else config.PER_DOWNLOAD_DELAY
+    row_limit = new_limit if new_limit is not None else config.SCRAPE_NEW_LIMIT
 
     log_line("=== Starting scraping run (Playwright, response-capture) ===")
     log_line(f"Target base URL: {base_url}")
     log_line(
-        f"Params: entry_cap={entry_cap}, page_wait={page_wait}, "
-        f"per_download_delay={per_delay}"
+        "Params: scrape_mode=%s, row_limit=%s, page_wait=%s, per_download_delay=%s"
+        % (scrape_mode, row_limit if scrape_mode == "new" else "all", page_wait, per_delay)
     )
 
     load_cases_index("data/judgments.csv")
@@ -831,8 +893,7 @@ def run_scrape(
         if entry.get("downloaded") and has_local_pdf(entry):
             downloaded_index[slug_value] = entry
 
-    processed_tokens: Set[str] = set(checkpoint.processed_tokens)
-    processed_tokens.update(downloaded_index.keys())
+    persisted_tokens: Set[str] = set(downloaded_index.keys())
 
     summary: Dict[str, Any] = {
         "base_url": base_url,
@@ -840,8 +901,10 @@ def run_scrape(
         "downloaded": 0,
         "failed": 0,
         "skipped": 0,
+        "inspected_rows": 0,
         "total_cases": len(CASES_BY_ACTION),
         "log_file": str(log_path),
+        "scrape_mode": scrape_mode,
     }
 
     if not CASES_BY_ACTION:
@@ -849,8 +912,8 @@ def run_scrape(
         return summary
 
     attempt = 0
-    while attempt <= MAX_RESTART_ATTEMPTS:
-        seen_fnames_in_run: Set[str] = set(processed_tokens)
+    while attempt <= max_retries:
+        seen_fnames_in_run: Set[str] = set()
         pending_by_fname: Dict[str, Dict[str, Any]] = {}
         active = True
         browser: Optional[Browser] = None
@@ -965,7 +1028,7 @@ def run_scrape(
                                 http_client=http_fetcher,
                                 pending=pending_by_fname,
                                 checkpoint=checkpoint,
-                                processed_tokens=processed_tokens,
+                                persisted_tokens=persisted_tokens,
                             )
 
                             if result == "downloaded":
@@ -995,7 +1058,8 @@ def run_scrape(
                     _screenshot(page)
 
                     total_clicks = summary.get("processed", 0)
-                    entry_cap_reached = False
+                    row_limit_reached = False
+                    rows_evaluated = summary.get("inspected_rows", 0)
                     resume_consumed = False
                     page_number = max(1, resume_page_index + 1)
 
@@ -1090,10 +1154,20 @@ def run_scrape(
                                 if crash_stop:
                                     break
 
-                                if entry_cap is not None and total_clicks >= entry_cap:
-                                    log_line("Entry cap reached; stopping pagination loop.")
-                                    entry_cap_reached = True
+                                if (
+                                    scrape_mode == "new"
+                                    and row_limit is not None
+                                    and row_limit > 0
+                                    and rows_evaluated >= row_limit
+                                ):
+                                    log_line(
+                                        "Row inspection limit reached for 'new' mode; stopping pagination loop."
+                                    )
+                                    row_limit_reached = True
                                     break
+
+                                rows_evaluated += 1
+                                summary["inspected_rows"] = rows_evaluated
 
                                 try:
                                     el = page.locator("button:has(i.icon-dl)").nth(i)
@@ -1170,27 +1244,27 @@ def run_scrape(
                                     checkpoint.mark_position(page_index_zero, i)
                                     continue
 
-                                if fname_key in processed_tokens:
-                                    log_line(
-                                        f"[SKIP] fname={fname_token} already processed according to checkpoint; skipping click."
-                                    )
-                                    checkpoint.mark_position(page_index_zero, i)
-                                    summary["skipped"] += 1
-                                    seen_fnames_in_run.add(fname_key)
-                                    continue
-
                                 metadata_entry = downloaded_index.get(fname_key)
                                 if metadata_entry and has_local_pdf(metadata_entry):
                                     label = metadata_entry.get("title") or fname_key
                                     log_line(
                                         f"[SKIP] fname={fname_token} already downloaded as {label}; skipping click."
                                     )
-                                    processed_tokens.add(fname_key)
+                                    persisted_tokens.add(fname_key)
                                     checkpoint.record_download(
                                         fname_key,
                                         metadata_entry.get("local_filename")
                                         or metadata_entry.get("filename")
                                         or "",
+                                    )
+                                    checkpoint.mark_position(page_index_zero, i)
+                                    summary["skipped"] += 1
+                                    seen_fnames_in_run.add(fname_key)
+                                    continue
+
+                                if fname_key in persisted_tokens:
+                                    log_line(
+                                        f"[SKIP] fname={fname_token} already downloaded previously; skipping click."
                                     )
                                     checkpoint.mark_position(page_index_zero, i)
                                     summary["skipped"] += 1
@@ -1286,7 +1360,7 @@ def run_scrape(
 
                                 time.sleep((per_delay or 0) + 0.4)
 
-                            if crash_stop or entry_cap_reached:
+                            if crash_stop or row_limit_reached:
                                 break
 
                             try:
@@ -1308,7 +1382,7 @@ def run_scrape(
                                 log_line(f"Failed to locate pagination controls: {exc}")
                                 break
 
-                            if crash_stop or entry_cap_reached:
+                            if crash_stop or row_limit_reached:
                                 break
 
                             if next_count == 0:
@@ -1377,15 +1451,14 @@ def run_scrape(
         except Exception as exc:
             attempt += 1
             log_line(f"[RUN] Top-level scrape error: {exc}")
-            if attempt > MAX_RESTART_ATTEMPTS:
+            if attempt > max_retries:
                 log_line("[RUN] Exhausted restart attempts; aborting scrape.")
                 raise
-            delay = RESTART_BACKOFF_SECONDS[min(
-                attempt - 1,
-                len(RESTART_BACKOFF_SECONDS) - 1,
-            )]
+            delay = RESTART_BACKOFF_SECONDS[
+                min(attempt - 1, len(RESTART_BACKOFF_SECONDS) - 1)
+            ]
             log_line(
-                f"[RUN] Restarting browser in {delay}s (attempt {attempt}/{MAX_RESTART_ATTEMPTS})"
+                f"[RUN] Restarting browser in {delay}s (attempt {attempt}/{max_retries})"
             )
             time.sleep(delay)
             continue
@@ -1394,6 +1467,63 @@ def run_scrape(
 
     log_line("Completed run (response-capture strategy).")
     return summary
+
+
+def run_scrape(
+    base_url: Optional[str] = None,
+    page_wait: Optional[int] = None,
+    per_delay: Optional[float] = None,
+    start_message: Optional[str] = None,
+    *,
+    scrape_mode: Optional[str] = None,
+    new_limit: Optional[int] = None,
+    max_retries: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Public entrypoint that wraps the core scraper with retry support."""
+
+    ensure_dirs()
+    log_path = setup_run_logger()
+
+    mode = (scrape_mode or config.SCRAPE_MODE_DEFAULT).strip().lower()
+    if mode not in {"new", "full"}:
+        log_line(
+            f"[RUN] Unknown scrape_mode={mode!r}; defaulting to 'new'."
+        )
+        mode = "new"
+
+    row_limit = new_limit if new_limit is not None else config.SCRAPE_NEW_LIMIT
+    retry_limit = max_retries if max_retries is not None else config.SCRAPER_MAX_RETRIES
+
+    if mode == "full":
+        log_line("[RUN] Full scrape requested; resetting metadata state before run.")
+        for path in (
+            config.METADATA_FILE,
+            config.DATA_DIR / "state.json",
+        ):
+            try:
+                path.unlink()
+            except OSError:
+                continue
+        ensure_dirs()
+
+    next_start_message = start_message
+
+    def _attempt() -> Dict[str, Any]:
+        nonlocal next_start_message
+        result = _run_scrape_attempt(
+            base_url=base_url,
+            page_wait=page_wait,
+            per_delay=per_delay,
+            start_message=next_start_message,
+            scrape_mode=mode,
+            new_limit=row_limit,
+            log_path=log_path,
+            max_retries=0,
+        )
+        next_start_message = None
+        return result
+
+    return run_with_retries(_attempt, max_retries=max(1, retry_limit))
 
 
 if __name__ == "__main__":  # pragma: no cover - quick manual verification
@@ -1471,6 +1601,7 @@ if __name__ == "__main__":  # pragma: no cover - quick manual verification
             seen=set(),
             http_client=_DummyClient(),
             pending={},
+            persisted_tokens=set(),
         )
         print("[Demo] Handler result:", result)
 

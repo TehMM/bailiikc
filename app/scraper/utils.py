@@ -120,6 +120,32 @@ def truncate_stem(stem: str, max_len: int = MAX_STEM_LEN) -> str:
     return stem[:max_len].rstrip()
 
 
+def make_pdf_filename_from_title(
+    title: str | None,
+    action: str | None = None,
+) -> str:
+    """Construct a safe PDF filename derived primarily from *title*."""
+
+    base = (title or "").strip()
+    if not base:
+        base = (action or "judgment").strip()
+
+    base = re.sub(r"[\\/*?:\"<>|]+", " ", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    if not base:
+        base = "judgment"
+
+    max_len = 150
+    if len(base) > max_len:
+        cutoff = base[:max_len]
+        last_space = cutoff.rfind(" ")
+        if last_space > 40:
+            cutoff = cutoff[:last_space]
+        base = cutoff.strip() or base[:max_len]
+
+    return f"{base}.pdf"
+
+
 def hashed_fallback_stem(title: str, prefix_len: int = 40) -> str:
     """Produce a deterministic hashed fallback stem for *title*."""
 
@@ -129,30 +155,21 @@ def hashed_fallback_stem(title: str, prefix_len: int = 40) -> str:
     return f"{digest} - {leading}" if leading else digest
 
 
-def build_pdf_path(base_dir: Path, title: str, *, cause_number: str | None = None) -> Path:
-    """Construct a safe PDF destination path from *title* and optional cause number."""
+def build_pdf_path(
+    base_dir: Path,
+    title: str | None,
+    *,
+    action: str | None = None,
+    cause_number: str | None = None,
+) -> Path:
+    """Construct a safe PDF destination path derived from *title* and *action*."""
 
     base_dir = Path(base_dir).resolve()
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    stem_parts = []
-    if cause_number:
-        cause_stem = sanitize_filename_stem(cause_number)
-        if cause_stem:
-            stem_parts.append(cause_stem)
-
-    title_stem = sanitize_filename_stem(title)
-    stem_parts.append(title_stem or "Judgment")
-
-    stem = truncate_stem(" - ".join(filter(None, stem_parts)))
-    filename = f"{stem or 'Judgment'}.pdf"
-    path = (base_dir / filename).resolve()
-
-    if len(path.name.encode("utf-8")) > 240:
-        trimmed = truncate_stem(stem, 100)
-        path = (base_dir / f"{trimmed or 'Judgment'}.pdf").resolve()
-
-    return path
+    fallback = action or cause_number or "judgment"
+    filename = make_pdf_filename_from_title(title, fallback)
+    return (base_dir / filename).resolve()
 
 
 def hashed_fallback_path(base_dir: Path, title: str) -> Path:
@@ -504,6 +521,7 @@ __all__ = [
     "log_line",
     "sanitize_filename_stem",
     "truncate_stem",
+    "make_pdf_filename_from_title",
     "hashed_fallback_stem",
     "hashed_fallback_path",
     "sanitize_filename",

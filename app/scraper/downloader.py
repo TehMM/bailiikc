@@ -102,10 +102,15 @@ def attempt_download_case(
     fid = case["fid"]
     slug = case.get("fname") or fid
     log_line(f"Processing case {fid}: {case.get('title', 'Untitled')}")
-    title = case.get("title") or case.get("subject") or fid
+    title = case.get("title") or ""
     cause_number = case.get("cause_number") or None
 
-    out_path = build_pdf_path(config.PDF_DIR, title, cause_number=cause_number)
+    out_path = build_pdf_path(
+        config.PDF_DIR,
+        title,
+        action=slug,
+        cause_number=cause_number,
+    )
 
     entry, _ = find_metadata_entry(meta, slug=slug, fid=fid, filename=out_path.name)
     if entry and (entry.get("local_filename") or entry.get("filename")):

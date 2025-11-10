@@ -61,8 +61,16 @@ The mounted `./data` folder stores PDFs, logs, and metadata persistently.
 3. Create a **Volume** and mount it at `/app/data` so PDFs and logs persist across deploys.
 4. (Optional) Configure environment variables to adjust scraper defaults:
    - `PAGE_WAIT_SECONDS` – wait time after loading the judgments page (default `15`).
-   - `ENTRY_CAP` – maximum number of CSV rows processed per run (default `25`).
+   - `SCRAPE_MODE_DEFAULT` – default scrape mode (`new` or `full`, default `new`).
+   - `SCRAPE_NEW_LIMIT` – rows inspected when running in `new` mode (default `50`).
    - `PER_DOWNLOAD_DELAY` – delay between downloads in seconds (default `1.0`).
+   - `SCRAPER_MAX_RETRIES` – number of Playwright restart attempts on crash (default `3`).
+
+### Scrape modes
+
+The scraper starts in **new** mode, inspecting only the most recent rows (the limit is
+configurable via `SCRAPE_NEW_LIMIT`). Switch to **full** mode from the web UI or by setting
+`SCRAPE_MODE_DEFAULT=full` to clear metadata and redownload every judgment from scratch.
 
 ## API Endpoints
 - `GET /` – Home dashboard with scraper controls.

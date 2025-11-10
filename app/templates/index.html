@@ -12,8 +12,15 @@
             <input type="number" name="page_wait" min="1" value="{{ default_wait }}" required>
         </label>
         <label>
-            Entry Cap
-            <input type="number" name="entry_cap" min="1" value="{{ default_cap }}" required>
+            Scrape Mode
+            <select name="scrape_mode">
+                <option value="new" {% if default_mode == 'new' %}selected{% endif %}>Scrape new only</option>
+                <option value="full" {% if default_mode == 'full' %}selected{% endif %}>Scrape from scratch</option>
+            </select>
+        </label>
+        <label>
+            New Rows Limit
+            <input type="number" name="new_limit" min="0" value="{{ default_new_limit }}" required>
         </label>
         <label>
             Delay Between Downloads (seconds)
@@ -35,8 +42,30 @@
         <li><strong>Downloaded:</strong> {{ last_summary.downloaded }}</li>
         <li><strong>Skipped:</strong> {{ last_summary.skipped }}</li>
         <li><strong>Failed:</strong> {{ last_summary.failed }}</li>
+        <li><strong>Rows Inspected:</strong> {{ last_summary.inspected_rows | default(last_summary.processed) }}</li>
+        <li><strong>Mode:</strong> {{ last_summary.scrape_mode | default('new') }}</li>
     </ul>
     <a href="{{ url_for('report') }}" class="button">View Detailed Report</a>
 </section>
 {% endif %}
+<script>
+const modeSelect = document.querySelector('select[name="scrape_mode"]');
+const limitInput = document.querySelector('input[name="new_limit"]');
+function toggleLimit() {
+    if (!modeSelect || !limitInput) {
+        return;
+    }
+    const isNew = modeSelect.value === 'new';
+    limitInput.disabled = !isNew;
+    if (!isNew) {
+        limitInput.setAttribute('aria-disabled', 'true');
+    } else {
+        limitInput.removeAttribute('aria-disabled');
+    }
+}
+if (modeSelect && limitInput) {
+    modeSelect.addEventListener('change', toggleLimit);
+    toggleLimit();
+}
+</script>
 {% endblock %}

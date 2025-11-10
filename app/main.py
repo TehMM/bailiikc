@@ -189,12 +189,16 @@ def index() -> str:
 
     ensure_dirs()
     last_summary = app.config.get("LAST_SUMMARY")
+    last_params = app.config.get("LAST_PARAMS", {})
     context = {
         "default_base_url": load_base_url(),
-        "default_wait": app.config.get("LAST_PARAMS", {}).get("page_wait", config.PAGE_WAIT_SECONDS),
-        "default_cap": app.config.get("LAST_PARAMS", {}).get("entry_cap", config.ENTRY_CAP),
-        "default_delay": app.config.get("LAST_PARAMS", {}).get(
+        "default_wait": last_params.get("page_wait", config.PAGE_WAIT_SECONDS),
+        "default_new_limit": last_params.get("new_limit", config.SCRAPE_NEW_LIMIT),
+        "default_delay": last_params.get(
             "per_download_delay", config.PER_DOWNLOAD_DELAY
+        ),
+        "default_mode": last_params.get(
+            "scrape_mode", config.SCRAPE_MODE_DEFAULT
         ),
         "last_summary": last_summary,
     }
@@ -207,15 +211,30 @@ def start_scrape() -> Response:
 
     base_url = request.form.get("base_url", config.DEFAULT_BASE_URL).strip()
     page_wait = int(request.form.get("page_wait", config.PAGE_WAIT_SECONDS))
-    entry_cap = int(request.form.get("entry_cap", config.ENTRY_CAP))
     per_delay = float(request.form.get("per_download_delay", config.PER_DOWNLOAD_DELAY))
+    scrape_mode = (
+        request.form.get("scrape_mode", config.SCRAPE_MODE_DEFAULT).strip().lower()
+        or config.SCRAPE_MODE_DEFAULT
+    )
+    try:
+        new_limit = int(request.form.get("new_limit", config.SCRAPE_NEW_LIMIT))
+    except (TypeError, ValueError):
+        new_limit = config.SCRAPE_NEW_LIMIT
+    new_limit = max(0, new_limit)
+    try:
+        max_retries = int(request.form.get("max_retries", config.SCRAPER_MAX_RETRIES))
+    except (TypeError, ValueError):
+        max_retries = config.SCRAPER_MAX_RETRIES
+    max_retries = max(1, max_retries)
 
     save_base_url(base_url)
     app.config["LAST_PARAMS"] = {
         "base_url": base_url,
         "page_wait": page_wait,
-        "entry_cap": entry_cap,
         "per_download_delay": per_delay,
+        "scrape_mode": scrape_mode,
+        "new_limit": new_limit,
+        "max_retries": max_retries,
     }
 
     def _run() -> None:
@@ -223,10 +242,12 @@ def start_scrape() -> Response:
             try:
                 summary = run_scrape(
                     base_url=base_url,
-                    entry_cap=entry_cap,
                     page_wait=page_wait,
                     per_delay=per_delay,
                     start_message="Initiating scrape via web UI",
+                    scrape_mode=scrape_mode,
+                    new_limit=new_limit,
+                    max_retries=max_retries,
                 )
                 app.config["LAST_SUMMARY"] = summary
                 app.config["CURRENT_LOG_FILE"] = summary.get("log_file")

@@ -18,13 +18,17 @@
         <li><strong>Downloaded:</strong> {{ last_summary.downloaded }}</li>
         <li><strong>Skipped:</strong> {{ last_summary.skipped }}</li>
         <li><strong>Failed:</strong> {{ last_summary.failed }}</li>
+        <li><strong>Rows Inspected:</strong> {{ last_summary.inspected_rows | default(last_summary.processed) }}</li>
+        <li><strong>Mode:</strong> {{ last_summary.scrape_mode | default('new') }}</li>
     </ul>
     {% endif %}
     <p><strong>Current Log File:</strong> <a href="{{ url_for('download_log', filename=current_log_name) }}">{{ current_log_name }}</a></p>
     <form id="run-again-form" method="post" action="{{ url_for('start_scrape') }}" hidden>
         <input type="hidden" name="base_url" value="{{ last_params.base_url | default(base_url) }}">
         <input type="hidden" name="page_wait" value="{{ last_params.page_wait | default(config.PAGE_WAIT_SECONDS) }}">
-        <input type="hidden" name="entry_cap" value="{{ last_params.entry_cap | default(config.ENTRY_CAP) }}">
+        <input type="hidden" name="scrape_mode" value="{{ last_params.scrape_mode | default(config.SCRAPE_MODE_DEFAULT) }}">
+        <input type="hidden" name="new_limit" value="{{ last_params.new_limit | default(config.SCRAPE_NEW_LIMIT) }}">
+        <input type="hidden" name="max_retries" value="{{ last_params.max_retries | default(config.SCRAPER_MAX_RETRIES) }}">
         <input type="hidden" name="per_download_delay" value="{{ last_params.per_download_delay | default(config.PER_DOWNLOAD_DELAY) }}">
     </form>
 </section>

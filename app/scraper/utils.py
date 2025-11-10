@@ -16,6 +16,9 @@ LOGGER = logging.getLogger("bailiikc")
 _LOGGER_INITIALISED = False
 _CURRENT_LOG_FILE: Path = config.LOG_FILE
 
+MAX_STEM_LEN = 150
+_BAD_CHARS = r"[\\/:*?\"<>|\r\n\t]"
+
 
 def _configure_logger(log_path: Path) -> None:
     """Configure the shared application logger to write to ``log_path``."""
@@ -101,6 +104,64 @@ def log_line(message: str) -> None:
     LOGGER.info(message)
 
 
+def sanitize_filename_stem(text: str) -> str:
+    """Return a normalised filename stem with unsafe characters removed."""
+
+    stem = re.sub(_BAD_CHARS, " ", (text or "")).strip()
+    stem = re.sub(r"\s+", " ", stem)
+    return stem or "Judgment"
+
+
+def truncate_stem(stem: str, max_len: int = MAX_STEM_LEN) -> str:
+    """Ensure *stem* does not exceed *max_len* characters."""
+
+    if len(stem) <= max_len:
+        return stem
+    return stem[:max_len].rstrip()
+
+
+def hashed_fallback_stem(title: str, prefix_len: int = 40) -> str:
+    """Produce a deterministic hashed fallback stem for *title*."""
+
+    clean = sanitize_filename_stem(title)
+    digest = hashlib.sha1((title or "").encode("utf-8", errors="ignore")).hexdigest()[:8]
+    leading = truncate_stem(clean, max(1, prefix_len))
+    return f"{digest} - {leading}" if leading else digest
+
+
+def build_pdf_path(base_dir: Path, title: str, *, cause_number: str | None = None) -> Path:
+    """Construct a safe PDF destination path from *title* and optional cause number."""
+
+    base_dir = Path(base_dir).resolve()
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    stem_parts = []
+    if cause_number:
+        cause_stem = sanitize_filename_stem(cause_number)
+        if cause_stem:
+            stem_parts.append(cause_stem)
+
+    title_stem = sanitize_filename_stem(title)
+    stem_parts.append(title_stem or "Judgment")
+
+    stem = truncate_stem(" - ".join(filter(None, stem_parts)))
+    filename = f"{stem or 'Judgment'}.pdf"
+    path = (base_dir / filename).resolve()
+
+    if len(path.name.encode("utf-8")) > 240:
+        trimmed = truncate_stem(stem, 100)
+        path = (base_dir / f"{trimmed or 'Judgment'}.pdf").resolve()
+
+    return path
+
+
+def hashed_fallback_path(base_dir: Path, title: str) -> Path:
+    """Return a fallback PDF path using a hashed title stem."""
+
+    stem = hashed_fallback_stem(title)
+    return (Path(base_dir).resolve() / f"{stem}.pdf").resolve()
+
+
 def sanitize_filename(name: str) -> str:
     """
     Return a filesystem-safe filename derived from *name*.
@@ -140,40 +201,6 @@ def truncate_to_max_bytes(value: str, max_bytes: int) -> str:
         encoded = encoded[:-1]
 
     return encoded.decode("utf-8", "ignore")
-
-
-def build_pdf_path(pdf_dir: Path, case_token: str | None, title: str) -> Path:
-    """Construct a safe PDF path under *pdf_dir* for the given case."""
-
-    pdf_dir = Path(pdf_dir)
-    safe_title = sanitize_filename_component(title) or "Judgment"
-
-    short_token = sanitize_filename_component((case_token or "").strip())
-    if short_token:
-        short_token = truncate_to_max_bytes(short_token, 32)
-
-    base = safe_title
-    filename = truncate_to_max_bytes(base, 200 - len(".pdf")) + ".pdf"
-    path = pdf_dir / filename
-
-    if path.exists() and short_token:
-        base = f"{safe_title} - {short_token}"
-        filename = truncate_to_max_bytes(base, 200 - len(".pdf")) + ".pdf"
-        path = pdf_dir / filename
-
-    if path.exists() or len(path.name.encode("utf-8")) > 255:
-        digest_source = case_token or title or safe_title
-        digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()[:8]
-        max_base_bytes = max(1, 200 - len(".pdf") - len(digest) - 3)
-        base = truncate_to_max_bytes(safe_title, max_base_bytes)
-        filename = f"{base} - {digest}.pdf"
-        path = pdf_dir / filename
-
-    if len(path.name.encode("utf-8")) > 255:
-        trimmed_name = truncate_to_max_bytes(path.stem, 200 - len(".pdf"))
-        path = pdf_dir / f"{trimmed_name}.pdf"
-
-    return path
 
 
 def load_metadata() -> dict[str, Any]:
@@ -475,6 +502,10 @@ __all__ = [
     "setup_run_logger",
     "get_current_log_path",
     "log_line",
+    "sanitize_filename_stem",
+    "truncate_stem",
+    "hashed_fallback_stem",
+    "hashed_fallback_path",
     "sanitize_filename",
     "sanitize_filename_component",
     "truncate_to_max_bytes",

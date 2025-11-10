@@ -12,12 +12,13 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from . import config
 from .selenium_client import selenium_ajax_get_box_url
 from .utils import (
+    build_pdf_path,
     ensure_dirs,
     find_metadata_entry,
+    hashed_fallback_path,
     is_duplicate,
     log_line,
     record_result,
-    sanitize_filename,
 )
 
 
@@ -101,14 +102,16 @@ def attempt_download_case(
     fid = case["fid"]
     slug = case.get("fname") or fid
     log_line(f"Processing case {fid}: {case.get('title', 'Untitled')}")
-    sanitized = sanitize_filename(case["fname"])
-    filename = sanitized if sanitized.lower().endswith(".pdf") else f"{sanitized}.pdf"
+    title = case.get("title") or case.get("subject") or fid
+    cause_number = case.get("cause_number") or None
 
-    entry, _ = find_metadata_entry(meta, slug=slug, fid=fid, filename=filename)
+    out_path = build_pdf_path(config.PDF_DIR, title, cause_number=cause_number)
+
+    entry, _ = find_metadata_entry(meta, slug=slug, fid=fid, filename=out_path.name)
     if entry and (entry.get("local_filename") or entry.get("filename")):
-        filename = entry.get("local_filename") or entry.get("filename")  # type: ignore[assignment]
-
-    out_path = config.PDF_DIR / filename
+        existing_name = entry.get("local_filename") or entry.get("filename")
+        if isinstance(existing_name, str) and existing_name.strip():
+            out_path = config.PDF_DIR / existing_name
 
     if is_duplicate(fid, out_path.name, meta, slug=slug):
         log_line(
@@ -134,7 +137,7 @@ def attempt_download_case(
     success, error = stream_pdf(session, box_url, out_path)
     if success:
         size_kb = out_path.stat().st_size / 1024
-        log_line(f"Saved {filename} ({size_kb:.1f} KiB)")
+        log_line(f"Saved {out_path.name} ({size_kb:.1f} KiB)")
         record_result(
             meta,
             slug=slug,
@@ -152,9 +155,54 @@ def attempt_download_case(
         )
         result = {"status": "downloaded", "fid": fid, "filename": out_path.name}
     else:
-        log_line(f"Failed to download {fid}: {error}")
-        out_path.unlink(missing_ok=True)
-        result = {"status": "failed", "fid": fid, "filename": filename, "error": error}
+        filename_error = str(error or "").lower()
+        if "file name too long" in filename_error or "errno 36" in filename_error:
+            fallback_path = hashed_fallback_path(config.PDF_DIR, title)
+            log_line(
+                f"Filename too long for {title!r}; retrying with fallback {fallback_path.name}"
+            )
+            success, retry_error = stream_pdf(session, box_url, fallback_path)
+            if success:
+                size_kb = fallback_path.stat().st_size / 1024
+                log_line(f"Saved {fallback_path.name} ({size_kb:.1f} KiB) after fallback")
+                record_result(
+                    meta,
+                    slug=slug,
+                    fid=fid,
+                    title=case.get("title") or slug,
+                    local_filename=fallback_path.name,
+                    source_url=box_url,
+                    size_bytes=fallback_path.stat().st_size,
+                    category=case.get("category"),
+                    judgment_date=case.get("judgment_date"),
+                    court=case.get("court"),
+                    cause_number=case.get("cause_number"),
+                    subject=case.get("subject") or case.get("title"),
+                    local_path=str(fallback_path.resolve()),
+                )
+                result = {
+                    "status": "downloaded",
+                    "fid": fid,
+                    "filename": fallback_path.name,
+                }
+            else:
+                log_line(f"Failed to download {fid}: {retry_error}")
+                fallback_path.unlink(missing_ok=True)
+                result = {
+                    "status": "failed",
+                    "fid": fid,
+                    "filename": fallback_path.name,
+                    "error": retry_error,
+                }
+        else:
+            log_line(f"Failed to download {fid}: {error}")
+            out_path.unlink(missing_ok=True)
+            result = {
+                "status": "failed",
+                "fid": fid,
+                "filename": out_path.name,
+                "error": error,
+            }
 
     time.sleep(per_delay if per_delay is not None else config.PER_DOWNLOAD_DELAY)
     return result

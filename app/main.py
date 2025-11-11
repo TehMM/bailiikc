@@ -28,7 +28,6 @@ from app.scraper.utils import (
     build_zip,
     ensure_dirs,
     get_current_log_path,
-    list_pdfs,
     load_base_url,
     load_metadata,
     log_line,
@@ -278,9 +277,6 @@ def report() -> str:
 
     ensure_dirs()
     meta = load_metadata()
-    pdfs = list_pdfs()
-    total_size = sum(pdf.stat().st_size for pdf in pdfs)
-
     downloads = _build_download_rows(meta)
     courts = sorted({row["court"] for row in downloads if row["court"]})
     categories = sorted({row["category"] for row in downloads if row["category"]})
@@ -289,19 +285,6 @@ def report() -> str:
     context = {
         "base_url": load_base_url(),
         "csv_url": config.CSV_URL,
-        "pdfs": [
-            {
-                "name": pdf.name,
-                "size": pdf.stat().st_size,
-                "timestamp": time.strftime(
-                    "%Y-%m-%d %H:%M:%S",
-                    time.gmtime(pdf.stat().st_mtime),
-                ),
-            }
-            for pdf in pdfs
-        ],
-        "total_pdfs": len(pdfs),
-        "total_size": total_size,
         "log_lines": _read_last_log_lines(),
         "last_summary": app.config.get("LAST_SUMMARY"),
         "last_params": app.config.get("LAST_PARAMS", {}),

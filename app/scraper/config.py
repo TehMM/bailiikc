@@ -10,6 +10,7 @@ LOG_DIR: Path = DATA_DIR / "logs"
 LOG_FILE: Path = LOG_DIR / "latest.log"
 METADATA_FILE: Path = DATA_DIR / "metadata.json"
 CONFIG_FILE: Path = DATA_DIR / "config.txt"
+CHECKPOINT_PATH: Path = DATA_DIR / "state.json"
 
 DEFAULT_BASE_URL: str = "https://judicial.ky/judgments/unreported-judgments/"
 CSV_URL: str = "https://judicial.ky/wp-content/uploads/box_files/judgments.csv"
@@ -34,3 +35,15 @@ COMMON_HEADERS: dict[str, str] = {
     "Connection": "keep-alive",
     "X-Requested-With": "XMLHttpRequest",
 }
+
+
+def is_full_mode(mode: str) -> bool:
+    """Return ``True`` when ``mode`` represents a full scrape request."""
+
+    return str(mode).strip().lower() == "full"
+
+
+def is_new_mode(mode: str) -> bool:
+    """Return ``True`` when ``mode`` represents a new-only scrape request."""
+
+    return str(mode).strip().lower() == "new"

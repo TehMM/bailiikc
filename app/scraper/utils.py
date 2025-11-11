@@ -161,15 +161,32 @@ def build_pdf_path(
     *,
     action: str | None = None,
     cause_number: str | None = None,
+    judgment_date: str | None = None,
 ) -> Path:
-    """Construct a safe PDF destination path derived from *title* and *action*."""
+    """Construct a safe PDF destination path derived from case metadata."""
 
     base_dir = Path(base_dir).resolve()
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    fallback = action or cause_number or "judgment"
-    filename = make_pdf_filename_from_title(title, fallback)
-    return (base_dir / filename).resolve()
+    parts: list[str] = []
+
+    cause_clean = sanitize_filename_component(cause_number) if cause_number else ""
+    if cause_clean:
+        parts.append(cause_clean)
+
+    date_clean = sanitize_filename_component(judgment_date) if judgment_date else ""
+    if date_clean:
+        parts.append(date_clean)
+
+    title_clean = truncate_stem(sanitize_filename_stem(title or ""))
+    if not title_clean and action:
+        title_clean = truncate_stem(sanitize_filename_stem(action))
+    if not title_clean:
+        title_clean = "Judgment"
+
+    parts.append(title_clean)
+    filename = " - ".join(part for part in parts if part)
+    return (base_dir / f"{filename}.pdf").resolve()
 
 
 def hashed_fallback_path(base_dir: Path, title: str) -> Path:

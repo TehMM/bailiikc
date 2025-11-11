@@ -110,6 +110,7 @@ def attempt_download_case(
         title,
         action=slug,
         cause_number=cause_number,
+        judgment_date=case.get("judgment_date") or case.get("date"),
     )
 
     entry, _ = find_metadata_entry(meta, slug=slug, fid=fid, filename=out_path.name)

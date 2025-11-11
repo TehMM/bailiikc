@@ -4,7 +4,7 @@
     <h2>Scrape Report</h2>
     <p><strong>Target URL:</strong> <a href="{{ base_url }}" target="_blank" rel="noopener">{{ base_url }}</a></p>
     <p><strong>CSV Source:</strong> <a href="{{ csv_url }}" target="_blank" rel="noopener">judgments.csv</a></p>
-    <p><strong>Total PDFs:</strong> {{ total_pdfs }} ({{ (total_size / 1024)|round(1) }} KiB)</p>
+    <p><strong>Downloaded Cases:</strong> {{ downloads|length }}</p>
     <div class="button-row">
         <a href="{{ url_for('index') }}" class="button">Home</a>
         <a href="{{ url_for('download_all_zip') }}" class="button">Download All ZIP</a>
@@ -95,36 +95,6 @@
     </div>
     {% else %}
     <p>No downloads recorded yet.</p>
-    {% endif %}
-</section>
-
-<section class="card">
-    <h3>Downloaded Files</h3>
-    {% if pdfs %}
-    <div class="table-wrapper">
-        <table>
-            <thead>
-                <tr>
-                    <th>Filename</th>
-                    <th>Size</th>
-                    <th>Timestamp</th>
-                    <th>Action</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for pdf in pdfs %}
-                <tr>
-                    <td class="mono">{{ pdf.name }}</td>
-                    <td>{{ (pdf.size / 1024)|round(1) }} KiB</td>
-                    <td>{{ pdf.timestamp }}</td>
-                    <td><a href="{{ url_for('download_file', filename=pdf.name) }}">Download</a></td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-    {% else %}
-    <p>No PDFs downloaded yet.</p>
     {% endif %}
 </section>
 

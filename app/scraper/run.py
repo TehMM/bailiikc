@@ -42,6 +42,7 @@ from playwright.sync_api import (
 )
 
 from . import config
+from .config import is_full_mode, is_new_mode
 from .cases_index import (
     CASES_BY_ACTION,
     find_case_by_fname,
@@ -63,8 +64,6 @@ from .utils import (
 ADMIN_AJAX = "https://judicial.ky/wp-admin/admin-ajax.php"
 
 _ONCLICK_FNAME_RE = re.compile(r"dl_bfile[^'\"]*['\"]([A-Za-z0-9]+)['\"]", re.IGNORECASE)
-_FORM_FIELD_SPLIT_RE = re.compile(r"&(?=[A-Za-z0-9_]+=)")
-
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -366,22 +365,6 @@ def _extract_box_url(data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _extract_form_value(body: str, field: str) -> str:
-    """Extract *field* from an ``application/x-www-form-urlencoded`` body."""
-
-    if not body or not field:
-        return ""
-
-    marker = f"{field}="
-    if marker not in body:
-        return ""
-
-    tail = body.split(marker, 1)[1]
-    parts = _FORM_FIELD_SPLIT_RE.split(tail, 1)
-    value = parts[0]
-    return value
-
-
 # ---------------------------------------------------------------------------
 # Download + AJAX helpers
 # ---------------------------------------------------------------------------
@@ -471,346 +454,313 @@ def _label_for_entry(
 
 
 def handle_dl_bfile_from_ajax(
-    post_body: str,
-    payload: Any,
-    downloads_dir: Path,
     *,
-    meta: Optional[Dict[str, Any]] = None,
-    seen: Optional[Set[str]] = None,
-    http_client: Optional[Any] = None,
-    pending: Optional[Dict[str, Dict[str, Any]]] = None,
+    mode: str,
+    fname: str,
+    box_url: str,
+    downloads_dir: Path,
+    cases_by_action: Dict[str, Any],
+    seen_fnames_in_run: Optional[Set[str]] = None,
     checkpoint: Optional[Checkpoint] = None,
-    persisted_tokens: Optional[Set[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    http_client: Optional[Any] = None,
+    case_context: Optional[Dict[str, Any]] = None,
+    fid: Optional[str] = None,
 ) -> str:
-    """Process a dl_bfile AJAX response and download the corresponding PDF."""
+    """Process a dl_bfile AJAX response using explicit mode and dedupe semantics."""
 
-    params = {
-        k: v for k, v in urllib.parse.parse_qsl(post_body or "", keep_blank_values=True)
-    }
-    action_param = (params.get("action") or "").strip()
-    fname_raw = (params.get("fname") or "").strip()
-    if not fname_raw:
-        fname_raw = _extract_form_value(post_body or "", "fname").strip()
-    fid_param = (params.get("fid") or "").strip()
-
-    if action_param and action_param != "dl_bfile":
-        return "ignored"
-
-    if not fname_raw:
-        log_line(f"[AJAX] dl_bfile without fname; params={params!r}")
-        return "ignored"
-
-    fname_value = urllib.parse.unquote_plus(fname_raw).strip()
-    fname_key = normalize_action_token(fname_value or fname_raw)
-    fname_display = fname_value or fname_raw or fname_key
-
-    if not fname_key:
+    norm_fname = normalize_action_token(fname)
+    display_name = fname or norm_fname
+    if not norm_fname:
         log_line(
-            f"[AJAX][WARN] Unable to normalise fname token '{fname_display}'; skipping."
+            f"[AJAX][WARN] Unable to normalise fname token '{display_name}'; skipping."
         )
         return "failed"
 
-    def _finalise(
-        result: str,
-        final_path: Optional[Path] = None,
-        *,
-        mark_token: bool = True,
-        mark_seen: bool = True,
-    ) -> str:
-        context = pending.get(fname_key) if pending is not None else None
-        if checkpoint is not None and context:
-            page_idx = context.get("page_index")
-            row_idx = context.get("row_index")
-            if page_idx is not None and row_idx is not None:
-                try:
-                    checkpoint.mark_position(int(page_idx), int(row_idx))
-                except Exception as exc:  # noqa: BLE001
-                    log_line(f"[CHECKPOINT] Failed to record position: {exc}")
-        if mark_token and result in {"downloaded", "duplicate"}:
-            if persisted_tokens is not None:
-                persisted_tokens.add(fname_key)
-            if checkpoint is not None:
-                checkpoint.record_download(
-                    fname_key,
-                    final_path.name if final_path is not None else "",
-                )
-        if mark_seen and seen is not None:
-            seen.add(fname_key)
-        if pending is not None:
-            pending.pop(fname_key, None)
-        return result
+    if seen_fnames_in_run is not None:
+        if norm_fname in seen_fnames_in_run:
+            log_line(
+                f"[AJAX] fname {display_name} already processed this run; skipping."
+            )
+            return "duplicate_in_run"
+        seen_fnames_in_run.add(norm_fname)
 
-    if persisted_tokens is not None and fname_key in persisted_tokens:
+    case_row = case_context.get("case") if case_context else None
+    if case_row is None:
+        case_row = cases_by_action.get(norm_fname)
+    if case_row is None:
+        case_row = find_case_by_fname(norm_fname, strict=True)
+
+    slug = norm_fname
+    if case_row is not None and getattr(case_row, "action", None):
+        slug = normalize_action_token(case_row.action) or norm_fname
+
+    if case_row is not None:
+        subject_label = case_row.title or case_row.subject or display_name
         log_line(
-            f"[AJAX] fname {fname_display} already downloaded previously (metadata+file present); skipping."
-        )
-        return _finalise("duplicate", mark_token=False)
-
-    if seen is not None and fname_key in seen:
-        log_line(f"[AJAX] fname {fname_display} already processed in this run; skipping.")
-        return _finalise("duplicate", mark_token=False)
-
-    if not isinstance(payload, dict):
-        log_line(
-            f"[AJAX][WARN] dl_bfile payload is not a dict for fname={fname_key}: {payload!r}"
-        )
-        return _finalise("failed", mark_token=False)
-
-    if payload in (-1, "-1") or not payload.get("success"):
-        log_line(f"[AJAX][WARN] dl_bfile failure for fname={fname_key}: {payload!r}")
-        return _finalise("failed", mark_token=False)
-
-    data = payload.get("data") or {}
-    box_url = _extract_box_url(data)
-    if not box_url:
-        log_line(
-            f"[AJAX] Could not find Box URL in payload for fname={fname_key}: {data!r}"
-        )
-        return _finalise("failed", mark_token=False)
-
-    case_context: Optional[Dict[str, Any]] = None
-    if pending is not None:
-        case_context = pending.get(fname_key)
-
-    case = case_context.get("case") if case_context else None
-    slug = case_context.get("slug") if case_context and case_context.get("slug") else fname_key
-    meta_entry: Optional[Dict[str, Any]] = None
-    if case_context:
-        meta_entry = case_context.get("metadata_entry")
-
-    if case is None:
-        case = find_case_by_fname(fname_key, strict=True)
-        if case is not None:
-            slug = case.action
-
-    if case is None:
-        log_line(
-            f"[AJAX][WARN] No case mapping found for fname={fname_display}; "
-            "not skipping based on other cases."
+            f"[AJAX] dl_bfile fname={display_name} resolved to case='{subject_label}'"
         )
     else:
-        case_subject = case.subject or case.title or fname_key
+        subject_label = display_name
         log_line(
-            f"[AJAX] dl_bfile fname={fname_display} resolved to case='{case_subject}'"
+            f"[AJAX][WARN] No case mapping found for fname={display_name}; proceeding generically."
         )
-        slug = case.action
 
     downloads_dir = Path(downloads_dir).resolve()
-    title_source: Optional[str] = None
-    if case and case.title:
-        title_source = case.title
-    elif resolved_entry and isinstance(resolved_entry.get("title"), str):
-        stored_title = resolved_entry.get("title")
-        if stored_title:
-            title_source = str(stored_title)
-    if not title_source:
-        title_source = fname_display
-    cause_number: Optional[str] = None
-    if case is not None:
-        cause_number = case.cause_number or case.extra.get("Cause Number")
-    dest_path = build_pdf_path(
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+
+    cause_number = None
+    judgment_date = None
+    court = None
+    category = None
+    if case_row is not None:
+        cause_number = getattr(case_row, "cause_number", None) or case_row.extra.get(
+            "Cause Number"
+        )
+        judgment_date = getattr(case_row, "judgment_date", None) or case_row.extra.get(
+            "Judgment Date"
+        )
+        category = getattr(case_row, "category", None) or case_row.extra.get("Category")
+        court = getattr(case_row, "court", None) or case_row.extra.get("Court")
+
+    pdf_path = build_pdf_path(
         downloads_dir,
-        title_source,
-        action=fname_key,
+        subject_label,
+        action=slug,
         cause_number=cause_number,
+        judgment_date=judgment_date,
     )
-
-    if meta is not None:
-        conflict_entry, _ = find_metadata_entry(meta, filename=dest_path.name)
-        if conflict_entry is not None:
-            conflict_slug = normalize_action_token(
-                conflict_entry.get("slug") or conflict_entry.get("fid") or ""
-            )
-            current_slug = normalize_action_token(slug)
-            if conflict_slug and current_slug and conflict_slug != current_slug:
-                safe_suffix = re.sub(r"[\\/*?:\"<>|]+", " ", current_slug)[:10]
-                safe_suffix = safe_suffix.strip() or current_slug[:10]
-                alt_name = f"{dest_path.stem} [{safe_suffix.strip()}].pdf"
-                alt_path = (downloads_dir / alt_name).resolve()
-                if alt_path != dest_path:
-                    log_line(
-                        f"[AJAX] Filename collision detected; using alternate name '{alt_path.name}'."
-                    )
-                    dest_path = alt_path
-
-    raw_fid_value = data.get("fid") or box_url
-    if isinstance(raw_fid_value, str):
-        fid_for_log = raw_fid_value.strip()
-    else:
-        fid_for_log = str(raw_fid_value)
-    if fid_for_log:
-        short_fid = fid_for_log if len(fid_for_log) <= 96 else f"{fid_for_log[:93]}..."
-        log_line(
-            f"[AJAX] dl_bfile fname={fname_display} using download fid={short_fid}"
-        )
-
-    resolved_entry = meta_entry
-    if meta is not None:
-        lookup_entry, _ = find_metadata_entry(meta, slug=slug, filename=dest_path.name)
-        if lookup_entry is None and slug != fname_key:
-            lookup_entry, _ = find_metadata_entry(
-                meta, slug=fname_key, filename=dest_path.name
-            )
-        if lookup_entry is not None:
-            resolved_entry = lookup_entry
-
     log_line(
-        f"[AJAX] dl_bfile fname={fname_display} expected_path='{dest_path}'"
+        f"[AJAX] dl_bfile fname={display_name} expected_path='{pdf_path.name}'"
     )
 
-    if resolved_entry and has_local_pdf(resolved_entry):
-        label = resolved_entry.get("title") or resolved_entry.get("slug") or fname_display
-        log_line(
-            f"[AJAX] fname {fname_display} already downloaded previously (metadata+file present); skipping."
-        )
-        return _finalise("duplicate", dest_path)
-
-    if resolved_entry:
-        stored_name = (resolved_entry.get("local_filename") or "").strip()
-        if stored_name and stored_name != dest_path.name:
+    if is_new_mode(mode) and checkpoint is not None:
+        processed_tokens = checkpoint.processed_tokens
+        if norm_fname in processed_tokens:
             log_line(
-                f"[AJAX][WARN] Metadata filename mismatch for fname={fname_display}: "
-                f"stored={stored_name!r} expected={dest_path.name!r}; proceeding to download."
+                f"[AJAX] {display_name} previously completed; skip in NEW mode."
             )
+            return "checkpoint_skip"
 
-    if not resolved_entry:
-        try:
-            if dest_path.exists() and dest_path.is_file() and dest_path.stat().st_size > 0:
-                log_line(
-                    f"[AJAX] fname {fname_display} already downloaded previously (metadata+file present); skipping."
+    meta = metadata or {}
+    meta_entry: Optional[Dict[str, Any]] = None
+    if case_context and case_context.get("metadata_entry"):
+        meta_entry = case_context["metadata_entry"]
+
+    if meta_entry is None and meta:
+        meta_entry, _ = find_metadata_entry(meta, slug=slug, filename=pdf_path.name)
+        if meta_entry is None and slug != norm_fname:
+            meta_entry, _ = find_metadata_entry(
+                meta, slug=norm_fname, filename=pdf_path.name
+            )
+        if meta_entry is None:
+            meta_entry, _ = find_metadata_entry(meta, filename=pdf_path.name)
+
+    if meta_entry and has_local_pdf(meta_entry):
+        label = meta_entry.get("title") or meta_entry.get("slug") or subject_label
+        log_line(
+            f"[AJAX] Metadata and local file confirm {label}; skipping download."
+        )
+        if checkpoint is not None and is_new_mode(mode):
+            checkpoint.record_download(slug, str(pdf_path.name))
+        return "existing_file"
+
+    try:
+        if pdf_path.exists() and pdf_path.stat().st_size > 0:
+            log_line(
+                f"[AJAX] Local file {pdf_path.name} already exists; skipping download."
+            )
+            if meta_entry is None and meta is not None:
+                record_result(
+                    meta,
+                    slug=slug,
+                    fid=fid or slug,
+                    title=subject_label,
+                    local_filename=pdf_path.name,
+                    source_url=box_url,
+                    size_bytes=pdf_path.stat().st_size,
+                    category=category,
+                    judgment_date=judgment_date,
+                    court=court,
+                    cause_number=cause_number,
+                    subject=subject_label,
+                    local_path=str(pdf_path.resolve()),
                 )
-                if meta is not None:
-                    subject_value = (
-                        (case.title if case and case.title else None)
-                        or (case.subject if case and case.subject else None)
-                        or fname_display
-                    )
-                    category_value = None
-                    judgment_value = None
-                    court_value = None
-                    cause_value = None
-                    if case is not None:
-                        category_value = case.category or case.extra.get("Category")
-                        judgment_value = (
-                            case.judgment_date
-                            or case.extra.get("Judgment Date")
-                            or case.extra.get("Date")
-                        )
-                        court_value = (
-                            case.court
-                            or case.extra.get("Court")
-                            or case.extra.get("Court file")
-                        )
-                        cause_value = case.cause_number or case.extra.get("Cause Number")
-                    record_result(
-                        meta,
-                        slug=slug,
-                        fid=fid_param or fname_key,
-                        title=subject_value or fname_display,
-                        local_filename=dest_path.name,
-                        source_url=box_url,
-                        size_bytes=dest_path.stat().st_size,
-                        category=category_value,
-                        judgment_date=judgment_value,
-                        court=court_value,
-                        cause_number=cause_value,
-                        subject=subject_value,
-                        local_path=str(dest_path.resolve()),
-                    )
-                return _finalise("duplicate", dest_path)
-        except OSError:
-            pass
+            if checkpoint is not None and is_new_mode(mode):
+                checkpoint.record_download(slug, str(pdf_path.name))
+            return "existing_file"
+    except OSError:
+        pass
 
     success = False
     error: Optional[str] = None
-    final_path = dest_path
+    final_path = pdf_path
 
     try:
         success, error = queue_or_download_file(
             box_url,
-            dest_path,
+            pdf_path,
             http_client=http_client,
         )
     except OSError as exc:
         error = str(exc)
         success = False
 
-    def _filename_error_matches(message: Optional[str]) -> bool:
-        if not message:
-            return False
-        lowered = message.lower()
-        return "file name too long" in lowered or "errno 36" in lowered or "errno 63" in lowered
-
-    if not success and _filename_error_matches(error):
-        fallback_path = hashed_fallback_path(downloads_dir, title_source)
-        if fallback_path != dest_path:
-            log_line(
-                f"[AJAX] Retrying save for fname={fname_display} with fallback {fallback_path.name}"
-            )
-            final_path = fallback_path
-            try:
-                success, error = queue_or_download_file(
-                    box_url,
-                    fallback_path,
-                    http_client=http_client,
+    if not success and error:
+        lowered = error.lower()
+        if "file name too long" in lowered or "errno 36" in lowered or "errno 63" in lowered:
+            fallback_path = hashed_fallback_path(downloads_dir, subject_label)
+            if fallback_path != pdf_path:
+                log_line(
+                    f"[AJAX] Retrying save for {display_name} with fallback {fallback_path.name}"
                 )
-            except OSError as exc:
-                error = str(exc)
-                success = False
+                final_path = fallback_path
+                try:
+                    success, error = queue_or_download_file(
+                        box_url,
+                        fallback_path,
+                        http_client=http_client,
+                    )
+                except OSError as exc:
+                    error = str(exc)
+                    success = False
 
     if not success:
-        log_line(f"[AJAX] Failed to save {fname_key} to {final_path}: {error}")
+        log_line(
+            f"[AJAX] Download failed for {display_name} -> {final_path.name}: {error}"
+        )
         final_path.unlink(missing_ok=True)
-        return _finalise("failed", mark_token=False)
+        if seen_fnames_in_run is not None:
+            seen_fnames_in_run.discard(norm_fname)
+        return "failed"
 
     size_bytes = final_path.stat().st_size
     log_line(
-        f"[AJAX] Saved fname={fname_display} -> {final_path} ({size_bytes/1024:.1f} KiB)"
+        f"[AJAX] Saved fname={display_name} -> {final_path} ({size_bytes/1024:.1f} KiB)"
     )
 
     if meta is not None:
-        subject_value = (
-            (case.title if case and case.title else None)
-            or (case.subject if case and case.subject else None)
-            or fname_display
-        )
-        category_value = None
-        judgment_value = None
-        court_value = None
-        cause_value = None
-        if case is not None:
-            category_value = case.category or case.extra.get("Category")
-            judgment_value = (
-                case.judgment_date
-                or case.extra.get("Judgment Date")
-                or case.extra.get("Date")
-            )
-            court_value = case.court or case.extra.get("Court") or case.extra.get("Court file")
-            cause_value = case.cause_number or case.extra.get("Cause Number")
-        elif resolved_entry:
-            category_value = resolved_entry.get("category")
-            judgment_value = resolved_entry.get("judgment_date")
-            court_value = resolved_entry.get("court")
-            cause_value = resolved_entry.get("cause_number")
-
         record_result(
             meta,
             slug=slug,
-            fid=fid_param or fname_key,
-            title=subject_value or fname_key,
+            fid=fid or slug,
+            title=subject_label,
             local_filename=final_path.name,
             source_url=box_url,
             size_bytes=size_bytes,
-            category=category_value,
-            judgment_date=judgment_value,
-            court=court_value,
-            cause_number=cause_value,
-            subject=subject_value,
+            category=category,
+            judgment_date=judgment_date,
+            court=court,
+            cause_number=cause_number,
+            subject=subject_label,
             local_path=str(final_path.resolve()),
         )
 
-    return _finalise("downloaded", final_path)
+    if checkpoint is not None and is_new_mode(mode):
+        checkpoint.record_download(slug, str(final_path.name))
 
+    return "downloaded"
+
+
+# ---------------------------------------------------------------------------
+# Retry helpers
+# ---------------------------------------------------------------------------
+
+
+def retry_failed_downloads(
+    *,
+    page: Optional[Page],
+    failed_items: List[Dict[str, Any]],
+    scrape_mode: str,
+    pending_by_fname: Dict[str, Dict[str, Any]],
+    seen_fnames_in_run: Set[str],
+    checkpoint: Optional[Checkpoint],
+) -> None:
+    """Retry download clicks for items that previously failed."""
+
+    if page is None or page.is_closed():
+        return
+
+    if not failed_items:
+        return
+
+    log_line(f"[RETRY] Attempting {len(failed_items)} failed download retries.")
+
+    for item in list(failed_items):
+        if page.is_closed():
+            log_line("[RETRY] Page closed before retry could complete; aborting remaining retries.")
+            break
+
+        fname = item.get("fname")
+        if not fname:
+            continue
+
+        page_index = int(item.get("page_index", 0))
+        button_index = int(item.get("button_index", 0))
+
+        try:
+            if not _set_datatable_page(page, page_index):
+                log_line(
+                    f"[RETRY] Unable to navigate to DataTable page {page_index + 1} for {fname}; skipping."
+                )
+                continue
+        except PWError as exc:
+            if _is_target_closed_error(exc):
+                log_line("[RETRY] Target closed while navigating for retry; aborting retries.")
+                break
+            log_line(f"[RETRY] Error setting page for retry: {exc}")
+            continue
+
+        wait_seconds(page, 0.3)
+
+        locator = None
+        for selector in _guess_download_locators():
+            try:
+                candidates = page.locator(selector)
+                if candidates.count() > button_index:
+                    locator = candidates.nth(button_index)
+                    break
+            except PWError as exc:
+                if _is_target_closed_error(exc):
+                    log_line("[RETRY] Target closed while locating button; aborting retries.")
+                    locator = None
+                    break
+                log_line(f"[RETRY] Locator error for selector {selector!r}: {exc}")
+            except Exception as exc:
+                log_line(f"[RETRY] Unexpected locator error for selector {selector!r}: {exc}")
+
+        if locator is None:
+            log_line(
+                f"[RETRY] Could not locate button index {button_index} on page {page_index + 1} for {fname}; skipping."
+            )
+            continue
+
+        pending_by_fname[fname] = {
+            "case": item.get("case"),
+            "metadata_entry": item.get("metadata_entry"),
+            "slug": item.get("slug") or fname,
+            "raw": item.get("raw") or fname,
+            "page_index": page_index,
+            "row_index": button_index,
+            "fid": item.get("fid"),
+        }
+
+        try:
+            locator.click(timeout=2000)
+            seen_fnames_in_run.discard(fname)
+            wait_seconds(page, 0.4)
+        except PWError as exc:
+            if _is_target_closed_error(exc):
+                log_line("[RETRY] Target closed during retry click; aborting remaining retries.")
+                break
+            log_line(f"[RETRY] Click failed for {fname}: {exc}")
+            continue
+        except Exception as exc:
+            log_line(f"[RETRY] Click failed for {fname}: {exc}")
+            continue
+
+        if checkpoint is not None and is_new_mode(scrape_mode):
+            checkpoint.mark_position(page_index, button_index)
 
 # ---------------------------------------------------------------------------
 # Main entrypoint
@@ -861,6 +811,7 @@ def _run_scrape_attempt(
     new_limit: Optional[int],
     log_path: Path,
     max_retries: int,
+    checkpoint: Optional[Checkpoint],
 ) -> Dict[str, Any]:
     """Execute a scraping run with automatic restart/resume support."""
 
@@ -881,8 +832,6 @@ def _run_scrape_attempt(
 
     load_cases_index("data/judgments.csv")
     meta = load_metadata()
-    checkpoint = Checkpoint(config.DATA_DIR / "state.json")
-
     downloaded_index: Dict[str, Dict[str, Any]] = {}
     for entry in meta.get("downloads", []):
         if not isinstance(entry, dict):
@@ -892,8 +841,6 @@ def _run_scrape_attempt(
             continue
         if entry.get("downloaded") and has_local_pdf(entry):
             downloaded_index[slug_value] = entry
-
-    persisted_tokens: Set[str] = set(downloaded_index.keys())
 
     summary: Dict[str, Any] = {
         "base_url": base_url,
@@ -915,17 +862,21 @@ def _run_scrape_attempt(
     while attempt <= max_retries:
         seen_fnames_in_run: Set[str] = set()
         pending_by_fname: Dict[str, Dict[str, Any]] = {}
+        failed_items: List[Dict[str, Any]] = []
         active = True
         browser: Optional[Browser] = None
         context: Optional[BrowserContext] = None
         page: Optional[Page] = None
-        resume_page_index = max(0, checkpoint.page_index)
-        resume_row_index = checkpoint.row_index
+        if checkpoint is not None and is_new_mode(scrape_mode):
+            resume_page_index = max(0, checkpoint.page_index)
+            resume_row_index = checkpoint.row_index
+            log_line(
+                f"[RUN] Resume checkpoint -> page_index={resume_page_index}, row_index={resume_row_index}"
+            )
+        else:
+            resume_page_index = 0
+            resume_row_index = -1
         crash_stop = False
-
-        log_line(
-            f"[RUN] Resume checkpoint -> page_index={resume_page_index}, row_index={resume_row_index}"
-        )
 
         try:
             with sync_playwright() as pw:
@@ -1012,6 +963,19 @@ def _run_scrape_attempt(
                             if not active:
                                 return
 
+                            if not isinstance(payload, dict):
+                                summary["failed"] += 1
+                                return
+
+                            data = payload.get("data") if isinstance(payload, dict) else None
+                            box_url = _extract_box_url(data or {}) if data else None
+                            if not box_url:
+                                log_line(
+                                    f"[AJAX] Could not find Box URL in payload for fname={fname_param}"
+                                )
+                                summary["failed"] += 1
+                                return
+
                             http_fetcher = (
                                 lambda download_url, timeout=120: context.request.get(
                                     download_url,
@@ -1019,24 +983,67 @@ def _run_scrape_attempt(
                                 )
                             )
 
-                            result = handle_dl_bfile_from_ajax(
-                                post_body=body,
-                                payload=payload,
-                                downloads_dir=config.PDF_DIR,
-                                meta=meta,
-                                seen=seen_fnames_in_run,
-                                http_client=http_fetcher,
-                                pending=pending_by_fname,
-                                checkpoint=checkpoint,
-                                persisted_tokens=persisted_tokens,
+                            norm_fname = normalize_action_token(fname_param or "")
+                            case_context = (
+                                pending_by_fname.get(norm_fname) if norm_fname else None
                             )
+                            if case_context is not None:
+                                case_context = dict(case_context)
+                                if fid_param:
+                                    case_context.setdefault("fid", fid_param)
+
+                            result = handle_dl_bfile_from_ajax(
+                                mode=scrape_mode,
+                                fname=fname_param or norm_fname,
+                                box_url=box_url,
+                                downloads_dir=config.PDF_DIR,
+                                cases_by_action=CASES_BY_ACTION,
+                                seen_fnames_in_run=seen_fnames_in_run,
+                                checkpoint=checkpoint if is_new_mode(scrape_mode) else None,
+                                metadata=meta,
+                                http_client=http_fetcher,
+                                case_context=case_context,
+                                fid=fid_param,
+                            )
+
+                            if norm_fname:
+                                pending_by_fname.pop(norm_fname, None)
+
+                                def _remove_failed_record(token: str) -> None:
+                                    for idx, item in enumerate(failed_items):
+                                        if item.get("fname") == token:
+                                            failed_items.pop(idx)
+                                            summary["failed"] = max(0, summary["failed"] - 1)
+                                            break
 
                             if result == "downloaded":
                                 summary["downloaded"] += 1
+                                if norm_fname:
+                                    _remove_failed_record(norm_fname)
                             elif result == "failed":
                                 summary["failed"] += 1
-                            elif result in {"duplicate", "unknown", "ignored"}:
+                                if norm_fname and case_context:
+                                    if not any(item.get("fname") == norm_fname for item in failed_items):
+                                        failed_items.append(
+                                            {
+                                                "fname": norm_fname,
+                                                "raw": case_context.get("raw") or fname_param,
+                                                "page_index": case_context.get("page_index", 0),
+                                                "button_index": case_context.get("row_index", 0),
+                                                "metadata_entry": case_context.get("metadata_entry"),
+                                                "case": case_context.get("case"),
+                                                "slug": case_context.get("slug"),
+                                                "fid": case_context.get("fid"),
+                                            }
+                                        )
+                            elif result in {
+                                "duplicate_in_run",
+                                "existing_file",
+                                "checkpoint_skip",
+                            }:
                                 summary["skipped"] += 1
+                                if norm_fname:
+                                    _remove_failed_record(norm_fname)
 
                         except Exception as exc:
                             log_line(f"[AJAX] handler error: {exc}")
@@ -1106,7 +1113,8 @@ def _run_scrape_attempt(
 
                         while not crash_stop:
                             page_index_zero = max(0, page_number - 1)
-                            checkpoint.mark_page(page_index_zero, reset_row=False)
+                            if checkpoint is not None and is_new_mode(scrape_mode):
+                                checkpoint.mark_page(page_index_zero, reset_row=False)
                             try:
                                 buttons = page.locator("button:has(i.icon-dl)")
                                 count = buttons.count()
@@ -1241,7 +1249,8 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[AJAX][WARN] Skipping button index {i} on page {page_number}: unable to normalise fname token."
                                     )
-                                    checkpoint.mark_position(page_index_zero, i)
+                                    if checkpoint is not None and is_new_mode(scrape_mode):
+                                        checkpoint.mark_position(page_index_zero, i)
                                     continue
 
                                 metadata_entry = downloaded_index.get(fname_key)
@@ -1250,23 +1259,28 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] fname={fname_token} already downloaded as {label}; skipping click."
                                     )
-                                    persisted_tokens.add(fname_key)
-                                    checkpoint.record_download(
-                                        fname_key,
-                                        metadata_entry.get("local_filename")
-                                        or metadata_entry.get("filename")
-                                        or "",
-                                    )
-                                    checkpoint.mark_position(page_index_zero, i)
+                                    if checkpoint is not None and is_new_mode(scrape_mode):
+                                        checkpoint.record_download(
+                                            fname_key,
+                                            metadata_entry.get("local_filename")
+                                            or metadata_entry.get("filename")
+                                            or "",
+                                        )
+                                        checkpoint.mark_position(page_index_zero, i)
                                     summary["skipped"] += 1
                                     seen_fnames_in_run.add(fname_key)
                                     continue
 
-                                if fname_key in persisted_tokens:
+                                if (
+                                    checkpoint is not None
+                                    and is_new_mode(scrape_mode)
+                                    and fname_key in checkpoint.processed_tokens
+                                ):
                                     log_line(
-                                        f"[SKIP] fname={fname_token} already downloaded previously; skipping click."
+                                        f"[SKIP] fname={fname_token} recorded in checkpoint; skipping click in NEW mode."
                                     )
-                                    checkpoint.mark_position(page_index_zero, i)
+                                    if checkpoint is not None and is_new_mode(scrape_mode):
+                                        checkpoint.mark_position(page_index_zero, i)
                                     summary["skipped"] += 1
                                     seen_fnames_in_run.add(fname_key)
                                     continue
@@ -1348,7 +1362,8 @@ def _run_scrape_attempt(
                                     )
                                     pending_by_fname.pop(fname_key, None)
                                     summary["failed"] += 1
-                                    checkpoint.mark_position(page_index_zero, i)
+                                    if checkpoint is not None and is_new_mode(scrape_mode):
+                                        checkpoint.mark_position(page_index_zero, i)
                                     continue
 
                                 seen_fnames_in_run.add(fname_key)
@@ -1418,7 +1433,8 @@ def _run_scrape_attempt(
                                 log_line(f"Pagination load state wait failed: {exc}")
                                 break
 
-                            checkpoint.mark_page(page_index_zero + 1)
+                            if checkpoint is not None and is_new_mode(scrape_mode):
+                                checkpoint.mark_page(page_index_zero + 1)
                             page_number += 1
                             wait_seconds(page, 0.5)
 
@@ -1426,6 +1442,16 @@ def _run_scrape_attempt(
                             log_line(
                                 "[RUN] Pagination loop terminated early due to browser crash; collected downloads will be preserved."
                             )
+
+                    if failed_items:
+                        retry_failed_downloads(
+                            page=page,
+                            failed_items=failed_items,
+                            scrape_mode=scrape_mode,
+                            pending_by_fname=pending_by_fname,
+                            seen_fnames_in_run=seen_fnames_in_run,
+                            checkpoint=checkpoint if is_new_mode(scrape_mode) else None,
+                        )
 
                     time.sleep(2.5)
 
@@ -1484,27 +1510,25 @@ def run_scrape(
     ensure_dirs()
     log_path = setup_run_logger()
 
-    mode = (scrape_mode or config.SCRAPE_MODE_DEFAULT).strip().lower()
-    if mode not in {"new", "full"}:
+    raw_mode = (scrape_mode or config.SCRAPE_MODE_DEFAULT).strip().lower()
+    if is_full_mode(raw_mode):
+        mode = "full"
+    elif is_new_mode(raw_mode):
+        mode = "new"
+    else:
         log_line(
-            f"[RUN] Unknown scrape_mode={mode!r}; defaulting to 'new'."
+            f"[RUN] Unknown scrape_mode={raw_mode!r}; defaulting to 'new'."
         )
         mode = "new"
 
     row_limit = new_limit if new_limit is not None else config.SCRAPE_NEW_LIMIT
     retry_limit = max_retries if max_retries is not None else config.SCRAPER_MAX_RETRIES
 
-    if mode == "full":
-        log_line("[RUN] Full scrape requested; resetting metadata state before run.")
-        for path in (
-            config.METADATA_FILE,
-            config.DATA_DIR / "state.json",
-        ):
-            try:
-                path.unlink()
-            except OSError:
-                continue
-        ensure_dirs()
+    checkpoint: Optional[Checkpoint]
+    if is_new_mode(mode):
+        checkpoint = Checkpoint(config.CHECKPOINT_PATH)
+    else:
+        checkpoint = None
 
     next_start_message = start_message
 
@@ -1519,6 +1543,7 @@ def run_scrape(
             new_limit=row_limit,
             log_path=log_path,
             max_retries=0,
+            checkpoint=checkpoint,
         )
         next_start_message = None
         return result
@@ -1584,24 +1609,17 @@ if __name__ == "__main__":  # pragma: no cover - quick manual verification
         def __call__(self, url: str, timeout: int = 120) -> _DummyResponse:  # noqa: D401
             return _DummyResponse(b"%PDF-1.4\n%%EOF\n")
 
-    sample_body = (
-        "action=dl_bfile&fid=999&fname=FSD0151202511062025ATPLIFESCIENCE&security=dummy"
-    )
-    sample_payload = {
-        "success": True,
-        "data": {"fid": "https://example.org/dummy.pdf"},
-    }
-
     with TemporaryDirectory() as tmpdir:
         result = handle_dl_bfile_from_ajax(
-            sample_body,
-            sample_payload,
-            Path(tmpdir),
-            meta={},
-            seen=set(),
+            mode="new",
+            fname="FSD0151202511062025ATPLIFESCIENCE",
+            box_url="https://example.org/dummy.pdf",
+            downloads_dir=Path(tmpdir),
+            cases_by_action=CASES_BY_ACTION,
+            seen_fnames_in_run=set(),
+            checkpoint=None,
+            metadata={},
             http_client=_DummyClient(),
-            pending={},
-            persisted_tokens=set(),
         )
         print("[Demo] Handler result:", result)
 

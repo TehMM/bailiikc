@@ -8,6 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Tuple
+from urllib.parse import unquote_plus
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from . import config
@@ -17,7 +18,16 @@ _LOGGER_INITIALISED = False
 _CURRENT_LOG_FILE: Path = config.LOG_FILE
 
 MAX_STEM_LEN = 150
+MAX_CASE_FILENAME_BASE = 180
 _BAD_CHARS = r"[\\/:*?\"<>|\r\n\t]"
+
+
+def canon_fname(value: str | None) -> str:
+    """Return a canonical token for AJAX ``fname`` values."""
+
+    if value is None:
+        return ""
+    return unquote_plus(str(value)).strip().upper()
 
 
 def _configure_logger(log_path: Path) -> None:
@@ -120,6 +130,49 @@ def truncate_stem(stem: str, max_len: int = MAX_STEM_LEN) -> str:
     return stem[:max_len].rstrip()
 
 
+def safe_case_filename(
+    *,
+    cause_number: str | None,
+    title: str | None,
+    fallback_token: str | None = None,
+) -> str:
+    """Return a safe ``<Cause Number> - <Title>.pdf`` style filename."""
+
+    cause_clean = sanitize_filename_component(cause_number) if cause_number else ""
+    fallback_clean = sanitize_filename_component(fallback_token) if fallback_token else ""
+    if not cause_clean:
+        cause_clean = fallback_clean
+    if not cause_clean:
+        cause_clean = "Judgment"
+
+    title_source = title if title and title.strip() else fallback_token
+    title_clean = sanitize_filename_component(title_source) if title_source else ""
+    if not title_clean:
+        title_clean = "Judgment"
+
+    base = f"{cause_clean} - {title_clean}" if title_clean else cause_clean
+    base = re.sub(r"\s+", " ", base).strip(" -") or cause_clean
+
+    if len(base) > MAX_CASE_FILENAME_BASE:
+        if cause_clean and title_clean:
+            tail_len = max(0, MAX_CASE_FILENAME_BASE - len(cause_clean) - 3)
+            if tail_len > 0:
+                truncated = title_clean[:tail_len].rstrip()
+                if truncated:
+                    base = f"{cause_clean} - {truncated}"
+                else:
+                    base = cause_clean
+            else:
+                base = cause_clean
+        else:
+            base = base[:MAX_CASE_FILENAME_BASE].rstrip()
+
+    if not base:
+        base = "Judgment"
+
+    return f"{base}.pdf"
+
+
 def make_pdf_filename_from_title(
     title: str | None,
     action: str | None = None,
@@ -168,25 +221,13 @@ def build_pdf_path(
     base_dir = Path(base_dir).resolve()
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    parts: list[str] = []
-
-    cause_clean = sanitize_filename_component(cause_number) if cause_number else ""
-    if cause_clean:
-        parts.append(cause_clean)
-
-    date_clean = sanitize_filename_component(judgment_date) if judgment_date else ""
-    if date_clean:
-        parts.append(date_clean)
-
-    title_clean = truncate_stem(sanitize_filename_stem(title or ""))
-    if not title_clean and action:
-        title_clean = truncate_stem(sanitize_filename_stem(action))
-    if not title_clean:
-        title_clean = "Judgment"
-
-    parts.append(title_clean)
-    filename = " - ".join(part for part in parts if part)
-    return (base_dir / f"{filename}.pdf").resolve()
+    fallback_token = action or cause_number or judgment_date or "judgment"
+    filename = safe_case_filename(
+        cause_number=cause_number,
+        title=title,
+        fallback_token=fallback_token,
+    )
+    return (base_dir / filename).resolve()
 
 
 def hashed_fallback_path(base_dir: Path, title: str) -> Path:
@@ -505,6 +546,17 @@ def reset_state(*, delete_pdfs: bool = False, delete_logs: bool = False) -> None
         except OSError:
             pass
 
+    checkpoint_files = [
+        config.CHECKPOINT_PATH,
+        config.DATA_DIR / "downloaded_index.json",
+    ]
+    for checkpoint in checkpoint_files:
+        try:
+            if checkpoint.exists():
+                checkpoint.unlink()
+        except OSError:
+            continue
+
     if delete_pdfs:
         for path in config.PDF_DIR.glob("*.pdf"):
             try:
@@ -532,12 +584,14 @@ def reset_state(*, delete_pdfs: bool = False, delete_logs: bool = False) -> None
 
 
 __all__ = [
+    "canon_fname",
     "ensure_dirs",
     "setup_run_logger",
     "get_current_log_path",
     "log_line",
     "sanitize_filename_stem",
     "truncate_stem",
+    "safe_case_filename",
     "make_pdf_filename_from_title",
     "hashed_fallback_stem",
     "hashed_fallback_path",

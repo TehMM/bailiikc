@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Generator, Iterable
 
 from flask import (
@@ -29,6 +30,8 @@ from app.scraper.utils import (
     ensure_dirs,
     get_current_log_path,
     load_base_url,
+    load_json_file,
+    load_json_lines,
     load_metadata,
     log_line,
     reset_state,
@@ -135,32 +138,43 @@ def _metadata_to_csv(meta: dict) -> str:
     return output.getvalue()
 
 
-def _build_download_rows(meta: dict) -> list[dict[str, str]]:
+def _load_download_records() -> list[dict[str, object]]:
+    """Return download records sourced from ``downloads.jsonl``."""
+
+    ensure_dirs()
+    records = load_json_lines(config.DOWNLOADS_LOG)
+    return records
+
+
+def _build_download_rows(records: list[dict[str, object]]) -> list[dict[str, object]]:
     """Build structured rows for the downloads table."""
 
-    rows: list[dict[str, str]] = []
-    for entry in meta.get("downloads", []):
+    rows: list[dict[str, object]] = []
+    for entry in records:
         if not isinstance(entry, dict):
             continue
-        filename = entry.get("local_filename") or entry.get("filename")
-        if not filename:
-            continue
 
+        saved_path = entry.get("saved_path") or ""
+        title = entry.get("title") or entry.get("subject") or saved_path
         judgment_date = entry.get("judgment_date") or ""
+        actions_token = entry.get("actions_token") or ""
+
+        filename = Path(saved_path).name if saved_path else ""
+
         rows.append(
             {
-                "slug": entry.get("slug") or entry.get("fid") or filename,
-                "fid": entry.get("fid") or "",
-                "title": entry.get("title") or entry.get("subject") or filename,
-                "subject": entry.get("subject") or entry.get("title") or "",
+                "actions_token": actions_token,
+                "title": title,
+                "subject": entry.get("subject") or "",
                 "court": entry.get("court") or "",
                 "category": entry.get("category") or "",
                 "judgment_date": judgment_date,
-                "sort_judgment_date": _sortable_date(judgment_date),
+                "sort_judgment_date": _sortable_date(str(judgment_date)),
                 "cause_number": entry.get("cause_number") or "",
                 "downloaded_at": entry.get("downloaded_at") or "",
-                "local_filename": filename,
-                "filesize": entry.get("filesize") or 0,
+                "saved_path": saved_path,
+                "filename": filename,
+                "size_kb": round((entry.get("bytes") or 0) / 1024, 1) if entry.get("bytes") else 0,
             }
         )
     return rows
@@ -287,17 +301,18 @@ def report() -> str:
     """Render the report page with current metadata and live logs."""
 
     ensure_dirs()
-    meta = load_metadata()
-    downloads = _build_download_rows(meta)
+    records = _load_download_records()
+    downloads = _build_download_rows(records)
     courts = sorted({row["court"] for row in downloads if row["court"]})
     categories = sorted({row["category"] for row in downloads if row["category"]})
 
     current_log_path = get_current_log_path()
+    summary = load_json_file(config.SUMMARY_FILE)
     context = {
         "base_url": load_base_url(),
         "csv_url": config.CSV_URL,
         "log_lines": _read_last_log_lines(),
-        "last_summary": app.config.get("LAST_SUMMARY"),
+        "last_summary": summary or app.config.get("LAST_SUMMARY"),
         "last_params": app.config.get("LAST_PARAMS", {}),
         "downloads": downloads,
         "courts": courts,

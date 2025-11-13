@@ -23,7 +23,10 @@ SCRAPE_MODE_DEFAULT: str = (
     os.getenv("SCRAPE_MODE", "new").strip().lower() or "new"
 )
 SCRAPE_NEW_LIMIT: int = int(os.getenv("SCRAPE_NEW_LIMIT", "50"))
+SCRAPE_NEW_CONSECUTIVE_LIMIT: int = int(os.getenv("SCRAPE_NEW_CONSECUTIVE_LIMIT", "30"))
 SCRAPER_MAX_RETRIES: int = int(os.getenv("SCRAPER_MAX_RETRIES", "3"))
+SCRAPE_RESUME_MAX_AGE_HOURS: int = int(os.getenv("SCRAPE_RESUME_MAX_AGE_HOURS", "24"))
+SCRAPE_RESUME_DEFAULT: bool = os.getenv("SCRAPE_RESUME", "true").strip().lower() != "false"
 
 COMMON_HEADERS: dict[str, str] = {
     "User-Agent": (

@@ -199,6 +199,8 @@ def index() -> str:
         "default_mode": last_params.get(
             "scrape_mode", config.SCRAPE_MODE_DEFAULT
         ),
+        "default_reset_before_run": last_params.get("reset_before_run", False),
+        "default_reset_delete_pdfs": last_params.get("reset_delete_pdfs", False),
         "last_summary": last_summary,
     }
     return render_template("index.html", **context)
@@ -215,6 +217,8 @@ def start_scrape() -> Response:
         request.form.get("scrape_mode", config.SCRAPE_MODE_DEFAULT).strip().lower()
         or config.SCRAPE_MODE_DEFAULT
     )
+    reset_before_run = request.form.get("reset_before_run") == "1"
+    delete_pdfs_during_reset = request.form.get("reset_delete_pdfs") == "1"
     try:
         new_limit = int(request.form.get("new_limit", config.SCRAPE_NEW_LIMIT))
     except (TypeError, ValueError):
@@ -226,6 +230,10 @@ def start_scrape() -> Response:
         max_retries = config.SCRAPER_MAX_RETRIES
     max_retries = max(1, max_retries)
 
+    if reset_before_run:
+        reset_state(delete_pdfs=delete_pdfs_during_reset, delete_logs=False)
+        scrape_mode = "full"
+
     save_base_url(base_url)
     app.config["LAST_PARAMS"] = {
         "base_url": base_url,
@@ -234,6 +242,8 @@ def start_scrape() -> Response:
         "scrape_mode": scrape_mode,
         "new_limit": new_limit,
         "max_retries": max_retries,
+        "reset_before_run": reset_before_run,
+        "reset_delete_pdfs": delete_pdfs_during_reset,
     }
 
     def _run() -> None:
@@ -247,6 +257,7 @@ def start_scrape() -> Response:
                     scrape_mode=scrape_mode,
                     new_limit=new_limit,
                     max_retries=max_retries,
+                    resume=config.SCRAPE_RESUME_DEFAULT,
                 )
                 app.config["LAST_SUMMARY"] = summary
                 app.config["CURRENT_LOG_FILE"] = summary.get("log_file")

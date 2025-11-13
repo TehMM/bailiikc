@@ -25,6 +25,7 @@ import json
 import re
 import time
 import urllib.parse
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -51,6 +52,7 @@ from .cases_index import (
 )
 from .utils import (
     build_pdf_path,
+    canon_fname,
     ensure_dirs,
     find_metadata_entry,
     hashed_fallback_path,
@@ -81,19 +83,21 @@ class Checkpoint:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.data: Dict[str, Any] = {
-            "last_page_index": 0,
-            "last_row_index": -1,
+            "mode": "",
+            "current_page": 0,
+            "last_button_index": -1,
+            "processed_count": 0,
             "processed_tokens": [],
             "completed_downloads": [],
+            "updated_at": None,
         }
+        self._dirty = False
 
         if self.path.exists():
             try:
                 loaded = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
-                    for key in self.data:
-                        if key in loaded:
-                            self.data[key] = loaded[key]
+                    self.data.update({k: loaded.get(k, v) for k, v in self.data.items()})
             except Exception as exc:  # noqa: BLE001
                 log_line(f"[CHECKPOINT] Failed to read checkpoint: {exc}")
 
@@ -113,17 +117,21 @@ class Checkpoint:
         }
         self.data["completed_downloads"] = sorted(self._completed_downloads)
 
+    # ------------------------------------------------------------------
+    # Properties + helpers
+    # ------------------------------------------------------------------
+
     @property
     def page_index(self) -> int:
         try:
-            return int(self.data.get("last_page_index", 0))
+            return int(self.data.get("current_page", 0))
         except (TypeError, ValueError):
             return 0
 
     @property
     def row_index(self) -> int:
         try:
-            return int(self.data.get("last_row_index", -1))
+            return int(self.data.get("last_button_index", -1))
         except (TypeError, ValueError):
             return -1
 
@@ -131,30 +139,80 @@ class Checkpoint:
     def processed_tokens(self) -> Set[str]:
         return set(self._processed_tokens)
 
-    def save(self) -> None:
+    @property
+    def processed_count(self) -> int:
+        try:
+            return int(self.data.get("processed_count", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _touch(self) -> None:
+        self.data["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    def save(self, *, force: bool = False) -> None:
+        if not force and not self._dirty:
+            return
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp_path.write_text(
             json.dumps(self.data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         tmp_path.replace(self.path)
+        self._dirty = False
 
-    def mark_page(self, page_index: int, *, reset_row: bool = True) -> None:
-        self.data["last_page_index"] = int(max(0, page_index))
-        if reset_row:
-            self.data["last_row_index"] = -1
-        self.save()
+    def flush(self) -> None:
+        self.save(force=True)
 
-    def mark_row(self, row_index: int) -> None:
-        self.data["last_row_index"] = int(max(-1, row_index))
-        self.save()
+    def should_resume(self, mode: str, *, max_age_hours: int) -> bool:
+        stored_mode = (self.data.get("mode") or "").strip().lower()
+        if not stored_mode or stored_mode != mode.strip().lower():
+            return False
+        updated_raw = self.data.get("updated_at")
+        if not updated_raw:
+            return False
+        try:
+            updated = datetime.fromisoformat(updated_raw.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        age = datetime.utcnow() - updated.replace(tzinfo=None)
+        return age <= timedelta(hours=max_age_hours)
 
-    def mark_position(self, page_index: int, row_index: int) -> None:
-        self.data["last_page_index"] = int(max(0, page_index))
-        self.data["last_row_index"] = int(max(-1, row_index))
-        self.save()
+    # ------------------------------------------------------------------
+    # Mutation helpers
+    # ------------------------------------------------------------------
 
-    def record_download(self, token: str, filename: str) -> None:
+    def _update_position(
+        self,
+        page_index: int,
+        row_index: int,
+        *,
+        mode: str,
+    ) -> None:
+        self.data["mode"] = mode
+        self.data["current_page"] = int(max(0, page_index))
+        self.data["last_button_index"] = int(max(-1, row_index))
+        self._touch()
+        self._dirty = True
+
+    def mark_page(self, page_index: int, *, reset_row: bool = True, mode: str = "") -> None:
+        row_index = -1 if reset_row else self.row_index
+        self._update_position(page_index, row_index, mode=mode or (self.data.get("mode") or ""))
+
+    def mark_row(self, row_index: int, *, mode: str = "") -> None:
+        self._update_position(self.page_index, row_index, mode=mode or (self.data.get("mode") or ""))
+
+    def mark_position(self, page_index: int, row_index: int, *, mode: str) -> None:
+        self._update_position(page_index, row_index, mode=mode)
+
+    def record_download(
+        self,
+        token: str,
+        filename: str,
+        *,
+        mode: str,
+        page_index: Optional[int] = None,
+        row_index: Optional[int] = None,
+    ) -> None:
         norm = normalize_action_token(token)
         if norm:
             if norm not in self._processed_tokens:
@@ -166,7 +224,20 @@ class Checkpoint:
                 self._completed_downloads.add(filename)
                 downloads = self.data.setdefault("completed_downloads", [])
                 downloads.append(filename)
-        self.save()
+
+        new_count = self.processed_count + 1
+        self.data["processed_count"] = new_count
+        if page_index is not None or row_index is not None:
+            target_page = self.page_index if page_index is None else page_index
+            target_row = self.row_index if row_index is None else row_index
+            self._update_position(target_page, target_row, mode=mode)
+        else:
+            self.data["mode"] = mode
+            self._touch()
+            self._dirty = True
+
+        if new_count % 10 == 0:
+            self.save(force=True)
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +364,78 @@ def _refresh_datatable_page(page: Page, page_index: int) -> None:
     except Exception:
         # Silently ignore; best effort.
         pass
+
+
+def _get_total_pages(page: Page) -> int:
+    """Return the total number of DataTable pages available."""
+
+    try:
+        buttons = page.locator(
+            "ul.pagination li.dt-paging-button button.page-link:not(.previous):not(.next)"
+        )
+        count = buttons.count()
+    except PWError as exc:
+        if _is_target_closed_error(exc):
+            raise
+        log_line(f"[RUN] Unable to enumerate pagination buttons: {exc}")
+        return 1
+    except Exception as exc:
+        log_line(f"[RUN] Unable to enumerate pagination buttons: {exc}")
+        return 1
+
+    max_index = -1
+    for idx in range(count):
+        try:
+            attr = buttons.nth(idx).get_attribute("data-dt-idx") or ""
+        except PWError as exc:
+            if _is_target_closed_error(exc):
+                raise
+            log_line(f"[RUN] Failed reading pagination attribute: {exc}")
+            continue
+        except Exception as exc:
+            log_line(f"[RUN] Failed reading pagination attribute: {exc}")
+            continue
+
+        if not attr:
+            continue
+        try:
+            value = int(attr)
+        except ValueError:
+            continue
+        max_index = max(max_index, value)
+
+    return max_index + 1 if max_index >= 0 else 1
+
+
+def _goto_datatable_page(page: Page, page_index: int) -> bool:
+    """Click the DataTable pagination button for ``page_index``."""
+
+    if page_index <= 0:
+        return True
+
+    selector = (
+        "ul.pagination li.dt-paging-button button.page-link[data-dt-idx='%d']" % page_index
+    )
+    try:
+        button = page.locator(selector)
+        if button.count() == 0:
+            log_line(f"[RUN] Pagination button {page_index + 1} not found; attempting JS fallback.")
+            return _set_datatable_page(page, page_index)
+        button.first.click(timeout=2000)
+        wait_seconds(page, 0.4)
+        try:
+            page.wait_for_load_state("networkidle", timeout=20_000)
+        except PWTimeout:
+            log_line("[RUN] Pagination networkidle timeout; continuing.")
+        return True
+    except PWError as exc:
+        if _is_target_closed_error(exc):
+            raise
+        log_line(f"[RUN] Pagination button click failed: {exc}")
+        return False
+    except Exception as exc:
+        log_line(f"[RUN] Pagination button click failed: {exc}")
+        return False
 
 
 def _guess_download_locators() -> List[str]:
@@ -460,7 +603,7 @@ def handle_dl_bfile_from_ajax(
     box_url: str,
     downloads_dir: Path,
     cases_by_action: Dict[str, Any],
-    seen_fnames_in_run: Optional[Set[str]] = None,
+    processed_this_run: Optional[Set[str]] = None,
     checkpoint: Optional[Checkpoint] = None,
     metadata: Optional[Dict[str, Any]] = None,
     http_client: Optional[Any] = None,
@@ -471,19 +614,19 @@ def handle_dl_bfile_from_ajax(
 
     norm_fname = normalize_action_token(fname)
     display_name = fname or norm_fname
+    canonical_token = canon_fname(fname)
     if not norm_fname:
         log_line(
             f"[AJAX][WARN] Unable to normalise fname token '{display_name}'; skipping."
         )
         return "failed"
 
-    if seen_fnames_in_run is not None:
-        if norm_fname in seen_fnames_in_run:
+    if processed_this_run is not None and canonical_token:
+        if canonical_token in processed_this_run:
             log_line(
-                f"[AJAX] fname {display_name} already processed this run; skipping."
+                f"[AJAX] fname {display_name} already processed earlier in this run; ignoring duplicate response."
             )
             return "duplicate_in_run"
-        seen_fnames_in_run.add(norm_fname)
 
     case_row = case_context.get("case") if case_context else None
     if case_row is None:
@@ -494,6 +637,9 @@ def handle_dl_bfile_from_ajax(
     slug = norm_fname
     if case_row is not None and getattr(case_row, "action", None):
         slug = normalize_action_token(case_row.action) or norm_fname
+
+    page_index_hint = (case_context or {}).get("page_index")
+    row_index_hint = (case_context or {}).get("row_index")
 
     if case_row is not None:
         subject_label = case_row.title or case_row.subject or display_name
@@ -523,9 +669,10 @@ def handle_dl_bfile_from_ajax(
         category = getattr(case_row, "category", None) or case_row.extra.get("Category")
         court = getattr(case_row, "court", None) or case_row.extra.get("Court")
 
+    title_label = case_row.title if case_row else subject_label
     pdf_path = build_pdf_path(
         downloads_dir,
-        subject_label,
+        title_label,
         action=slug,
         cause_number=cause_number,
         judgment_date=judgment_date,
@@ -533,6 +680,43 @@ def handle_dl_bfile_from_ajax(
     log_line(
         f"[AJAX] dl_bfile fname={display_name} expected_path='{pdf_path.name}'"
     )
+
+    final_path = pdf_path
+    if final_path.exists():
+        try:
+            size_bytes = final_path.stat().st_size
+        except OSError:
+            size_bytes = 0
+        log_line(
+            f"[AJAX] Local file exists for fname={display_name}; counted as processed."
+        )
+        if processed_this_run is not None and canonical_token:
+            processed_this_run.add(canonical_token)
+        if metadata is not None:
+            record_result(
+                metadata,
+                slug=slug,
+                fid=fid or slug,
+                title=title_label,
+                local_filename=final_path.name,
+                source_url=box_url,
+                size_bytes=size_bytes,
+                category=category,
+                judgment_date=judgment_date,
+                court=court,
+                cause_number=cause_number,
+                subject=subject_label,
+                local_path=str(final_path.resolve()),
+            )
+        if checkpoint is not None:
+            checkpoint.record_download(
+                slug,
+                str(final_path.name),
+                mode=mode,
+                page_index=page_index_hint,
+                row_index=row_index_hint,
+            )
+        return "existing_file"
 
     if is_new_mode(mode) and checkpoint is not None:
         processed_tokens = checkpoint.processed_tokens
@@ -561,8 +745,14 @@ def handle_dl_bfile_from_ajax(
         log_line(
             f"[AJAX] Metadata and local file confirm {label}; skipping download."
         )
-        if checkpoint is not None and is_new_mode(mode):
-            checkpoint.record_download(slug, str(pdf_path.name))
+        if checkpoint is not None:
+            checkpoint.record_download(
+                slug,
+                str(pdf_path.name),
+                mode=mode,
+                page_index=page_index_hint,
+                row_index=row_index_hint,
+            )
         return "existing_file"
 
     try:
@@ -575,7 +765,7 @@ def handle_dl_bfile_from_ajax(
                     meta,
                     slug=slug,
                     fid=fid or slug,
-                    title=subject_label,
+                    title=title_label,
                     local_filename=pdf_path.name,
                     source_url=box_url,
                     size_bytes=pdf_path.stat().st_size,
@@ -586,16 +776,20 @@ def handle_dl_bfile_from_ajax(
                     subject=subject_label,
                     local_path=str(pdf_path.resolve()),
                 )
-            if checkpoint is not None and is_new_mode(mode):
-                checkpoint.record_download(slug, str(pdf_path.name))
+            if checkpoint is not None:
+                checkpoint.record_download(
+                    slug,
+                    str(pdf_path.name),
+                    mode=mode,
+                    page_index=page_index_hint,
+                    row_index=row_index_hint,
+                )
             return "existing_file"
     except OSError:
         pass
 
     success = False
     error: Optional[str] = None
-    final_path = pdf_path
-
     try:
         success, error = queue_or_download_file(
             box_url,
@@ -630,8 +824,6 @@ def handle_dl_bfile_from_ajax(
             f"[AJAX] Download failed for {display_name} -> {final_path.name}: {error}"
         )
         final_path.unlink(missing_ok=True)
-        if seen_fnames_in_run is not None:
-            seen_fnames_in_run.discard(norm_fname)
         return "failed"
 
     size_bytes = final_path.stat().st_size
@@ -639,12 +831,15 @@ def handle_dl_bfile_from_ajax(
         f"[AJAX] Saved fname={display_name} -> {final_path} ({size_bytes/1024:.1f} KiB)"
     )
 
+    if processed_this_run is not None and canonical_token:
+        processed_this_run.add(canonical_token)
+
     if meta is not None:
         record_result(
             meta,
             slug=slug,
             fid=fid or slug,
-            title=subject_label,
+            title=title_label,
             local_filename=final_path.name,
             source_url=box_url,
             size_bytes=size_bytes,
@@ -656,8 +851,14 @@ def handle_dl_bfile_from_ajax(
             local_path=str(final_path.resolve()),
         )
 
-    if checkpoint is not None and is_new_mode(mode):
-        checkpoint.record_download(slug, str(final_path.name))
+    if checkpoint is not None:
+        checkpoint.record_download(
+            slug,
+            str(final_path.name),
+            mode=mode,
+            page_index=page_index_hint,
+            row_index=row_index_hint,
+        )
 
     return "downloaded"
 
@@ -673,7 +874,7 @@ def retry_failed_downloads(
     failed_items: List[Dict[str, Any]],
     scrape_mode: str,
     pending_by_fname: Dict[str, Dict[str, Any]],
-    seen_fnames_in_run: Set[str],
+    processed_this_run: Set[str],
     checkpoint: Optional[Checkpoint],
 ) -> None:
     """Retry download clicks for items that previously failed."""
@@ -747,7 +948,7 @@ def retry_failed_downloads(
 
         try:
             locator.click(timeout=2000)
-            seen_fnames_in_run.discard(fname)
+            processed_this_run.discard(canon_fname(fname))
             wait_seconds(page, 0.4)
         except PWError as exc:
             if _is_target_closed_error(exc):
@@ -759,8 +960,8 @@ def retry_failed_downloads(
             log_line(f"[RETRY] Click failed for {fname}: {exc}")
             continue
 
-        if checkpoint is not None and is_new_mode(scrape_mode):
-            checkpoint.mark_position(page_index, button_index)
+        if checkpoint is not None:
+            checkpoint.mark_position(page_index, button_index, mode=scrape_mode)
 
 # ---------------------------------------------------------------------------
 # Main entrypoint
@@ -812,6 +1013,7 @@ def _run_scrape_attempt(
     log_path: Path,
     max_retries: int,
     checkpoint: Optional[Checkpoint],
+    resume_enabled: bool,
 ) -> Dict[str, Any]:
     """Execute a scraping run with automatic restart/resume support."""
 
@@ -860,14 +1062,21 @@ def _run_scrape_attempt(
 
     attempt = 0
     while attempt <= max_retries:
-        seen_fnames_in_run: Set[str] = set()
+        consecutive_existing = 0
+        processed_this_run: Set[str] = set()
         pending_by_fname: Dict[str, Dict[str, Any]] = {}
         failed_items: List[Dict[str, Any]] = []
         active = True
         browser: Optional[Browser] = None
         context: Optional[BrowserContext] = None
         page: Optional[Page] = None
-        if checkpoint is not None and is_new_mode(scrape_mode):
+        if (
+            checkpoint is not None
+            and resume_enabled
+            and checkpoint.should_resume(
+                scrape_mode, max_age_hours=config.SCRAPE_RESUME_MAX_AGE_HOURS
+            )
+        ):
             resume_page_index = max(0, checkpoint.page_index)
             resume_row_index = checkpoint.row_index
             log_line(
@@ -876,6 +1085,9 @@ def _run_scrape_attempt(
         else:
             resume_page_index = 0
             resume_row_index = -1
+            if checkpoint is not None:
+                checkpoint.mark_page(0, mode=scrape_mode)
+                checkpoint.mark_row(-1, mode=scrape_mode)
         crash_stop = False
 
         try:
@@ -904,6 +1116,7 @@ def _run_scrape_attempt(
                         raise RuntimeError("Failed to create Playwright page")
 
                     def on_response(resp: Response) -> None:
+                        nonlocal consecutive_existing, row_limit_reached, active
                         try:
                             url = resp.url
                         except Exception as exc:
@@ -998,7 +1211,7 @@ def _run_scrape_attempt(
                                 box_url=box_url,
                                 downloads_dir=config.PDF_DIR,
                                 cases_by_action=CASES_BY_ACTION,
-                                seen_fnames_in_run=seen_fnames_in_run,
+                                processed_this_run=processed_this_run,
                                 checkpoint=checkpoint if is_new_mode(scrape_mode) else None,
                                 metadata=meta,
                                 http_client=http_fetcher,
@@ -1018,6 +1231,7 @@ def _run_scrape_attempt(
 
                             if result == "downloaded":
                                 summary["downloaded"] += 1
+                                consecutive_existing = 0
                                 if norm_fname:
                                     _remove_failed_record(norm_fname)
                             elif result == "failed":
@@ -1036,14 +1250,30 @@ def _run_scrape_attempt(
                                                 "fid": case_context.get("fid"),
                                             }
                                         )
-                            elif result in {
-                                "duplicate_in_run",
-                                "existing_file",
-                                "checkpoint_skip",
-                            }:
+                            elif result == "existing_file":
+                                summary["skipped"] += 1
+                                consecutive_existing += 1
+                                if norm_fname:
+                                    _remove_failed_record(norm_fname)
+                            elif result == "checkpoint_skip":
+                                summary["skipped"] += 1
+                                consecutive_existing += 1
+                                if norm_fname:
+                                    _remove_failed_record(norm_fname)
+                            elif result == "duplicate_in_run":
                                 summary["skipped"] += 1
                                 if norm_fname:
                                     _remove_failed_record(norm_fname)
+
+                            if (
+                                is_new_mode(scrape_mode)
+                                and consecutive_existing >= config.SCRAPE_NEW_CONSECUTIVE_LIMIT
+                            ):
+                                log_line(
+                                    "[RUN] Consecutive already-downloaded threshold reached; halting NEW mode run."
+                                )
+                                row_limit_reached = True
+                                active = False
 
                         except Exception as exc:
                             log_line(f"[AJAX] handler error: {exc}")
@@ -1068,8 +1298,6 @@ def _run_scrape_attempt(
                     row_limit_reached = False
                     rows_evaluated = summary.get("inspected_rows", 0)
                     resume_consumed = False
-                    page_number = max(1, resume_page_index + 1)
-
                     try:
                         page.wait_for_selector("button:has(i.icon-dl)", timeout=25_000)
                     except PWTimeout:
@@ -1084,37 +1312,36 @@ def _run_scrape_attempt(
                         else:
                             log_line(f"Failed waiting for download buttons: {exc}")
                     else:
-                        if resume_page_index > 0:
-                            if _set_datatable_page(page, resume_page_index):
+                        try:
+                            total_pages = max(1, _get_total_pages(page))
+                        except PWError as exc:
+                            if _is_target_closed_error(exc):
                                 log_line(
-                                    f"[RUN] Jumped to DataTable page index {resume_page_index}"
+                                    "[RUN] Browser target crashed while reading pagination; stopping scrape gracefully."
                                 )
-                                page_number = resume_page_index + 1
+                                crash_stop = True
+                                active = False
                             else:
-                                log_line(
-                                    "[RUN] Unable to set DataTable page via JS; advancing manually."
-                                )
-                                for step in range(resume_page_index):
-                                    try:
-                                        next_button = page.locator(
-                                            "ul.pagination li.dt-paging-button button.page-link.next"
-                                        )
-                                        if next_button.count() == 0:
-                                            break
-                                        next_button.first.click(timeout=2000)
-                                        wait_seconds(page, 0.4)
-                                        page.wait_for_load_state("networkidle", timeout=10_000)
-                                    except Exception as exc:
-                                        log_line(
-                                            f"[RUN][WARN] Manual pagination advance failed on step {step+1}: {exc}"
-                                        )
-                                        break
-                                page_number = resume_page_index + 1
+                                log_line(f"[RUN] Failed to read pagination: {exc}")
+                            total_pages = 0
 
-                        while not crash_stop:
-                            page_index_zero = max(0, page_number - 1)
-                            if checkpoint is not None and is_new_mode(scrape_mode):
-                                checkpoint.mark_page(page_index_zero, reset_row=False)
+                        if resume_page_index >= total_pages:
+                            resume_page_index = max(0, total_pages - 1)
+
+                        for page_index_zero in range(resume_page_index, total_pages):
+                            if crash_stop or row_limit_reached:
+                                break
+
+                            page_number = page_index_zero + 1
+                            if not _goto_datatable_page(page, page_index_zero):
+                                log_line(
+                                    f"[RUN] Unable to navigate to DataTable page {page_number}; stopping pagination loop."
+                                )
+                                break
+
+                            if checkpoint is not None:
+                                checkpoint.mark_page(page_index_zero, reset_row=False, mode=scrape_mode)
+
                             try:
                                 buttons = page.locator("button:has(i.icon-dl)")
                                 count = buttons.count()
@@ -1144,6 +1371,8 @@ def _run_scrape_attempt(
                             log_line(
                                 f"Processing pagination page {page_number}: {count} download button(s)"
                             )
+
+                            clicked_on_page: Set[str] = set()
 
                             start_row = 0
                             if (
@@ -1245,12 +1474,32 @@ def _run_scrape_attempt(
                                     break
 
                                 fname_key = normalize_action_token(fname_token or "")
+                                canonical_token = canon_fname(fname_token or fname_key)
                                 if not fname_key:
                                     log_line(
                                         f"[AJAX][WARN] Skipping button index {i} on page {page_number}: unable to normalise fname token."
                                     )
-                                    if checkpoint is not None and is_new_mode(scrape_mode):
-                                        checkpoint.mark_position(page_index_zero, i)
+                                    if checkpoint is not None:
+                                        checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
+                                    continue
+
+                                if (
+                                    canonical_token
+                                    and canonical_token in processed_this_run
+                                ):
+                                    log_line(
+                                        f"[SKIP] fname={fname_token} already handled earlier in this run; skipping duplicate button."
+                                    )
+                                    if checkpoint is not None:
+                                        checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
+                                    summary["skipped"] += 1
+                                    continue
+
+                                dedupe_key = canonical_token or fname_key
+                                if dedupe_key and dedupe_key in clicked_on_page:
+                                    log_line(
+                                        f"[SKIP] Button for fname={fname_token} already clicked on page {page_number}; skipping duplicate element."
+                                    )
                                     continue
 
                                 metadata_entry = downloaded_index.get(fname_key)
@@ -1259,16 +1508,31 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] fname={fname_token} already downloaded as {label}; skipping click."
                                     )
-                                    if checkpoint is not None and is_new_mode(scrape_mode):
+                                    if canonical_token:
+                                        processed_this_run.add(canonical_token)
+                                    if checkpoint is not None:
                                         checkpoint.record_download(
                                             fname_key,
                                             metadata_entry.get("local_filename")
                                             or metadata_entry.get("filename")
                                             or "",
+                                            mode=scrape_mode,
+                                            page_index=page_index_zero,
+                                            row_index=i,
                                         )
-                                        checkpoint.mark_position(page_index_zero, i)
+                                        checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     summary["skipped"] += 1
-                                    seen_fnames_in_run.add(fname_key)
+                                    if is_new_mode(scrape_mode):
+                                        consecutive_existing += 1
+                                        if (
+                                            consecutive_existing
+                                            >= config.SCRAPE_NEW_CONSECUTIVE_LIMIT
+                                        ):
+                                            log_line(
+                                                "[RUN] Consecutive already-downloaded threshold reached; halting NEW mode run."
+                                            )
+                                            row_limit_reached = True
+                                            break
                                     continue
 
                                 if (
@@ -1279,10 +1543,22 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] fname={fname_token} recorded in checkpoint; skipping click in NEW mode."
                                     )
-                                    if checkpoint is not None and is_new_mode(scrape_mode):
-                                        checkpoint.mark_position(page_index_zero, i)
+                                    if canonical_token:
+                                        processed_this_run.add(canonical_token)
+                                    if checkpoint is not None:
+                                        checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     summary["skipped"] += 1
-                                    seen_fnames_in_run.add(fname_key)
+                                    if is_new_mode(scrape_mode):
+                                        consecutive_existing += 1
+                                        if (
+                                            consecutive_existing
+                                            >= config.SCRAPE_NEW_CONSECUTIVE_LIMIT
+                                        ):
+                                            log_line(
+                                                "[RUN] Consecutive already-downloaded threshold reached; halting NEW mode run."
+                                            )
+                                            row_limit_reached = True
+                                            break
                                     continue
 
                                 case_for_fname = CASES_BY_ACTION.get(fname_key)
@@ -1297,7 +1573,11 @@ def _run_scrape_attempt(
                                     "raw": fname_token,
                                     "page_index": page_index_zero,
                                     "row_index": i,
+                                    "canonical": canonical_token,
                                 }
+
+                                if dedupe_key:
+                                    clicked_on_page.add(dedupe_key)
 
                                 click_success = False
                                 for attempt_idx in range(3):
@@ -1362,11 +1642,10 @@ def _run_scrape_attempt(
                                     )
                                     pending_by_fname.pop(fname_key, None)
                                     summary["failed"] += 1
-                                    if checkpoint is not None and is_new_mode(scrape_mode):
-                                        checkpoint.mark_position(page_index_zero, i)
+                                    if checkpoint is not None:
+                                        checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     continue
 
-                                seen_fnames_in_run.add(fname_key)
                                 total_clicks += 1
                                 summary["processed"] = total_clicks
                                 log_line(
@@ -1374,69 +1653,6 @@ def _run_scrape_attempt(
                                 )
 
                                 time.sleep((per_delay or 0) + 0.4)
-
-                            if crash_stop or row_limit_reached:
-                                break
-
-                            try:
-                                next_button = page.locator(
-                                    "ul.pagination li.dt-paging-button button.page-link.next"
-                                )
-                                next_count = next_button.count()
-                            except PWError as exc:
-                                if _is_target_closed_error(exc):
-                                    log_line(
-                                        "[RUN] Browser target crashed while locating pagination controls; stopping scrape gracefully."
-                                    )
-                                    crash_stop = True
-                                    active = False
-                                    break
-                                log_line(f"Failed to locate pagination controls: {exc}")
-                                break
-                            except Exception as exc:
-                                log_line(f"Failed to locate pagination controls: {exc}")
-                                break
-
-                            if crash_stop or row_limit_reached:
-                                break
-
-                            if next_count == 0:
-                                log_line("No pagination 'next' button found; ending traversal.")
-                                break
-
-                            try:
-                                next_button.first.click(timeout=2000)
-                            except PWError as exc:
-                                if _is_target_closed_error(exc):
-                                    log_line(
-                                        "[RUN] Target crashed during pagination; stopping scrape gracefully."
-                                    )
-                                    crash_stop = True
-                                    active = False
-                                    break
-                                log_line(f"Pagination click failed: {exc}")
-                                break
-                            except Exception as exc:
-                                log_line(f"Pagination click failed: {exc}")
-                                break
-
-                            try:
-                                page.wait_for_load_state("networkidle", timeout=20_000)
-                            except PWError as exc:
-                                if _is_target_closed_error(exc):
-                                    log_line(
-                                        "[RUN] Target crashed while waiting after pagination; stopping scrape gracefully."
-                                    )
-                                    crash_stop = True
-                                    active = False
-                                    break
-                                log_line(f"Pagination load state wait failed: {exc}")
-                                break
-
-                            if checkpoint is not None and is_new_mode(scrape_mode):
-                                checkpoint.mark_page(page_index_zero + 1)
-                            page_number += 1
-                            wait_seconds(page, 0.5)
 
                         if crash_stop:
                             log_line(
@@ -1449,7 +1665,7 @@ def _run_scrape_attempt(
                             failed_items=failed_items,
                             scrape_mode=scrape_mode,
                             pending_by_fname=pending_by_fname,
-                            seen_fnames_in_run=seen_fnames_in_run,
+                            processed_this_run=processed_this_run,
                             checkpoint=checkpoint if is_new_mode(scrape_mode) else None,
                         )
 
@@ -1492,6 +1708,20 @@ def _run_scrape_attempt(
             break
 
     log_line("Completed run (response-capture strategy).")
+    if checkpoint is not None:
+        checkpoint.flush()
+    log_line(
+        "[RUN] Totals: mode=%s, processed=%s, downloaded=%s, skipped=%s, failed=%s, inspected_rows=%s, total_cases=%s"
+        % (
+            scrape_mode,
+            summary.get("processed"),
+            summary.get("downloaded"),
+            summary.get("skipped"),
+            summary.get("failed"),
+            summary.get("inspected_rows"),
+            summary.get("total_cases"),
+        )
+    )
     return summary
 
 
@@ -1504,6 +1734,7 @@ def run_scrape(
     scrape_mode: Optional[str] = None,
     new_limit: Optional[int] = None,
     max_retries: Optional[int] = None,
+    resume: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Public entrypoint that wraps the core scraper with retry support."""
 
@@ -1524,8 +1755,9 @@ def run_scrape(
     row_limit = new_limit if new_limit is not None else config.SCRAPE_NEW_LIMIT
     retry_limit = max_retries if max_retries is not None else config.SCRAPER_MAX_RETRIES
 
+    resume_enabled = config.SCRAPE_RESUME_DEFAULT if resume is None else bool(resume)
     checkpoint: Optional[Checkpoint]
-    if is_new_mode(mode):
+    if resume_enabled:
         checkpoint = Checkpoint(config.CHECKPOINT_PATH)
     else:
         checkpoint = None
@@ -1544,6 +1776,7 @@ def run_scrape(
             log_path=log_path,
             max_retries=0,
             checkpoint=checkpoint,
+            resume_enabled=resume_enabled,
         )
         next_start_message = None
         return result
@@ -1616,7 +1849,7 @@ if __name__ == "__main__":  # pragma: no cover - quick manual verification
             box_url="https://example.org/dummy.pdf",
             downloads_dir=Path(tmpdir),
             cases_by_action=CASES_BY_ACTION,
-            seen_fnames_in_run=set(),
+            processed_this_run=set(),
             checkpoint=None,
             metadata={},
             http_client=_DummyClient(),

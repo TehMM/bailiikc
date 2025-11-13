@@ -26,6 +26,17 @@
             Delay Between Downloads (seconds)
             <input type="number" step="0.1" name="per_download_delay" min="0" value="{{ default_delay }}" required>
         </label>
+        <fieldset class="form-fieldset">
+            <legend>Reset Before Run</legend>
+            <label class="checkbox">
+                <input type="checkbox" name="reset_before_run" value="1" {% if default_reset_before_run %}checked{% endif %}>
+                Reset metadata before starting (forces Full mode)
+            </label>
+            <label class="checkbox reset-delete-option" data-reset-dependent>
+                <input type="checkbox" name="reset_delete_pdfs" value="1" {% if default_reset_delete_pdfs %}checked{% endif %}>
+                Also delete downloaded PDFs (confirmation required)
+            </label>
+        </fieldset>
         <div class="form-actions">
             <button type="submit" class="primary">Start Scrape</button>
             <a href="{{ url_for('report') }}" class="button">View Report</a>
@@ -51,6 +62,8 @@
 <script>
 const modeSelect = document.querySelector('select[name="scrape_mode"]');
 const limitInput = document.querySelector('input[name="new_limit"]');
+const resetCheckbox = document.querySelector('input[name="reset_before_run"]');
+const deletePdfsCheckbox = document.querySelector('input[name="reset_delete_pdfs"]');
 function toggleLimit() {
     if (!modeSelect || !limitInput) {
         return;
@@ -66,6 +79,28 @@ function toggleLimit() {
 if (modeSelect && limitInput) {
     modeSelect.addEventListener('change', toggleLimit);
     toggleLimit();
+}
+if (resetCheckbox && deletePdfsCheckbox) {
+    const syncResetState = () => {
+        if (!resetCheckbox.checked) {
+            deletePdfsCheckbox.checked = false;
+            deletePdfsCheckbox.disabled = true;
+            deletePdfsCheckbox.closest('label').classList.add('disabled');
+        } else {
+            deletePdfsCheckbox.disabled = false;
+            deletePdfsCheckbox.closest('label').classList.remove('disabled');
+        }
+    };
+    deletePdfsCheckbox.addEventListener('change', (event) => {
+        if (event.target.checked) {
+            const confirmed = window.confirm('Delete all downloaded PDFs before running? This cannot be undone.');
+            if (!confirmed) {
+                event.target.checked = false;
+            }
+        }
+    });
+    resetCheckbox.addEventListener('change', syncResetState);
+    syncResetState();
 }
 </script>
 {% endblock %}

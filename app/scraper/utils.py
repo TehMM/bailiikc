@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Dict, List, Tuple
 from urllib.parse import unquote_plus
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -106,6 +108,15 @@ def ensure_dirs() -> None:
             encoding="utf-8",
         )
 
+    config.DOWNLOADS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    config.DOWNLOADS_LOG.touch(exist_ok=True)
+
+    if not config.SUMMARY_FILE.exists():
+        config.SUMMARY_FILE.write_text(
+            json.dumps({}, indent=2),
+            encoding="utf-8",
+        )
+
 
 def log_line(message: str) -> None:
     """Write a timestamped log line to stdout and the active log file."""
@@ -199,6 +210,95 @@ def make_pdf_filename_from_title(
     return f"{base}.pdf"
 
 
+def slugify_title_for_filename(title: str, max_bytes: int = 180) -> str:
+    """Return a filesystem-safe slug generated from *title* only."""
+
+    import unicodedata
+
+    base = unicodedata.normalize("NFKD", title or "")
+    base = re.sub(r"[^\w\s\-\(\)\[\]\.,&]+", "", base, flags=re.UNICODE)
+    base = re.sub(r"\s+", " ", base).strip()
+    if not base:
+        base = "document"
+
+    encoded = base.encode("utf-8")
+    if len(encoded) > max_bytes:
+        encoded = encoded[:max_bytes]
+        base = encoded.decode("utf-8", errors="ignore").rstrip()
+        if not base:
+            base = "document"
+
+    return base
+
+
+def disk_has_room(
+    min_free_mb: int = config.MIN_FREE_MB,
+    path: Path | None = None,
+) -> bool:
+    """Return ``True`` when ``path`` has at least ``min_free_mb`` available."""
+
+    target = Path(path or config.PDF_DIR)
+    target.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(target.resolve())
+    free_mb = usage.free // (1024 * 1024)
+    return free_mb >= max(0, min_free_mb)
+
+
+def load_json_lines(path: Path) -> List[Dict[str, Any]]:
+    """Load JSON lines from *path*, ignoring malformed entries."""
+
+    if not path.exists():
+        return []
+
+    records: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                obj = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                records.append(obj)
+    return records
+
+
+def append_json_line(path: Path, payload: Dict[str, Any]) -> None:
+    """Append *payload* as a JSON line to *path* atomically."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def load_json_file(path: Path) -> Dict[str, Any]:
+    """Load a JSON object from *path*, returning an empty dict on failure."""
+
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def save_json_file(path: Path, payload: Dict[str, Any]) -> None:
+    """Persist *payload* to *path* atomically."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
 def hashed_fallback_stem(title: str, prefix_len: int = 40) -> str:
     """Produce a deterministic hashed fallback stem for *title*."""
 
@@ -212,22 +312,18 @@ def build_pdf_path(
     base_dir: Path,
     title: str | None,
     *,
-    action: str | None = None,
-    cause_number: str | None = None,
-    judgment_date: str | None = None,
+    default_stem: str | None = None,
 ) -> Path:
-    """Construct a safe PDF destination path derived from case metadata."""
+    """Construct the PDF destination path using only the case title."""
 
     base_dir = Path(base_dir).resolve()
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    fallback_token = action or cause_number or judgment_date or "judgment"
-    filename = safe_case_filename(
-        cause_number=cause_number,
-        title=title,
-        fallback_token=fallback_token,
-    )
-    return (base_dir / filename).resolve()
+    stem = slugify_title_for_filename(title or "")
+    if not stem:
+        stem = slugify_title_for_filename(default_stem or "document")
+
+    return (base_dir / f"{stem}.pdf").resolve()
 
 
 def hashed_fallback_path(base_dir: Path, title: str) -> Path:
@@ -549,6 +645,10 @@ def reset_state(*, delete_pdfs: bool = False, delete_logs: bool = False) -> None
     checkpoint_files = [
         config.CHECKPOINT_PATH,
         config.DATA_DIR / "downloaded_index.json",
+        config.RUN_STATE_FILE,
+        config.DOWNLOADS_LOG,
+        config.SUMMARY_FILE,
+        config.HISTORY_ACTIONS_FILE,
     ]
     for checkpoint in checkpoint_files:
         try:

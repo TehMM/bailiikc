@@ -20,7 +20,7 @@ TOKEN_SPLIT_RE = re.compile(r"[|,;/\\\s]+")
 
 
 def normalize_action_token(raw: str) -> str:
-    """Return the canonical representation of an action token."""
+    """Normalise an Actions token to an uppercase alphanumeric string."""
 
     if raw is None:
         return ""
@@ -28,15 +28,13 @@ def normalize_action_token(raw: str) -> str:
     token = html.unescape(str(raw))
     token = urllib.parse.unquote_plus(token)
     token = token.replace("\u00a0", " ")
-    token = token.strip()
+    token = re.sub(r"\s+", " ", token).strip()
     if not token:
         return ""
 
-    if token.lower().endswith(".pdf"):
-        token = token[:-4]
-
-    token = re.sub(r"\s+", "", token)
-    return token.upper()
+    token = token.upper()
+    token = re.sub(r"[^A-Z0-9]+", "", token)
+    return token
 
 
 @dataclass(frozen=True)

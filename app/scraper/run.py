@@ -46,17 +46,21 @@ from . import config
 from .config import is_full_mode, is_new_mode
 from .cases_index import (
     CASES_BY_ACTION,
-    find_case_by_fname,
     load_cases_from_csv as load_cases_index,
     normalize_action_token,
 )
 from .utils import (
     build_pdf_path,
     canon_fname,
+    disk_has_room,
     ensure_dirs,
     find_metadata_entry,
     hashed_fallback_path,
     has_local_pdf,
+    append_json_line,
+    load_json_file,
+    load_json_lines,
+    save_json_file,
     load_metadata,
     log_line,
     record_result,
@@ -631,8 +635,6 @@ def handle_dl_bfile_from_ajax(
     case_row = case_context.get("case") if case_context else None
     if case_row is None:
         case_row = cases_by_action.get(norm_fname)
-    if case_row is None:
-        case_row = find_case_by_fname(norm_fname, strict=True)
 
     slug = norm_fname
     if case_row is not None and getattr(case_row, "action", None):
@@ -673,9 +675,7 @@ def handle_dl_bfile_from_ajax(
     pdf_path = build_pdf_path(
         downloads_dir,
         title_label,
-        action=slug,
-        cause_number=cause_number,
-        judgment_date=judgment_date,
+        default_stem=slug,
     )
     log_line(
         f"[AJAX] dl_bfile fname={display_name} expected_path='{pdf_path.name}'"
@@ -788,6 +788,12 @@ def handle_dl_bfile_from_ajax(
     except OSError:
         pass
 
+    if not disk_has_room(config.MIN_FREE_MB, downloads_dir):
+        log_line(
+            f"[AJAX][STOP] Insufficient disk space (<{config.MIN_FREE_MB} MB free); aborting before download."
+        )
+        return "disk_full"
+
     success = False
     error: Optional[str] = None
     try:
@@ -850,6 +856,28 @@ def handle_dl_bfile_from_ajax(
             subject=subject_label,
             local_path=str(final_path.resolve()),
         )
+
+    try:
+        relative_path = final_path.relative_to(config.PDF_DIR)
+        saved_path_value: str = str(relative_path)
+    except ValueError:
+        saved_path_value = final_path.name
+
+    append_json_line(
+        config.DOWNLOADS_LOG,
+        {
+            "actions_token": slug,
+            "title": title_label,
+            "subject": subject_label,
+            "court": court,
+            "category": category,
+            "cause_number": cause_number,
+            "judgment_date": judgment_date,
+            "saved_path": saved_path_value,
+            "bytes": size_bytes,
+            "downloaded_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        },
+    )
 
     if checkpoint is not None:
         checkpoint.record_download(
@@ -1032,7 +1060,7 @@ def _run_scrape_attempt(
         % (scrape_mode, row_limit if scrape_mode == "new" else "all", page_wait, per_delay)
     )
 
-    load_cases_index("data/judgments.csv")
+    load_cases_index(config.CSV_URL)
     meta = load_metadata()
     downloaded_index: Dict[str, Dict[str, Any]] = {}
     for entry in meta.get("downloads", []):
@@ -1054,11 +1082,18 @@ def _run_scrape_attempt(
         "total_cases": len(CASES_BY_ACTION),
         "log_file": str(log_path),
         "scrape_mode": scrape_mode,
+        "skip_reasons": {},
+        "fail_reasons": {},
     }
 
     if not CASES_BY_ACTION:
         log_line("No cases loaded from judgments CSV; aborting.")
         return summary
+
+    def _bump_reason(target: Dict[str, int], reason: str) -> None:
+        if not reason:
+            return
+        target[reason] = int(target.get(reason, 0)) + 1
 
     attempt = 0
     while attempt <= max_retries:
@@ -1236,6 +1271,7 @@ def _run_scrape_attempt(
                                     _remove_failed_record(norm_fname)
                             elif result == "failed":
                                 summary["failed"] += 1
+                                _bump_reason(summary["fail_reasons"], "download_other")
                                 if norm_fname and case_context:
                                     if not any(item.get("fname") == norm_fname for item in failed_items):
                                         failed_items.append(
@@ -1255,15 +1291,22 @@ def _run_scrape_attempt(
                                 consecutive_existing += 1
                                 if norm_fname:
                                     _remove_failed_record(norm_fname)
+                                _bump_reason(summary["skip_reasons"], "exists_ok")
                             elif result == "checkpoint_skip":
                                 summary["skipped"] += 1
                                 consecutive_existing += 1
                                 if norm_fname:
                                     _remove_failed_record(norm_fname)
+                                _bump_reason(summary["skip_reasons"], "seen_history")
                             elif result == "duplicate_in_run":
                                 summary["skipped"] += 1
                                 if norm_fname:
                                     _remove_failed_record(norm_fname)
+                                _bump_reason(summary["skip_reasons"], "in_run_dup")
+                            elif result == "disk_full":
+                                summary.setdefault("stop_reason", "disk_full")
+                                active = False
+                                return
 
                             if (
                                 is_new_mode(scrape_mode)
@@ -1493,6 +1536,7 @@ def _run_scrape_attempt(
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     summary["skipped"] += 1
+                                    _bump_reason(summary["skip_reasons"], "in_run_dup")
                                     continue
 
                                 dedupe_key = canonical_token or fname_key
@@ -1500,6 +1544,18 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] Button for fname={fname_token} already clicked on page {page_number}; skipping duplicate element."
                                     )
+                                    _bump_reason(summary["skip_reasons"], "in_run_dup")
+                                    continue
+
+                                case_for_fname = CASES_BY_ACTION.get(fname_key)
+                                if case_for_fname is None:
+                                    log_line(
+                                        f"[SKIP][csv_miss] No CSV entry for fname={fname_token}; skipping."
+                                    )
+                                    if checkpoint is not None:
+                                        checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
+                                    summary["skipped"] += 1
+                                    _bump_reason(summary["skip_reasons"], "csv_miss")
                                     continue
 
                                 metadata_entry = downloaded_index.get(fname_key)
@@ -1522,6 +1578,7 @@ def _run_scrape_attempt(
                                         )
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     summary["skipped"] += 1
+                                    _bump_reason(summary["skip_reasons"], "exists_ok")
                                     if is_new_mode(scrape_mode):
                                         consecutive_existing += 1
                                         if (
@@ -1548,6 +1605,7 @@ def _run_scrape_attempt(
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     summary["skipped"] += 1
+                                    _bump_reason(summary["skip_reasons"], "seen_history")
                                     if is_new_mode(scrape_mode):
                                         consecutive_existing += 1
                                         if (
@@ -1561,10 +1619,7 @@ def _run_scrape_attempt(
                                             break
                                     continue
 
-                                case_for_fname = CASES_BY_ACTION.get(fname_key)
-                                slug_value = (
-                                    case_for_fname.action if case_for_fname else fname_key
-                                )
+                                slug_value = case_for_fname.action if case_for_fname else fname_key
 
                                 pending_by_fname[fname_key] = {
                                     "case": case_for_fname,
@@ -1642,6 +1697,7 @@ def _run_scrape_attempt(
                                     )
                                     pending_by_fname.pop(fname_key, None)
                                     summary["failed"] += 1
+                                    _bump_reason(summary["fail_reasons"], "click_timeout")
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     continue
@@ -1722,6 +1778,7 @@ def _run_scrape_attempt(
             summary.get("total_cases"),
         )
     )
+    save_json_file(config.SUMMARY_FILE, summary)
     return summary
 
 
@@ -1822,12 +1879,6 @@ if __name__ == "__main__":  # pragma: no cover - quick manual verification
     AJAX_FNAME_INDEX[embedded_case.action] = embedded_case
 
     CASES_ALL.extend(CASES_BY_ACTION.values())
-
-    print(
-        "[Demo] Exact lookup:",
-        find_case_by_fname("FSD0151202511062025ATPLIFESCIENCE", strict=True),
-    )
-    print("[Demo] Partial lookup:", find_case_by_fname("AG13020"))
 
     class _DummyResponse:
         status = 200

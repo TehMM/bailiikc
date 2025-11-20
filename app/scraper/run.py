@@ -21,6 +21,7 @@ This is wired to /scrape via run_scrape().
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import time
@@ -49,7 +50,10 @@ from .cases_index import (
     load_cases_from_csv as load_cases_index,
     normalize_action_token,
 )
+from .state import clear_checkpoint, derive_checkpoint_from_logs, load_checkpoint, save_checkpoint
+from .telemetry import RunTelemetry
 from .utils import (
+    append_json_line,
     build_pdf_path,
     canon_fname,
     disk_has_room,
@@ -57,13 +61,12 @@ from .utils import (
     find_metadata_entry,
     hashed_fallback_path,
     has_local_pdf,
-    append_json_line,
     load_json_file,
     load_json_lines,
-    save_json_file,
     load_metadata,
     log_line,
     record_result,
+    save_json_file,
     setup_run_logger,
 )
 
@@ -417,20 +420,21 @@ def _goto_datatable_page(page: Page, page_index: int) -> bool:
     if page_index <= 0:
         return True
 
-    selector = (
-        "ul.pagination li.dt-paging-button button.page-link[data-dt-idx='%d']" % page_index
-    )
     try:
-        button = page.locator(selector)
-        if button.count() == 0:
-            log_line(f"[RUN] Pagination button {page_index + 1} not found; attempting JS fallback.")
-            return _set_datatable_page(page, page_index)
-        button.first.click(timeout=2000)
-        wait_seconds(page, 0.4)
-        try:
-            page.wait_for_load_state("networkidle", timeout=20_000)
-        except PWTimeout:
-            log_line("[RUN] Pagination networkidle timeout; continuing.")
+        page.evaluate(
+            """
+            (idx) => {
+              const dt = window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable ?
+                         window.jQuery('#judgment-registers').DataTable() : null;
+              if (dt) { dt.page(idx).draw('page'); }
+            }
+            """,
+            page_index,
+        )
+        page.wait_for_selector(
+            f"li.dt-paging-button.active:has(button[data-dt-idx=\"{page_index}\"])",
+            timeout=20_000,
+        )
         return True
     except PWError as exc:
         if _is_target_closed_error(exc):
@@ -690,8 +694,6 @@ def handle_dl_bfile_from_ajax(
         log_line(
             f"[AJAX] Local file exists for fname={display_name}; counted as processed."
         )
-        if processed_this_run is not None and canonical_token:
-            processed_this_run.add(canonical_token)
         if metadata is not None:
             record_result(
                 metadata,
@@ -1042,6 +1044,9 @@ def _run_scrape_attempt(
     max_retries: int,
     checkpoint: Optional[Checkpoint],
     resume_enabled: bool,
+    resume_state: Optional[Dict[str, Any]] = None,
+    limit_pages: Optional[List[int]] = None,
+    row_limit_override: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Execute a scraping run with automatic restart/resume support."""
 
@@ -1051,7 +1056,15 @@ def _run_scrape_attempt(
     base_url = (base_url or config.DEFAULT_BASE_URL).strip()
     page_wait = page_wait or config.PAGE_WAIT_SECONDS
     per_delay = per_delay if per_delay is not None else config.PER_DOWNLOAD_DELAY
-    row_limit = new_limit if new_limit is not None else config.SCRAPE_NEW_LIMIT
+    row_limit = (
+        row_limit_override
+        if row_limit_override is not None
+        else new_limit
+        if new_limit is not None
+        else config.SCRAPE_NEW_LIMIT
+    )
+
+    telemetry = RunTelemetry(scrape_mode)
 
     log_line("=== Starting scraping run (Playwright, response-capture) ===")
     log_line(f"Target base URL: {base_url}")
@@ -1086,8 +1099,35 @@ def _run_scrape_attempt(
         "fail_reasons": {},
     }
 
+    def _finalize_telemetry(payload: Dict[str, Any]) -> None:
+        try:
+            telemetry.finalize(payload)
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"[TELEMETRY] Unable to write run telemetry: {exc}")
+
+    def _persist_state(
+        page_index: int,
+        button_index: int,
+        *,
+        last_fname: Optional[str] = None,
+        last_title: Optional[str] = None,
+    ) -> None:
+        try:
+            save_checkpoint(
+                dt_page_index=page_index,
+                button_index=button_index,
+                last_fname=last_fname,
+                last_title=last_title,
+                downloaded_count=summary.get("downloaded", 0),
+                skipped_count=summary.get("skipped", 0),
+                failed_count=summary.get("failed", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"[STATE] Unable to persist checkpoint: {exc}")
+
     if not CASES_BY_ACTION:
         log_line("No cases loaded from judgments CSV; aborting.")
+        _finalize_telemetry(summary)
         return summary
 
     def _bump_reason(target: Dict[str, int], reason: str) -> None:
@@ -1105,7 +1145,21 @@ def _run_scrape_attempt(
         browser: Optional[Browser] = None
         context: Optional[BrowserContext] = None
         page: Optional[Page] = None
-        if (
+        resume_page_index = 0
+        resume_row_index = -1
+        if resume_state:
+            try:
+                resume_page_index = max(0, int(resume_state.get("dt_page_index", 0)))
+            except Exception:
+                resume_page_index = 0
+            try:
+                resume_row_index = int(resume_state.get("button_index", -1))
+            except Exception:
+                resume_row_index = -1
+            log_line(
+                f"[RUN] Resume requested -> page_index={resume_page_index}, row_index={resume_row_index}"
+            )
+        elif (
             checkpoint is not None
             and resume_enabled
             and checkpoint.should_resume(
@@ -1118,8 +1172,6 @@ def _run_scrape_attempt(
                 f"[RUN] Resume checkpoint -> page_index={resume_page_index}, row_index={resume_row_index}"
             )
         else:
-            resume_page_index = 0
-            resume_row_index = -1
             if checkpoint is not None:
                 checkpoint.mark_page(0, mode=scrape_mode)
                 checkpoint.mark_row(-1, mode=scrape_mode)
@@ -1308,6 +1360,59 @@ def _run_scrape_attempt(
                                 active = False
                                 return
 
+                            page_hint = case_context.get("page_index") if case_context else None
+                            row_hint = case_context.get("row_index") if case_context else None
+                            case_obj = case_context.get("case") if case_context else None
+                            meta_entry = (
+                                case_context.get("metadata_entry") if case_context else None
+                            )
+                            last_title = None
+                            if case_obj is not None:
+                                last_title = getattr(case_obj, "title", None)
+                                if last_title is None and isinstance(case_obj, dict):
+                                    last_title = case_obj.get("title")
+
+                            meta_payload = {
+                                "fname": fname_param or norm_fname or "",
+                                "title": last_title or (meta_entry or {}).get("title") or "",
+                                "subject": getattr(case_obj, "subject", None)
+                                or (meta_entry or {}).get("subject")
+                                or "",
+                                "court": getattr(case_obj, "court", None)
+                                or (meta_entry or {}).get("court")
+                                or "",
+                                "category": getattr(case_obj, "category", None)
+                                or (meta_entry or {}).get("category")
+                                or "",
+                                "cause_no": getattr(case_obj, "cause_number", None)
+                                or (meta_entry or {}).get("cause_number")
+                                or "",
+                                "judgment_date": getattr(case_obj, "judgment_date", None)
+                                or (meta_entry or {}).get("judgment_date")
+                                or "",
+                                "page": page_hint if page_hint is not None else 0,
+                                "idx": row_hint if row_hint is not None else 0,
+                                "file_path": (meta_entry or {}).get("local_path")
+                                or (meta_entry or {}).get("saved_path")
+                                or "",
+                                "size": (meta_entry or {}).get("bytes") or 0,
+                            }
+
+                            if result == "downloaded":
+                                telemetry.add("downloaded", "ok", meta_payload)
+                            elif result == "failed":
+                                telemetry.add("failed", "download_other", meta_payload)
+                            elif result in {"existing_file", "checkpoint_skip"}:
+                                telemetry.add("skipped", "exists", meta_payload)
+                            elif result == "duplicate_in_run":
+                                telemetry.add("skipped", "in_run_dup", meta_payload)
+                            _persist_state(
+                                page_hint if page_hint is not None else resume_page_index,
+                                (row_hint + 1) if row_hint is not None else 0,
+                                last_fname=fname_param or norm_fname,
+                                last_title=last_title,
+                            )
+
                             if (
                                 is_new_mode(scrape_mode)
                                 and consecutive_existing >= config.SCRAPE_NEW_CONSECUTIVE_LIMIT
@@ -1371,7 +1476,15 @@ def _run_scrape_attempt(
                         if resume_page_index >= total_pages:
                             resume_page_index = max(0, total_pages - 1)
 
-                        for page_index_zero in range(resume_page_index, total_pages):
+                        page_indices = list(range(resume_page_index, total_pages))
+                        if limit_pages:
+                            page_indices = [
+                                idx
+                                for idx in sorted(set(limit_pages))
+                                if resume_page_index <= idx < total_pages
+                            ]
+
+                        for page_index_zero in page_indices:
                             if crash_stop or row_limit_reached:
                                 break
 
@@ -1384,6 +1497,7 @@ def _run_scrape_attempt(
 
                             if checkpoint is not None:
                                 checkpoint.mark_page(page_index_zero, reset_row=False, mode=scrape_mode)
+                            _persist_state(page_index_zero, -1)
 
                             try:
                                 buttons = page.locator("button:has(i.icon-dl)")
@@ -1564,8 +1678,6 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] fname={fname_token} already downloaded as {label}; skipping click."
                                     )
-                                    if canonical_token:
-                                        processed_this_run.add(canonical_token)
                                     if checkpoint is not None:
                                         checkpoint.record_download(
                                             fname_key,
@@ -1600,8 +1712,6 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] fname={fname_token} recorded in checkpoint; skipping click in NEW mode."
                                     )
-                                    if canonical_token:
-                                        processed_this_run.add(canonical_token)
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     summary["skipped"] += 1
@@ -1779,6 +1889,7 @@ def _run_scrape_attempt(
         )
     )
     save_json_file(config.SUMMARY_FILE, summary)
+    _finalize_telemetry(summary)
     return summary
 
 
@@ -1792,6 +1903,11 @@ def run_scrape(
     new_limit: Optional[int] = None,
     max_retries: Optional[int] = None,
     resume: Optional[bool] = None,
+    resume_mode: str = "none",
+    resume_page: Optional[int] = None,
+    resume_index: Optional[int] = None,
+    limit_pages: Optional[List[int]] = None,
+    row_limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Public entrypoint that wraps the core scraper with retry support."""
 
@@ -1815,9 +1931,26 @@ def run_scrape(
     resume_enabled = config.SCRAPE_RESUME_DEFAULT if resume is None else bool(resume)
     checkpoint: Optional[Checkpoint]
     if resume_enabled:
-        checkpoint = Checkpoint(config.CHECKPOINT_PATH)
+        checkpoint = Checkpoint(config.RUN_STATE_FILE)
     else:
         checkpoint = None
+
+    resume_state: Optional[Dict[str, Any]] = None
+    normalized_resume = (resume_mode or "none").strip().lower()
+    if normalized_resume != "none":
+        state: Optional[Dict[str, Any]] = None
+        if normalized_resume in {"state", "auto"}:
+            state = load_checkpoint()
+        if state is None and normalized_resume in {"logs", "auto"}:
+            state = derive_checkpoint_from_logs()
+        if state is not None:
+            resume_state = dict(state)
+        if resume_page is not None:
+            resume_state = resume_state or {}
+            resume_state["dt_page_index"] = resume_page
+        if resume_index is not None:
+            resume_state = resume_state or {}
+            resume_state["button_index"] = resume_index
 
     next_start_message = start_message
 
@@ -1834,6 +1967,9 @@ def run_scrape(
             max_retries=0,
             checkpoint=checkpoint,
             resume_enabled=resume_enabled,
+            resume_state=resume_state,
+            limit_pages=limit_pages,
+            row_limit_override=row_limit,
         )
         next_start_message = None
         return result
@@ -1841,71 +1977,42 @@ def run_scrape(
     return run_with_retries(_attempt, max_retries=max(1, retry_limit))
 
 
-if __name__ == "__main__":  # pragma: no cover - quick manual verification
-    from tempfile import TemporaryDirectory
-
-    from .cases_index import AJAX_FNAME_INDEX, CASES_ALL, CaseRow
-
-    CASES_BY_ACTION.clear()
-    AJAX_FNAME_INDEX.clear()
-    CASES_ALL.clear()
-
-    sample_case = CaseRow(
-        action="FSD0151202511062025ATPLIFESCIENCE",
-        code="FSD0151202511062025",
-        suffix="ATPLIFESCIENCE",
-        title="Re ATP Life Science Ventures LP - Judgment",
-        subject="Re ATP Life Science Ventures LP - Judgment",
-        court="Grand Court",
-        category="Financial Services",
-        judgment_date="2025-Nov-06",
-        extra={"Category": "Financial Services", "Judgment Date": "2025-Nov-06"},
+if __name__ == "__main__":  # pragma: no cover
+    parser = argparse.ArgumentParser(description="Run the Playwright scraper")
+    parser.add_argument("--base-url", default=config.DEFAULT_BASE_URL)
+    parser.add_argument("--page-wait", type=int, default=config.PAGE_WAIT_SECONDS)
+    parser.add_argument("--per-download-delay", type=float, default=config.PER_DOWNLOAD_DELAY)
+    parser.add_argument("--scrape-mode", choices=["new", "full"], default=config.SCRAPE_MODE_DEFAULT)
+    parser.add_argument("--new-limit", type=int, default=config.SCRAPE_NEW_LIMIT)
+    parser.add_argument("--max-retries", type=int, default=config.SCRAPER_MAX_RETRIES)
+    parser.add_argument(
+        "--resume",
+        choices=["none", "auto", "state", "logs"],
+        default="none",
+        help="Resume strategy",
     )
-    CASES_BY_ACTION[sample_case.action] = sample_case
-    AJAX_FNAME_INDEX[sample_case.action] = sample_case
+    parser.add_argument("--resume-page", type=int, default=None)
+    parser.add_argument("--resume-index", type=int, default=None)
+    parser.add_argument("--limit-pages", type=int, nargs="*", default=None)
+    parser.add_argument("--row-limit", type=int, default=None)
 
-    embedded_case = CaseRow(
-        action="1J1CB5JDVWQJ1DE60AG13020A37E6E68EADE88BE7AE51E57A648",
-        code="1J1CB5JDVWQJ1DE60AG13020",
-        suffix="A37E6E68EADE88BE7AE51E57A648",
-        title="Embedded Token Fixture",
-        subject="Embedded Token Fixture",
-        court="Example Court",
-        category="Example",
-        judgment_date="2024-Jun-01",
-        extra={"Category": "Example", "Judgment Date": "2024-Jun-01"},
+    args = parser.parse_args()
+
+    ensure_dirs()
+    run_scrape(
+        base_url=args.base_url,
+        page_wait=args.page_wait,
+        per_delay=args.per_download_delay,
+        scrape_mode=args.scrape_mode,
+        new_limit=args.new_limit,
+        max_retries=args.max_retries,
+        resume=args.resume != "none",
+        resume_mode=args.resume,
+        resume_page=args.resume_page,
+        resume_index=args.resume_index,
+        limit_pages=args.limit_pages,
+        row_limit=args.row_limit,
     )
-    CASES_BY_ACTION[embedded_case.action] = embedded_case
-    AJAX_FNAME_INDEX[embedded_case.action] = embedded_case
-
-    CASES_ALL.extend(CASES_BY_ACTION.values())
-
-    class _DummyResponse:
-        status = 200
-
-        def __init__(self, payload: bytes) -> None:
-            self._payload = payload
-
-        def body(self) -> bytes:
-            return self._payload
-
-    class _DummyClient:
-        def __call__(self, url: str, timeout: int = 120) -> _DummyResponse:  # noqa: D401
-            return _DummyResponse(b"%PDF-1.4\n%%EOF\n")
-
-    with TemporaryDirectory() as tmpdir:
-        result = handle_dl_bfile_from_ajax(
-            mode="new",
-            fname="FSD0151202511062025ATPLIFESCIENCE",
-            box_url="https://example.org/dummy.pdf",
-            downloads_dir=Path(tmpdir),
-            cases_by_action=CASES_BY_ACTION,
-            processed_this_run=set(),
-            checkpoint=None,
-            metadata={},
-            http_client=_DummyClient(),
-        )
-        print("[Demo] Handler result:", result)
 
 __all__ = ["run_scrape"]
 

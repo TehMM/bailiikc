@@ -10,6 +10,7 @@
         <a href="{{ url_for('download_all_zip') }}" class="button">Download All ZIP</a>
         <a href="{{ url_for('export_csv') }}" class="button">Export Metadata CSV</a>
         <a href="{{ url_for('start_scrape') }}" class="button" onclick="event.preventDefault(); document.getElementById('run-again-form').submit();">Run Again</a>
+        <a href="{{ url_for('api_export_latest_xlsx') }}" class="button">Export latest run (Excel)</a>
     </div>
     {% if last_summary %}
     <ul class="summary-list">
@@ -65,71 +66,29 @@
     </details>
     {% endif %}
     {% endif %}
-    {% if downloads %}
-    <div class="table-controls">
-        <label>
-            Court
-            <select id="filter-court">
-                <option value="">All Courts</option>
-                {% for court in courts %}
-                <option value="{{ court }}">{{ court }}</option>
-                {% endfor %}
-            </select>
-        </label>
-        <label>
-            Category
-            <select id="filter-category">
-                <option value="">All Categories</option>
-                {% for category in categories %}
-                <option value="{{ category }}">{{ category }}</option>
-                {% endfor %}
-            </select>
-        </label>
-        <label class="grow">
-            Search
-            <input type="search" id="filter-search" placeholder="Subject or Cause Number">
-        </label>
-        <form method="post" action="{{ url_for('reset_view') }}" class="reset-form">
-            <label><input type="checkbox" name="delete_pdfs" value="1"> Delete PDFs</label>
-            <label><input type="checkbox" name="delete_logs" value="1"> Delete logs</label>
-            <button type="submit" class="button danger">Reset State</button>
-        </form>
-    </div>
     <div class="table-scroll">
-        <table id="downloads-table">
+        <table id="downloaded-cases" class="display compact" style="width:100%">
             <thead>
                 <tr>
-                    <th data-sort-key="title">Title</th>
-                    <th data-sort-key="subject">Subject</th>
-                    <th data-sort-key="court">Court</th>
-                    <th data-sort-key="category">Category</th>
-                    <th data-sort-key="judgment-date">Judgment Date</th>
-                    <th data-sort-key="cause-number">Cause Number</th>
-                    <th data-sort-key="size">Size (KB)</th>
-                    <th data-sort-key="actions-token">Actions Token</th>
-                    <th data-sort-key="downloaded-at">Downloaded At</th>
+                    <th>Judgment Date</th>
+                    <th>Title</th>
+                    <th>Subject</th>
+                    <th>Court</th>
+                    <th>Category</th>
+                    <th>Cause Number</th>
+                    <th>Saved File</th>
+                    <th>Size (KB)</th>
+                    <th>Actions Token</th>
                 </tr>
             </thead>
-            <tbody>
-                {% for row in downloads %}
-                <tr data-court="{{ row.court }}" data-category="{{ row.category }}" data-search="{{ (row.subject ~ ' ' ~ row.cause_number ~ ' ' ~ row.title ~ ' ' ~ row.actions_token)|lower }}">
-                    <td data-column="title" data-sort="{{ row.title|lower }}" class="mono"><a href="{{ url_for('download_file', filename=row.saved_path) }}">{{ row.title }}</a></td>
-                    <td data-column="subject" data-sort="{{ row.subject|lower }}">{{ row.subject or '—' }}</td>
-                    <td data-column="court" data-sort="{{ row.court|lower }}">{{ row.court or '—' }}</td>
-                    <td data-column="category" data-sort="{{ row.category|lower }}">{{ row.category or '—' }}</td>
-                    <td data-column="judgment-date" data-sort="{{ row.sort_judgment_date }}">{{ row.judgment_date or '—' }}</td>
-                    <td data-column="cause-number" data-sort="{{ row.cause_number|lower }}">{{ row.cause_number or '—' }}</td>
-                    <td data-column="size" data-sort="{{ row.size_kb }}">{{ row.size_kb }}</td>
-                    <td data-column="actions-token" data-sort="{{ row.actions_token|lower }}" class="mono">{{ row.actions_token }}</td>
-                    <td data-column="downloaded-at" data-sort="{{ row.downloaded_at or '' }}">{{ row.downloaded_at or '—' }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
+            <tbody></tbody>
         </table>
     </div>
-    {% else %}
-    <p>No downloads recorded yet.</p>
-    {% endif %}
+    <form method="post" action="{{ url_for('reset_view') }}" class="reset-form">
+        <label><input type="checkbox" name="delete_pdfs" value="1"> Delete PDFs</label>
+        <label><input type="checkbox" name="delete_logs" value="1"> Delete logs</label>
+        <button type="submit" class="button danger">Reset State</button>
+    </form>
 </section>
 
 <section class="card">
@@ -148,70 +107,31 @@ if (window.EventSource) {
     };
 }
 
-const table = document.getElementById('downloads-table');
-if (table) {
-    const tbody = table.querySelector('tbody');
-    const courtSelect = document.getElementById('filter-court');
-    const categorySelect = document.getElementById('filter-category');
-    const searchInput = document.getElementById('filter-search');
-    const headers = table.querySelectorAll('th[data-sort-key]');
-    let currentSortKey = null;
-    let sortDirection = 1;
-
-    function applyFilters() {
-        const court = courtSelect.value;
-        const category = categorySelect.value;
-        const term = searchInput.value.trim().toLowerCase();
-
-        tbody.querySelectorAll('tr').forEach((row) => {
-            const matchesCourt = !court || row.dataset.court === court;
-            const matchesCategory = !category || row.dataset.category === category;
-            const matchesSearch = !term || (row.dataset.search || '').includes(term);
-            row.style.display = matchesCourt && matchesCategory && matchesSearch ? '' : 'none';
-        });
-    }
-
-    function getSortValue(row, key) {
-        const cell = row.querySelector(`[data-column="${key}"]`);
-        if (!cell) {
-            return '';
-        }
-        return (cell.getAttribute('data-sort') || cell.textContent || '').toLowerCase();
-    }
-
-    function sortRows(key) {
-        const rows = Array.from(tbody.querySelectorAll('tr'));
-        rows.sort((a, b) => {
-            const aVal = getSortValue(a, key);
-            const bVal = getSortValue(b, key);
-            if (aVal === bVal) {
-                return 0;
-            }
-            return aVal > bVal ? sortDirection : -sortDirection;
-        });
-        rows.forEach((row) => tbody.appendChild(row));
-    }
-
-    headers.forEach((header) => {
-        header.addEventListener('click', () => {
-            const key = header.dataset.sortKey;
-            if (currentSortKey === key) {
-                sortDirection = -sortDirection;
-            } else {
-                currentSortKey = key;
-                sortDirection = 1;
-            }
-
-            headers.forEach((h) => h.classList.remove('sorted-asc', 'sorted-desc'));
-            header.classList.add(sortDirection === 1 ? 'sorted-asc' : 'sorted-desc');
-
-            sortRows(key);
-        });
+$(function() {
+    $('#downloaded-cases').DataTable({
+        ajax: '{{ url_for('api_downloaded_cases') }}',
+        deferRender: true,
+        scrollY: '50vh',
+        scroller: true,
+        order: [[0, 'desc']],
+        columns: [
+            { data: 'judgment_date', title: 'Judgment Date' },
+            { data: 'title', title: 'Title', render: function(data, type, row) {
+                if (type === 'display') {
+                    const href = row.saved_path ? `{{ url_for('download_file', filename='') }}/${row.saved_path}` : '#';
+                    return `<a href="${href}">${data || '—'}</a>`;
+                }
+                return data || '';
+            }},
+            { data: 'subject', title: 'Subject' },
+            { data: 'court', title: 'Court' },
+            { data: 'category', title: 'Category' },
+            { data: 'cause_number', title: 'Cause Number' },
+            { data: 'filename', title: 'Saved File' },
+            { data: 'size_kb', title: 'Size (KB)' },
+            { data: 'actions_token', title: 'Actions Token' }
+        ]
     });
-
-    courtSelect.addEventListener('change', applyFilters);
-    categorySelect.addEventListener('change', applyFilters);
-    searchInput.addEventListener('input', applyFilters);
-}
+});
 </script>
 {% endblock %}

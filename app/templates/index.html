@@ -45,6 +45,49 @@
     </form>
 </section>
 
+<section class="card">
+    <h2>Resume a Run</h2>
+    <form method="post" action="{{ url_for('resume_scrape') }}" class="form-grid">
+        <label>
+            Base URL
+            <input type="url" name="base_url" value="{{ default_base_url }}" required>
+        </label>
+        <label>
+            Page Wait (seconds)
+            <input type="number" name="page_wait" min="1" value="{{ default_wait }}" required>
+        </label>
+        <label>
+            Delay Between Downloads (seconds)
+            <input type="number" step="0.1" name="per_download_delay" min="0" value="{{ default_delay }}" required>
+        </label>
+        <fieldset class="form-fieldset">
+            <legend>Resume Source</legend>
+            <label class="radio">
+                <input type="radio" name="resume_mode" value="state" {% if default_resume_mode == 'state' %}checked{% endif %}> Checkpoint file
+            </label>
+            <label class="radio">
+                <input type="radio" name="resume_mode" value="logs" {% if default_resume_mode == 'logs' %}checked{% endif %}> Latest log file
+            </label>
+            <label class="radio">
+                <input type="radio" name="resume_mode" value="auto" {% if default_resume_mode not in ['state','logs'] %}checked{% endif %}> Auto (checkpoint then log)
+            </label>
+        </fieldset>
+        <label>
+            Start page (0-based)
+            <input type="number" name="resume_page" min="0" value="{{ default_resume_page }}" placeholder="Auto">
+        </label>
+        <label>
+            Start index (0-based)
+            <input type="number" name="resume_index" min="0" value="{{ default_resume_index }}" placeholder="Auto">
+        </label>
+        <div class="form-actions">
+            <button type="submit" class="primary">Resume</button>
+            <a href="{{ url_for('report') }}" class="button">View Report</a>
+            <a href="{{ url_for('api_export_latest_xlsx') }}" class="button">Export latest run (Excel)</a>
+        </div>
+    </form>
+</section>
+
 {% if last_summary %}
 <section class="card">
     <h2>Last Run Summary</h2>

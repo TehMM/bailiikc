@@ -1,0 +1,39 @@
+# Current Scraper Implementation (Pre-SQLite)
+
+## Overview
+The existing scraper targets the Cayman Islands Judicial website’s unreported judgments page. It pulls the published judgments CSV on each run, interprets the `Actions` column tokens, and drives Selenium/Playwright flows that issue the official `dl_bfile` AJAX requests to Box.com. Downloads, metadata, and resume information are stored entirely on disk using JSON/CSV files; SQLite is not yet part of the runtime path.
+
+## Key Modules
+- **app/main.py**: Flask web UI with forms for scrape/resume/reset actions, webhook endpoint, and routes for reports, exports, and file serving. Launches background scrape threads that call `run_scrape`.
+- **main.py (repo root)**: Thin entrypoint that ensures data directories exist and starts the Flask app (used by Railway/Docker).
+- **app/scraper/config.py**: Central constants for data paths, URLs, defaults, and HTTP headers. Defines `/app/data` layout, scrape defaults, and helper predicates for mode detection.
+- **app/scraper/run.py**: Primary scraper engine using Playwright. Loads the judgments CSV, builds in-memory case indices, coordinates page navigation and AJAX monitoring, downloads PDFs, and writes metadata/logs/state. Contains checkpoint logic and resume handling.
+- **app/scraper/cases_index.py**: CSV loader and normaliser. Parses `Actions` tokens, builds `CASES_BY_ACTION`, `AJAX_FNAME_INDEX`, and `CASES_ALL` for lookup during scraping.
+- **app/scraper/downloader.py**: Legacy Selenium-based downloader helpers (currently unused by Playwright flow). Handles AJAX nonce acquisition, Box URL fetching, PDF streaming, duplicate detection, and metadata updates.
+- **app/scraper/selenium_client.py**: Selenium utilities for nonce extraction and AJAX POST execution to retrieve Box URLs. Used by the legacy downloader path.
+- **app/scraper/utils.py**: Shared utilities: directory setup, logging configuration, filename sanitisation, PDF path building, metadata persistence, ZIP generation, JSON helpers, and duplicate detection.
+- **app/scraper/state.py**: Checkpoint persistence and derivation from logs (`state.json`, scrape log parsing) to support resume-on-crash flows.
+- **app/scraper/telemetry.py**: Lightweight telemetry writer producing per-run JSON files and helpers for locating the latest run and pruning exports.
+- **app/scraper/export_excel.py**: Builds Excel workbooks from telemetry JSON for download via the API.
+
+## Current Scrape Workflow
+1. **UI submission**: `app/main.py` renders forms and reads user input (base URL, waits, limits, resume options). On submit, it saves defaults, optionally resets state, and starts a background thread that calls `run_scrape` with the collected parameters.
+2. **CSV load and case index**: `run.py` invokes `load_cases_index(config.CSV_URL)` to fetch and parse `judgments.csv`, populating global indices (`CASES_BY_ACTION`, etc.).
+3. **Playwright session**: The scraper launches Chromium, loads the target page, scrolls to trigger DataTables loading, and navigates through pages/rows. It monitors `admin-ajax.php` responses to capture `dl_bfile` payloads and Box URLs.
+4. **Download handling**: When a Box URL is observed, `handle_dl_bfile_from_ajax` streams the PDF (via Playwright’s `context.request`), writes files under `/app/data/pdfs`, updates in-memory metadata, and appends entries to `downloads.jsonl`. Filename fallbacks and duplicate checks rely on helpers from `utils.py`.
+5. **Resume/state**: `Checkpoint` objects inside `run.py`, plus `state.py` helpers and scrape logs, maintain progress (`state.json`, `run_state.json`, latest scrape log). Resume modes decide whether to reuse these checkpoints or restart.
+6. **Reporting**: After the run, summaries/log paths are stored in JSON files. The Flask report page reads `downloads.jsonl`, `last_summary.json`, and current logs to show tables, filters, and download links. Telemetry is also written to per-run JSON for Excel export.
+
+## Current Data & State Files
+- **metadata.json**: Primary metadata store with `downloads` list; updated on each successful download.
+- **downloads.jsonl**: Append-only log of download attempts with actions token, titles, sizes, timestamps, and saved paths (used for the report table).
+- **state.json**: Persisted checkpoint referenced by resume logic.
+- **run_state.json**: Additional run progress tracking (written by `save_checkpoint`).
+- **last_summary.json**: Summary of the most recent run (counts, mode, log file path) for display in the UI.
+- **scrape_log.txt / scrape_*.log**: Human-readable scrape logs stored under `/app/data/logs`, tailed by the UI for live updates.
+
+## Known Limitations / Fragility
+- The judgments CSV is fetched fresh each run without caching/versioning; network hiccups can affect availability.
+- Resume relies on JSON checkpoints and log parsing, leading to complexity when recovering mid-run.
+- Disk space guardrails are basic (free-space checks via `utils.disk_has_room`), and filename length issues require fallbacks.
+- The Playwright AJAX capture flow is delicate; nonce/session handling and Box URL extraction were tuned through trial and error and should remain untouched for now.

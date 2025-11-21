@@ -23,7 +23,7 @@ from flask import (
     url_for,
 )
 
-from app.scraper import config
+from app.scraper import config, db
 from app.scraper.run import run_scrape
 from app.scraper.export_excel import export_latest_run_to_excel
 from app.scraper.telemetry import latest_run_json
@@ -44,6 +44,7 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 ensure_dirs()
+db.initialize_schema()
 
 
 _DATE_FORMATS: Iterable[str] = ("%Y-%m-%d", "%Y-%b-%d", "%d/%m/%Y", "%d-%b-%Y")

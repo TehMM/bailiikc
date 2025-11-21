@@ -193,11 +193,3 @@ def get_latest_valid_csv_version() -> Optional[sqlite3.Row]:
         "SELECT * FROM csv_versions WHERE valid = 1 ORDER BY id DESC LIMIT 1"
     )
     return cursor.fetchone()
-
-
-def get_latest_csv_version() -> Optional[sqlite3.Row]:
-    """Return the newest csv_versions row regardless of validity."""
-
-    conn = get_connection()
-    cursor = conn.execute("SELECT * FROM csv_versions ORDER BY id DESC LIMIT 1")
-    return cursor.fetchone()

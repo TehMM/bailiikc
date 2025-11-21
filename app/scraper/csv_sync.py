@@ -12,6 +12,7 @@ import io
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -44,6 +45,31 @@ def normalize_action_token(token: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "", token)
 
 
+def parse_judgment_date(raw: str) -> str:
+    """Return a normalised judgment date in ``YYYY-MM-DD`` format when possible."""
+
+    candidate = (raw or "").strip()
+    if not candidate:
+        return ""
+
+    formats = (
+        "%Y-%m-%d",
+        "%Y-%b-%d",
+        "%d/%m/%Y",
+        "%d-%b-%Y",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(candidate, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    digits = re.sub(r"[^0-9]", "", candidate)
+    if len(digits) >= 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    return candidate
+
+
 def build_http_session() -> requests.Session:
     """Return a requests session configured for CSV fetches."""
 
@@ -67,6 +93,15 @@ def _save_csv_copy(content: bytes, sha256: str) -> Path:
     return path
 
 
+def _validate_fieldnames(fieldnames: Optional[list[str]]) -> None:
+    """Ensure required columns are present in the CSV headers."""
+
+    if not fieldnames:
+        raise ValueError("CSV is missing header row")
+    if "Actions" not in fieldnames and "Action" not in fieldnames:
+        raise ValueError("CSV missing required Actions column")
+
+
 def _parse_row(row: dict[str, str]) -> tuple[list[str], dict[str, str]]:
     actions_raw = (row.get("Actions") or row.get("Action") or "").strip()
     if not actions_raw:
@@ -76,7 +111,7 @@ def _parse_row(row: dict[str, str]) -> tuple[list[str], dict[str, str]]:
     subject = (row.get("Subject") or title or "").strip()
     court = (row.get("Court") or row.get("Court file") or "").strip()
     category = (row.get("Category") or "").strip()
-    judgment_date = (row.get("Judgment Date") or row.get("Date") or "").strip()
+    judgment_date = parse_judgment_date(row.get("Judgment Date") or row.get("Date") or "")
     cause_number = (
         row.get("Cause Number")
         or row.get("Cause number")
@@ -85,11 +120,11 @@ def _parse_row(row: dict[str, str]) -> tuple[list[str], dict[str, str]]:
         or ""
     ).strip()
 
-    tokens = [
-        normalize_action_token(piece)
-        for piece in re.split(r"[|,;/\\\s]+", actions_raw)
-        if normalize_action_token(piece)
-    ]
+    tokens: list[str] = []
+    for piece in re.split(r"[|,;/\\\s]+", actions_raw):
+        norm = normalize_action_token(piece)
+        if norm:
+            tokens.append(norm)
 
     metadata = {
         "action_token_raw": actions_raw,
@@ -101,6 +136,13 @@ def _parse_row(row: dict[str, str]) -> tuple[list[str], dict[str, str]]:
         "cause_number": cause_number,
     }
     return tokens, metadata
+
+
+def infer_is_criminal(metadata: dict[str, str]) -> int:
+    """Placeholder classifier for criminal matters derived from CSV metadata."""
+
+    # TODO: implement real classification logic based on category/subject/title.
+    return 0
 
 
 def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> CsvSyncResult:
@@ -117,24 +159,27 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
     content = response.content
     sha256 = hashlib.sha256(content).hexdigest()
 
-    latest = db.get_latest_csv_version()
-    is_new_version = not latest or latest.get("sha256") != sha256
+    fetched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    latest = db.get_latest_valid_csv_version()
+    is_new_version = not latest or latest["sha256"] != sha256
 
     csv_path = _save_csv_copy(content, sha256)
-
+    rows: list[dict[str, str]] = []
+    row_count = 0
     try:
         decoded = content.decode("utf-8-sig")
         reader = csv.DictReader(io.StringIO(decoded))
+        _validate_fieldnames(reader.fieldnames)
         rows = list(reader)
         row_count = len(rows)
     except Exception as exc:  # noqa: BLE001
-        version_id = db.record_csv_version(
-            fetched_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        db.record_csv_version(
+            fetched_at=fetched_at,
             source_url=source_url,
             etag=response.headers.get("ETag"),
             last_modified=response.headers.get("Last-Modified"),
             sha256=sha256,
-            row_count=0,
+            row_count=row_count,
             file_path=str(csv_path),
             valid=False,
             error_message=str(exc),
@@ -142,7 +187,7 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
         raise
 
     version_id = db.record_csv_version(
-        fetched_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        fetched_at=fetched_at,
         source_url=source_url,
         etag=response.headers.get("ETag"),
         last_modified=response.headers.get("Last-Modified"),
@@ -163,9 +208,7 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
                 continue
 
             for token in tokens:
-                norm = normalize_action_token(token)
-                if not norm:
-                    continue
+                norm = token
 
                 cursor = conn.execute(
                     """
@@ -217,13 +260,14 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
                             (version_id, existing["id"]),
                         )
                 else:
+                    is_criminal = infer_is_criminal(metadata)
                     cursor = conn.execute(
                         """
                         INSERT INTO cases (
                             action_token_raw, action_token_norm, title, cause_number,
                             court, category, judgment_date, is_criminal, is_active,
                             source, first_seen_version_id, last_seen_version_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, 'unreported_judgments', ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'unreported_judgments', ?, ?)
                         """,
                         (
                             metadata.get("action_token_raw"),
@@ -233,6 +277,7 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
                             metadata.get("court"),
                             metadata.get("category"),
                             metadata.get("judgment_date"),
+                            is_criminal,
                             version_id,
                             version_id,
                         ),
@@ -248,6 +293,7 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
         )
         removed_case_ids = [int(row["id"]) for row in cursor.fetchall()]
         if removed_case_ids:
+            # Build the correct number of placeholders for a parameterised IN clause.
             conn.execute(
                 """
                 UPDATE cases
@@ -259,9 +305,10 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
             )
 
     log_line(
-        "[CSV_SYNC] version=%s new=%s changed=%s removed=%s rows=%s file=%s"
+        "[CSV_SYNC] version=%s new_version=%s new=%s changed=%s removed=%s rows=%s file=%s"
         % (
             version_id,
+            is_new_version,
             len(new_case_ids),
             len(changed_case_ids),
             len(removed_case_ids),

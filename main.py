@@ -8,6 +8,6 @@ if __name__ == "__main__":
     ensure_dirs()
     db.initialize_schema()
 
-    # Railway provides PORT; default to 8080 for local dev
+    # PORT may be provided by the hosting environment; default to 8080 for local dev
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)

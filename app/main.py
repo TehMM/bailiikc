@@ -43,6 +43,8 @@ from app.scraper.utils import (
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
+# Initialise storage paths and SQLite schema on import so WSGI/ASGI entrypoints
+# also have the expected environment ready. Idempotent by design.
 ensure_dirs()
 db.initialize_schema()
 
@@ -522,5 +524,6 @@ def export_csv() -> Response:
 
 
 if __name__ == "__main__":
-    ensure_dirs()
+    # Direct invocation is primarily for local development; directories and
+    # schema are initialised above during module import.
     app.run(host="0.0.0.0", port=8080)

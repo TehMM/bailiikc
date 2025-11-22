@@ -1109,6 +1109,9 @@ def _run_scrape_attempt(
         % (scrape_mode, row_limit if scrape_mode == "new" else "all", page_wait, per_delay)
     )
 
+    log_line(
+        f"[CASES_INDEX] using {'db' if cases_index.should_use_db_index() else 'csv'} backend"
+    )
     load_cases_index(config.CSV_URL)
     meta = load_metadata()
     downloaded_index: Dict[str, Dict[str, Any]] = {}

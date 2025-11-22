@@ -320,6 +320,17 @@ Either use the last known-good version (most recent valid=1), or
 
 Abort the run cleanly with a clear error.
 
+4.4 Case index backends (CSV vs DB)
+
+- The canonical in-memory case index (CASES_BY_ACTION, AJAX_FNAME_INDEX,
+  CASES_ALL) is still built from the CSV by default.
+- An experimental DB-backed index exists for validation and manual testing:
+  when ``BAILIIKC_USE_DB_CASES=1`` is set, the index is populated from the
+  SQLite ``cases`` table instead of parsing the CSV.
+- Behaviour must remain identical between backends; equivalence tests verify
+  that titles, cause numbers, courts, categories, judgment dates, and action
+  tokens match for the same CSV snapshot.
+
 4.4 “New cases” definition
 
 A case is new in this CSV version if:

@@ -32,11 +32,12 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 - **last_summary.json**: Summary of the most recent run (counts, mode, log file path) for display in the UI.
 - **scrape_log.txt / scrape_*.log**: Human-readable scrape logs stored under `/app/data/logs`, tailed by the UI for live updates.
 
-## SQLite usage (logging only)
+## SQLite usage (logging by default)
 - **CSV sync**: Each run syncs `judgments.csv` via `csv_sync.sync_csv`, recording a `csv_versions` row and upserting `cases`.
 - **Runs table**: `run_scrape` now inserts into `runs` with trigger, mode, parameters, and the CSV version used. Completion and failures are marked at the end of the run.
 - **Downloads table**: Per-case attempts are logged during scraping with statuses (`pending`, `in_progress`, `downloaded`, `skipped`, `failed`), attempt counts, timestamps, optional file info, and error details.
-- **Behaviour**: JSON files remain the source of truth for scraper control/resume. SQLite is write-only for observability in the current implementation.
+- **Case index backend**: The scraper still builds its in-memory case index from the CSV by default. Setting `BAILIIKC_USE_DB_CASES=1` makes `cases_index` load from the SQLite `cases` table instead; this mode is intended for validation and should be behaviourally identical to the CSV path.
+- **Behaviour**: JSON files remain the source of truth for scraper control/resume. SQLite is write-only for observability in the current implementation except when explicitly opted into the DB-backed case index.
 
 ## Known Limitations / Fragility
 - The judgments CSV is fetched fresh each run without caching/versioning; network hiccups can affect availability.

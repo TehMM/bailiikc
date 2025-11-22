@@ -1,17 +1,57 @@
 from __future__ import annotations
 
+"""Helpers for building and querying the judgments case index.
+
+The main entry points are:
+    - ``load_cases_from_csv(csv_path: str)``: Populate the in-memory index by
+      parsing the judgments CSV. This is the legacy, default path used by the
+      scraper.
+    - ``load_cases_index_from_db(...)``: Populate the same index from the
+      SQLite ``cases`` table (used when BAILIIKC_USE_DB_CASES=1).
+    - ``find_case_by_fname(fname: str)``: Locate a case by AJAX filename token.
+
+Index shape (global module state):
+    CASES_BY_ACTION: Dict[str, CaseRow]
+        Mapping from normalised action token (``action_token_norm``) to a
+        ``CaseRow`` describing the case. Keys are produced by
+        ``normalize_action_token``.
+    AJAX_FNAME_INDEX: Dict[str, CaseRow]
+        Alias of ``CASES_BY_ACTION`` used for AJAX filename lookups.
+    CASES_ALL: List[CaseRow]
+        Flat list of all CaseRow entries loaded from the source.
+
+Each ``CaseRow`` contains at least the following fields used by callers:
+    - action: str (normalised token used as the key)
+    - code: str (core code portion of the token)
+    - suffix: str (token suffix after the core code)
+    - title: str
+    - subject: str
+    - court: str
+    - category: str
+    - judgment_date: str
+    - cause_number: str
+    - extra: Dict[str, str] (raw CSV columns and helpers)
+
+By default, callers use ``load_cases_from_csv``. When the environment variable
+``BAILIIKC_USE_DB_CASES`` is set to ``"1"``, the in-memory index is populated
+from the database instead via ``load_cases_index_from_db``. This behaviour is
+controlled by ``should_use_db_index`` and is backwards compatible: the default
+remains the CSV-based path.
+"""
+
 import csv
 import html
 import io
+import os
 import re
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-from . import config
+from . import config, db_case_index
 from .utils import log_line
 
 
@@ -96,7 +136,16 @@ def _resolve_csv_stream(csv_path: str) -> Tuple[Optional[Iterable[str]], Optiona
 
 
 def load_cases_from_csv(csv_path: str) -> None:
-    """Populate the global case index from the provided CSV path."""
+    """Populate the global case index from the provided CSV path.
+
+    The legacy CSV parsing path remains the default. If
+    ``should_use_db_index()`` returns True, this function delegates to
+    ``load_cases_index_from_db`` instead of parsing the CSV.
+    """
+
+    if should_use_db_index():
+        load_cases_index_from_db()
+        return
 
     stream, description = _resolve_csv_stream(csv_path)
     if not stream and csv_path != config.CSV_URL:
@@ -188,6 +237,76 @@ def load_cases_from_csv(csv_path: str) -> None:
         f"[CSV] Loaded {loaded} case token(s) from CSV; "
         f"skipped {skipped_blank} row(s) without usable Actions entries."
     )
+
+
+def load_cases_index_from_db(
+    *, source: str = "unreported_judgments", only_active: bool = True
+) -> Dict[str, "CaseRow"]:
+    """Populate the global case index using the SQLite ``cases`` table.
+
+    Returns the populated ``CASES_BY_ACTION`` mapping for convenience.
+    """
+
+    CASES_BY_ACTION.clear()
+    AJAX_FNAME_INDEX.clear()
+    CASES_ALL.clear()
+
+    records = db_case_index.load_case_index_from_db(
+        source=source, only_active=only_active
+    )
+
+    loaded = 0
+    for token, record in records.items():
+        normalized = normalize_action_token(token)
+        if not normalized:
+            continue
+
+        match = ACTION_SPLIT_RE.match(normalized)
+        if match:
+            code = match.group(1)
+            suffix = match.group(2) or ""
+        else:
+            code = normalized
+            suffix = ""
+
+        case = CaseRow(
+            action=normalized,
+            code=code,
+            suffix=suffix,
+            title=(record.get("title") or "").strip(),
+            subject=(record.get("subject") or record.get("title") or "").strip(),
+            court=(record.get("court") or "").strip(),
+            category=(record.get("category") or "").strip(),
+            judgment_date=(record.get("judgment_date") or "").strip(),
+            cause_number=(record.get("cause_number") or "").strip(),
+            extra={
+                "_source": record.get("source", ""),
+                "_is_active": str(record.get("is_active", "")),
+            },
+        )
+
+        existing = CASES_BY_ACTION.get(normalized)
+        if existing:
+            log_line(
+                f"[DB] Duplicate action token {normalized} encountered; keeping first occurrence."
+            )
+            continue
+
+        CASES_BY_ACTION[normalized] = case
+        AJAX_FNAME_INDEX[normalized] = case
+        CASES_ALL.append(case)
+        loaded += 1
+
+    log_line(
+        f"[DB] Loaded {loaded} case token(s) from DB for source={source}; only_active={only_active}"
+    )
+    return CASES_BY_ACTION
+
+
+def should_use_db_index() -> bool:
+    """Return True when DB-backed case indexing should be used."""
+
+    return os.environ.get("BAILIIKC_USE_DB_CASES", "").strip() == "1"
 
 
 def find_case_by_fname(fname: str, *, strict: bool = False) -> Optional[CaseRow]:

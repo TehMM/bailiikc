@@ -390,7 +390,7 @@ def run_scrape(params: ScrapeParams) -> RunSummary:
     5. Commit and return RunSummary.
     """
 
-Current state (PR2): the legacy `run.py` integrates CSV sync + SQLite in a write-only fashion. The scraper still uses JSON/state files to decide which cases to process and how to resume, but every run now records a `runs` row and every per-case attempt updates `downloads` for observability.
+Current state: the legacy `run.py` integrates CSV sync + SQLite in a write-only fashion. The scraper still uses JSON/state files to decide which cases to process and how to resume, but every run now records a `runs` row and every per-case attempt updates `downloads` for observability.
 
 
 Pseudocode:
@@ -400,10 +400,11 @@ def run_scrape(params: ScrapeParams) -> RunSummary:
 
     csv_result = csv_sync.sync_csv(config.CSV_URL, http_session)
     version_id = csv_result.version_id
-    # The concrete CSV file path from sync_csv is reused to build the in-memory
-    # case index so the scrape operates on the exact payload recorded in
-    # ``csv_versions``. When DB-backed indices are enabled, the path is still
-    # captured for observability but lookup remains DB-driven.
+    # The concrete CSV file path from sync_csv (csv_result.csv_path) is reused
+    # to build the in-memory case index so the scrape operates on the exact
+    # payload recorded in ``csv_versions``. When DB-backed indices are enabled,
+    # the path is still captured for observability while the index is loaded
+    # from SQLite instead.
 
     run_id = db.create_run(
         trigger=current_trigger(),      # 'ui', 'webhook', 'cli', ...

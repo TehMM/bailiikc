@@ -23,7 +23,7 @@ from flask import (
     url_for,
 )
 
-from app.scraper import config
+from app.scraper import config, db
 from app.scraper.run import run_scrape
 from app.scraper.export_excel import export_latest_run_to_excel
 from app.scraper.telemetry import latest_run_json
@@ -43,7 +43,10 @@ from app.scraper.utils import (
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
+# Initialise storage paths and SQLite schema on import so WSGI/ASGI entrypoints
+# also have the expected environment ready. Idempotent by design.
 ensure_dirs()
+db.initialize_schema()
 
 
 _DATE_FORMATS: Iterable[str] = ("%Y-%m-%d", "%Y-%b-%d", "%d/%m/%Y", "%d-%b-%Y")
@@ -521,5 +524,6 @@ def export_csv() -> Response:
 
 
 if __name__ == "__main__":
-    ensure_dirs()
+    # Direct invocation is primarily for local development; directories and
+    # schema are initialised above during module import.
     app.run(host="0.0.0.0", port=8080)

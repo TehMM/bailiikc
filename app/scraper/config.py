@@ -15,6 +15,9 @@ RUN_STATE_FILE: Path = DATA_DIR / "run_state.json"
 DOWNLOADS_LOG: Path = DATA_DIR / "downloads.jsonl"
 SUMMARY_FILE: Path = DATA_DIR / "last_summary.json"
 HISTORY_ACTIONS_FILE: Path = DATA_DIR / "history_actions.json"
+# SQLite database path (new infrastructure); JSON files above remain active
+# for the current scraper implementation.
+DB_PATH: Path = DATA_DIR / "bailiikc.db"
 
 DEFAULT_BASE_URL: str = "https://judicial.ky/judgments/unreported-judgments/"
 CSV_URL: str = "https://judicial.ky/wp-content/uploads/box_files/judgments.csv"

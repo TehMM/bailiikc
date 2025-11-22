@@ -1,11 +1,11 @@
 # Cayman Judicial PDF Scraper & Dashboard
 
-This project provides a production-ready Flask dashboard and Selenium-based scraper for the Cayman Islands Judicial website. It collects non-criminal judgments, downloads the associated PDFs through the official AJAX flow, and presents status, logs, and downloads through a web UI.
+This project provides a production-ready Flask dashboard and Playwright-based scraper for the Cayman Islands Judicial website. It collects non-criminal judgments, downloads the associated PDFs through the official AJAX flow, and presents status, logs, and downloads through a web UI. Legacy Selenium helpers remain in the codebase but are not used in the current scraping pipeline.
 
 ## Features
-- Headless Chromium + Selenium workflow that discovers the live WordPress AJAX nonce and session cookies.
+- Headless Chromium + Playwright workflow that discovers the live WordPress AJAX nonce and session cookies.
 - Robust CSV parser that excludes criminal cases and extracts download metadata from the `Actions` column.
-- Selenium-executed AJAX requests to retrieve signed Box.com URLs, streamed to disk with duplicate detection.
+- Playwright-captured AJAX requests to retrieve signed Box.com URLs, streamed to disk with duplicate detection.
 - Persistent metadata (`/app/data/metadata.json`), scrape logs (`/app/data/pdfs/scrape_log.txt`), and PDF storage (`/app/data/pdfs`).
 - Flask 3 web dashboard with configuration form, live log streaming via Server-Sent Events (SSE), PDF table, metadata export, and ZIP bundling.
 - REST endpoints for metadata JSON and CSV export.
@@ -17,10 +17,10 @@ app/
   scraper/
     config.py          # Constants and paths
     utils.py           # Logging, persistence, ZIP helpers
-    parser.py          # CSV download and parsing
-    selenium_client.py # Headless Chrome helpers (nonce, AJAX)
-    downloader.py      # Download orchestration
-    run.py             # High-level scrape coordinator
+    cases_index.py     # CSV download and parsing helpers
+    selenium_client.py # Legacy Selenium helpers (not used in current Playwright path)
+    downloader.py      # Legacy download orchestration
+    run.py             # High-level Playwright scrape coordinator
   templates/           # Jinja templates for UI
   static/style.css     # Basic styling
 main.py                # Entry point (`python main.py`)
@@ -36,19 +36,20 @@ README.md
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
-2. **Ensure Chromium/Chromedriver** are installed locally (or run inside Docker).
+2. **Ensure Chromium is available** locally (or run inside Docker with bundled Playwright dependencies).
 3. **Create the data directories** (the app will auto-create them when run):
    ```bash
    mkdir -p /app/data/pdfs
    ```
 4. **Start the app**
    ```bash
+   python -m compileall app main.py
    python main.py
    ```
 5. Open <http://localhost:8080> in your browser, adjust scrape settings, and start a run.
 
 ## Docker Usage
-Build and run the containerised app (Chromium + Chromedriver included):
+Build and run the containerised app (Chromium included for Playwright):
 ```bash
 docker build -t cayman-scraper .
 docker run -p 8080:8080 -v $(pwd)/data:/app/data cayman-scraper

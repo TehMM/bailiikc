@@ -1,10 +1,10 @@
 # Current Scraper Implementation
 
 ## Overview
-The existing scraper targets the Cayman Islands Judicial website’s unreported judgments page. It pulls the published judgments CSV on each run, interprets the `Actions` column tokens, and drives a Playwright-based flow (with legacy Selenium helpers unused in the current path) that issues the official `dl_bfile` AJAX requests to Box.com. Downloads, metadata, and resume information remain stored on disk using JSON/CSV files; SQLite is now used in parallel for observability (CSV versioning, per-run records, and per-case download tracking) without changing scraper control flow.
+The existing scraper targets the Cayman Islands Judicial website’s unreported judgments page. It pulls the published judgments CSV on each run, interprets the `Actions` column tokens, and drives a Playwright-based flow (with legacy Selenium helpers unused in the current path) that issues the official `dl_bfile` AJAX requests to Box.com. Downloads, metadata, and resume information remain stored on disk using JSON/CSV files; SQLite is now used in parallel for observability (CSV versioning, per-run records, and per-case download tracking) without changing scraper control flow. DB-backed reporting helpers and `/api/db/...` endpoints expose the SQLite data without altering the legacy JSON surfaces.
 
 ## Key Modules
-- **app/main.py**: Flask web UI with forms for scrape/resume/reset actions, webhook endpoint, and routes for reports, exports, and file serving. Launches background scrape threads that call `run_scrape`.
+- **app/main.py**: Flask web UI with forms for scrape/resume/reset actions, webhook endpoint, and routes for reports, exports, and file serving. Launches background scrape threads that call `run_scrape`. Also exposes experimental `/api/db/runs/latest` and `/api/db/downloaded-cases` endpoints backed by SQLite.
 - **main.py (repo root)**: Thin entrypoint that imports `app.main` (which initialises directories and schema) and starts the Flask app; suitable for local development or generic hosting environments.
 - **app/scraper/config.py**: Central constants for data paths, URLs, defaults, and HTTP headers. Defines `/app/data` layout, scrape defaults, and helper predicates for mode detection.
 - **app/scraper/run.py**: Primary scraper engine using Playwright. Loads the judgments CSV, builds in-memory case indices, coordinates page navigation and AJAX monitoring, downloads PDFs, and writes metadata/logs/state. Contains checkpoint logic and resume handling.
@@ -15,6 +15,7 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 - **app/scraper/state.py**: Checkpoint persistence and derivation from logs (`state.json`, scrape log parsing) to support resume-on-crash flows.
 - **app/scraper/telemetry.py**: Lightweight telemetry writer producing per-run JSON files and helpers for locating the latest run and pruning exports.
 - **app/scraper/export_excel.py**: Builds Excel workbooks from telemetry JSON for download via the API.
+- **app/scraper/db_reporting.py**: Read-only helpers for querying runs and downloads from SQLite to support DB-backed reporting.
 
 ## Current Scrape Workflow
 1. **UI submission**: `app/main.py` renders forms and reads user input (base URL, waits, limits, resume options). On submit, it saves defaults, optionally resets state, and starts a background thread that calls `run_scrape` with the collected parameters.
@@ -34,8 +35,8 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 
 ## SQLite usage (logging by default)
 - **CSV sync**: Each run syncs `judgments.csv` via `csv_sync.sync_csv`, recording a `csv_versions` row and upserting `cases`.
-- **Runs table**: `run_scrape` now inserts into `runs` with trigger, mode, parameters, and the CSV version used. Completion and failures are marked at the end of the run.
-- **Downloads table**: Per-case attempts are logged during scraping with statuses (`pending`, `in_progress`, `downloaded`, `skipped`, `failed`), attempt counts, timestamps, optional file info, and error details.
+- **Runs table**: `run_scrape` now inserts into `runs` with trigger, mode, parameters, and the CSV version used. Completion and failures are marked at the end of the run. `db_reporting.get_latest_run_id` and `get_run_summary` provide read-only access for reporting APIs.
+- **Downloads table**: Per-case attempts are logged during scraping with statuses (`pending`, `in_progress`, `downloaded`, `skipped`, `failed`), attempt counts, timestamps, optional file info, and error details. `/api/db/downloaded-cases` reads from this table to offer DataTables-compatible payloads without touching the legacy JSON files.
 - **Case index backend**: The scraper still builds its in-memory case index from the CSV by default. Setting `BAILIIKC_USE_DB_CASES=1` makes `cases_index` load from the SQLite `cases` table instead; this mode is intended for validation and should be behaviourally identical to the CSV path.
 - **Behaviour**: JSON files remain the source of truth for scraper control/resume. SQLite is write-only for observability in the current implementation except when explicitly opted into the DB-backed case index.
 

@@ -1434,6 +1434,8 @@ def _run_scrape_attempt(
                                             summary["failed"] = max(0, summary["failed"] - 1)
                                             break
 
+                            disk_full_encountered = False
+
                             if result == "downloaded":
                                 summary["downloaded"] += 1
                                 consecutive_existing = 0
@@ -1475,8 +1477,7 @@ def _run_scrape_attempt(
                                 _bump_reason(summary["skip_reasons"], "in_run_dup")
                             elif result == "disk_full":
                                 summary.setdefault("stop_reason", "disk_full")
-                                active = False
-                                return
+                                disk_full_encountered = True
 
                             status_for_db: Optional[str] = None
                             error_code: Optional[str] = None
@@ -1507,6 +1508,10 @@ def _run_scrape_attempt(
                                     error_code=error_code,
                                     error_message=error_message,
                                 )
+
+                            if disk_full_encountered:
+                                active = False
+                                return
 
                             page_hint = case_context.get("page_index") if case_context else None
                             row_hint = case_context.get("row_index") if case_context else None

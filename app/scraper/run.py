@@ -43,13 +43,14 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-from . import config
+from . import config, csv_sync, db
 from .config import is_full_mode, is_new_mode
 from .cases_index import (
     CASES_BY_ACTION,
     load_cases_from_csv as load_cases_index,
     normalize_action_token,
 )
+from .csv_sync import normalize_action_token as normalize_action_token_db
 from .state import clear_checkpoint, derive_checkpoint_from_logs, load_checkpoint, save_checkpoint
 from .telemetry import RunTelemetry
 from .utils import (
@@ -81,6 +82,21 @@ UA = (
 
 
 RESTART_BACKOFF_SECONDS = [5, 15, 45]
+
+
+def _now_iso() -> str:
+    """Return the current UTC time formatted for DB logging."""
+
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _short_error_message(exc: Exception, max_length: int = 200) -> str:
+    """Return a truncated string representation of ``exc`` for DB logging."""
+
+    message = str(exc)
+    if len(message) > max_length:
+        return message[: max_length - 3] + "..."
+    return message
 
 
 class Checkpoint:
@@ -617,24 +633,31 @@ def handle_dl_bfile_from_ajax(
     http_client: Optional[Any] = None,
     case_context: Optional[Dict[str, Any]] = None,
     fid: Optional[str] = None,
-) -> str:
+) -> tuple[str, Dict[str, Any]]:
     """Process a dl_bfile AJAX response using explicit mode and dedupe semantics."""
 
     norm_fname = normalize_action_token(fname)
     display_name = fname or norm_fname
     canonical_token = canon_fname(fname)
+    download_details: Dict[str, Any] = {
+        "slug": None,
+        "box_url": box_url,
+        "file_path": None,
+        "file_size_bytes": None,
+        "error_message": None,
+    }
     if not norm_fname:
         log_line(
             f"[AJAX][WARN] Unable to normalise fname token '{display_name}'; skipping."
         )
-        return "failed"
+        return "failed", {**download_details, "error_message": "invalid_token"}
 
     if processed_this_run is not None and canonical_token:
         if canonical_token in processed_this_run:
             log_line(
                 f"[AJAX] fname {display_name} already processed earlier in this run; ignoring duplicate response."
             )
-            return "duplicate_in_run"
+            return "duplicate_in_run", {**download_details, "slug": norm_fname}
 
     case_row = case_context.get("case") if case_context else None
     if case_row is None:
@@ -658,6 +681,7 @@ def handle_dl_bfile_from_ajax(
             f"[AJAX][WARN] No case mapping found for fname={display_name}; proceeding generically."
         )
 
+    download_details["slug"] = slug
     downloads_dir = Path(downloads_dir).resolve()
     downloads_dir.mkdir(parents=True, exist_ok=True)
 
@@ -718,7 +742,7 @@ def handle_dl_bfile_from_ajax(
                 page_index=page_index_hint,
                 row_index=row_index_hint,
             )
-        return "existing_file"
+        return "existing_file", {**download_details, "file_path": str(final_path.name)}
 
     if is_new_mode(mode) and checkpoint is not None:
         processed_tokens = checkpoint.processed_tokens
@@ -726,7 +750,7 @@ def handle_dl_bfile_from_ajax(
             log_line(
                 f"[AJAX] {display_name} previously completed; skip in NEW mode."
             )
-            return "checkpoint_skip"
+            return "checkpoint_skip", download_details
 
     meta = metadata or {}
     meta_entry: Optional[Dict[str, Any]] = None
@@ -755,7 +779,7 @@ def handle_dl_bfile_from_ajax(
                 page_index=page_index_hint,
                 row_index=row_index_hint,
             )
-        return "existing_file"
+        return "existing_file", {**download_details, "file_path": str(pdf_path.name)}
 
     try:
         if pdf_path.exists() and pdf_path.stat().st_size > 0:
@@ -786,7 +810,7 @@ def handle_dl_bfile_from_ajax(
                     page_index=page_index_hint,
                     row_index=row_index_hint,
                 )
-            return "existing_file"
+            return "existing_file", {**download_details, "file_path": str(pdf_path.name)}
     except OSError:
         pass
 
@@ -794,7 +818,7 @@ def handle_dl_bfile_from_ajax(
         log_line(
             f"[AJAX][STOP] Insufficient disk space (<{config.MIN_FREE_MB} MB free); aborting before download."
         )
-        return "disk_full"
+        return "disk_full", {**download_details, "error_message": "disk_full"}
 
     success = False
     error: Optional[str] = None
@@ -832,7 +856,7 @@ def handle_dl_bfile_from_ajax(
             f"[AJAX] Download failed for {display_name} -> {final_path.name}: {error}"
         )
         final_path.unlink(missing_ok=True)
-        return "failed"
+        return "failed", {**download_details, "error_message": error or "unknown"}
 
     size_bytes = final_path.stat().st_size
     log_line(
@@ -890,7 +914,12 @@ def handle_dl_bfile_from_ajax(
             row_index=row_index_hint,
         )
 
-    return "downloaded"
+    return "downloaded", {
+        **download_details,
+        "file_path": saved_path_value,
+        "file_size_bytes": size_bytes,
+        "box_url": box_url,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1047,6 +1076,7 @@ def _run_scrape_attempt(
     resume_state: Optional[Dict[str, Any]] = None,
     limit_pages: Optional[List[int]] = None,
     row_limit_override: Optional[int] = None,
+    run_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Execute a scraping run with automatic restart/resume support."""
 
@@ -1098,6 +1128,84 @@ def _run_scrape_attempt(
         "skip_reasons": {},
         "fail_reasons": {},
     }
+
+    def _lookup_case_id(token_norm: str) -> Optional[int]:
+        if run_id is None or not token_norm:
+            return None
+        try:
+            return db.get_case_id_by_token_norm("unreported_judgments", token_norm)
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"[DB][WARN] Failed to resolve case id for token={token_norm}: {exc}")
+            return None
+
+    def _log_skip_status(case_id: Optional[int], reason: str) -> None:
+        if run_id is None or case_id is None:
+            return
+        try:
+            db.ensure_download_row(run_id, case_id)
+            db.update_download_status(
+                run_id=run_id,
+                case_id=case_id,
+                status="skipped",
+                attempt_count=0,
+                last_attempt_at=_now_iso(),
+                error_code=reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"[DB][WARN] Unable to record skip for case_id={case_id}: {exc}")
+
+    def _start_download_attempt(case_id: Optional[int], box_url: Optional[str]) -> Optional[int]:
+        if run_id is None or case_id is None:
+            return None
+        try:
+            row = db.ensure_download_row(run_id, case_id)
+            attempt = int(row["attempt_count"]) + 1
+            db.update_download_status(
+                run_id=run_id,
+                case_id=case_id,
+                status="in_progress",
+                attempt_count=attempt,
+                last_attempt_at=_now_iso(),
+                box_url_last=box_url,
+            )
+            return attempt
+        except Exception as exc:  # noqa: BLE001
+            log_line(
+                f"[DB][WARN] Unable to start download attempt for case_id={case_id}: {exc}"
+            )
+            return None
+
+    def _finish_download_attempt(
+        case_id: Optional[int],
+        status: str,
+        attempt_count: Optional[int],
+        *,
+        file_path: Optional[str] = None,
+        file_size_bytes: Optional[int] = None,
+        box_url_last: Optional[str] = None,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        if run_id is None or case_id is None:
+            return
+        attempts = attempt_count if attempt_count is not None else 0
+        try:
+            db.update_download_status(
+                run_id=run_id,
+                case_id=case_id,
+                status=status,
+                attempt_count=attempts,
+                last_attempt_at=_now_iso(),
+                file_path=file_path,
+                file_size_bytes=file_size_bytes,
+                box_url_last=box_url_last,
+                error_code=error_code,
+                error_message=error_message,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_line(
+                f"[DB][WARN] Unable to update download status for case_id={case_id}: {exc}"
+            )
 
     def _finalize_telemetry(payload: Dict[str, Any]) -> None:
         try:
@@ -1291,8 +1399,12 @@ def _run_scrape_attempt(
                                 case_context = dict(case_context)
                                 if fid_param:
                                     case_context.setdefault("fid", fid_param)
-
-                            result = handle_dl_bfile_from_ajax(
+                            db_token_norm = normalize_action_token_db(
+                                fname_param or norm_fname or ""
+                            )
+                            case_id = _lookup_case_id(db_token_norm)
+                            attempt_count_db = _start_download_attempt(case_id, box_url)
+                            result, download_info = handle_dl_bfile_from_ajax(
                                 mode=scrape_mode,
                                 fname=fname_param or norm_fname,
                                 box_url=box_url,
@@ -1359,6 +1471,36 @@ def _run_scrape_attempt(
                                 summary.setdefault("stop_reason", "disk_full")
                                 active = False
                                 return
+
+                            status_for_db: Optional[str] = None
+                            error_code: Optional[str] = None
+                            error_message = download_info.get("error_message") if isinstance(download_info, dict) else None
+                            file_path = download_info.get("file_path") if isinstance(download_info, dict) else None
+                            file_size_bytes = download_info.get("file_size_bytes") if isinstance(download_info, dict) else None
+                            box_url_last = download_info.get("box_url") if isinstance(download_info, dict) else box_url
+
+                            if result == "downloaded":
+                                status_for_db = "downloaded"
+                            elif result in {"existing_file", "checkpoint_skip", "duplicate_in_run"}:
+                                status_for_db = "skipped"
+                            elif result == "failed":
+                                status_for_db = "failed"
+                                error_code = "unknown"
+                            elif result == "disk_full":
+                                status_for_db = "failed"
+                                error_code = "disk_full"
+
+                            if status_for_db:
+                                _finish_download_attempt(
+                                    case_id,
+                                    status_for_db,
+                                    attempt_count_db if status_for_db != "skipped" else attempt_count_db or 0,
+                                    file_path=file_path,
+                                    file_size_bytes=file_size_bytes,
+                                    box_url_last=box_url_last,
+                                    error_code=error_code,
+                                    error_message=error_message,
+                                )
 
                             page_hint = case_context.get("page_index") if case_context else None
                             row_hint = case_context.get("row_index") if case_context else None
@@ -1632,12 +1774,15 @@ def _run_scrape_attempt(
 
                                 fname_key = normalize_action_token(fname_token or "")
                                 canonical_token = canon_fname(fname_token or fname_key)
+                                db_token_norm = normalize_action_token_db(fname_token or fname_key)
+                                case_id_for_logging = _lookup_case_id(db_token_norm)
                                 if not fname_key:
                                     log_line(
                                         f"[AJAX][WARN] Skipping button index {i} on page {page_number}: unable to normalise fname token."
                                     )
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
+                                    _log_skip_status(case_id_for_logging, "invalid_token")
                                     continue
 
                                 if (
@@ -1651,6 +1796,7 @@ def _run_scrape_attempt(
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     summary["skipped"] += 1
                                     _bump_reason(summary["skip_reasons"], "in_run_dup")
+                                    _log_skip_status(case_id_for_logging, "in_run_dup")
                                     continue
 
                                 dedupe_key = canonical_token or fname_key
@@ -1659,6 +1805,7 @@ def _run_scrape_attempt(
                                         f"[SKIP] Button for fname={fname_token} already clicked on page {page_number}; skipping duplicate element."
                                     )
                                     _bump_reason(summary["skip_reasons"], "in_run_dup")
+                                    _log_skip_status(case_id_for_logging, "in_run_dup")
                                     continue
 
                                 case_for_fname = CASES_BY_ACTION.get(fname_key)
@@ -1670,6 +1817,7 @@ def _run_scrape_attempt(
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     summary["skipped"] += 1
                                     _bump_reason(summary["skip_reasons"], "csv_miss")
+                                    _log_skip_status(case_id_for_logging, "csv_miss")
                                     continue
 
                                 metadata_entry = downloaded_index.get(fname_key)
@@ -1691,6 +1839,7 @@ def _run_scrape_attempt(
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     summary["skipped"] += 1
                                     _bump_reason(summary["skip_reasons"], "exists_ok")
+                                    _log_skip_status(case_id_for_logging, "exists_ok")
                                     if is_new_mode(scrape_mode):
                                         consecutive_existing += 1
                                         if (
@@ -1908,10 +2057,12 @@ def run_scrape(
     resume_index: Optional[int] = None,
     limit_pages: Optional[List[int]] = None,
     row_limit: Optional[int] = None,
+    trigger: str = "cli",
 ) -> Dict[str, Any]:
     """Public entrypoint that wraps the core scraper with retry support."""
 
     ensure_dirs()
+    db.initialize_schema()
     log_path = setup_run_logger()
 
     raw_mode = (scrape_mode or config.SCRAPE_MODE_DEFAULT).strip().lower()
@@ -1953,6 +2104,40 @@ def run_scrape(
             resume_state["button_index"] = resume_index
 
     next_start_message = start_message
+    run_id: Optional[int] = None
+
+    http_session = csv_sync.build_http_session()
+    sync_result = csv_sync.sync_csv(config.CSV_URL, session=http_session)
+    csv_version_id = sync_result.version_id
+
+    params_json = json.dumps(
+        {
+            "base_url": base_url,
+            "page_wait": page_wait,
+            "per_delay": per_delay,
+            "scrape_mode": mode,
+            "new_limit": row_limit,
+            "max_retries": retry_limit,
+            "resume": resume_enabled,
+            "resume_mode": resume_mode,
+            "resume_page": resume_page,
+            "resume_index": resume_index,
+            "limit_pages": limit_pages,
+            "row_limit": row_limit,
+        },
+        sort_keys=True,
+    )
+
+    mode_for_db = "resume" if resume_enabled and normalized_resume != "none" else mode
+    try:
+        run_id = db.create_run(
+            trigger=trigger or "cli",
+            mode=mode_for_db,
+            csv_version_id=csv_version_id,
+            params_json=params_json,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log_line(f"[DB][WARN] Unable to create run record: {exc}")
 
     def _attempt() -> Dict[str, Any]:
         nonlocal next_start_message
@@ -1970,11 +2155,26 @@ def run_scrape(
             resume_state=resume_state,
             limit_pages=limit_pages,
             row_limit_override=row_limit,
+            run_id=run_id,
         )
         next_start_message = None
         return result
 
-    return run_with_retries(_attempt, max_retries=max(1, retry_limit))
+    try:
+        result = run_with_retries(_attempt, max_retries=max(1, retry_limit))
+        if run_id is not None:
+            try:
+                db.mark_run_completed(run_id)
+            except Exception as exc:  # noqa: BLE001
+                log_line(f"[DB][WARN] Unable to mark run completed: {exc}")
+        return result
+    except Exception as exc:  # noqa: BLE001
+        if run_id is not None:
+            try:
+                db.mark_run_failed(run_id, _short_error_message(exc))
+            except Exception as mark_exc:  # noqa: BLE001
+                log_line(f"[DB][WARN] Unable to mark run failed: {mark_exc}")
+        raise
 
 
 if __name__ == "__main__":  # pragma: no cover

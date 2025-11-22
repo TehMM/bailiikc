@@ -25,14 +25,18 @@ from .utils import log_line
 
 @dataclass
 class CsvSyncResult:
-    """Outcome of a CSV sync attempt."""
+    """Outcome of a CSV sync attempt.
+
+    ``csv_path`` and ``row_count`` describe the concrete CSV file that was
+    fetched and used to drive this version, so scraper runs can build their
+    case index from the exact payload recorded in ``csv_versions``.
+    """
 
     version_id: int
     is_new_version: bool
     new_case_ids: List[int]
     changed_case_ids: List[int]
     removed_case_ids: List[int]
-    # New in PR6 – the concrete CSV file used for this version, and how many rows it had.
     csv_path: str = ""
     row_count: int = 0
 

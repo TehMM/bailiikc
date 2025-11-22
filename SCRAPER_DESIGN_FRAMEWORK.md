@@ -390,7 +390,7 @@ def run_scrape(params: ScrapeParams) -> RunSummary:
     5. Commit and return RunSummary.
     """
 
-Current state: the legacy `run.py` integrates CSV sync + SQLite in a write-only fashion. The scraper still uses JSON/state files to decide which cases to process and how to resume, but every run now records a `runs` row and every per-case attempt updates `downloads` for observability.
+Current state: the legacy `run.py` integrates CSV sync + SQLite so that every run records a `runs` row and every per-case attempt updates `downloads` and `cases`. The scraper still uses JSON/state files to decide which cases to process and how to resume, but SQLite now also backs optional case indexing and reporting (via `db_case_index` and `db_reporting`), while JSON remains the primary control surface.
 
 
 Pseudocode:
@@ -687,9 +687,9 @@ POST /resume – Start a resume run with selected strategy.
 
 GET /report – Latest run summary + case list of successfully downloaded cases. By default this reads the legacy JSON logs; when ``BAILIIKC_USE_DB_REPORTING=1`` it instead pulls rows from SQLite via ``db_reporting`` while keeping the row shape identical (``actions_token``, ``title``, ``subject``, ``court``, ``category``, ``judgment_date``, ``sort_judgment_date``, ``cause_number``, ``downloaded_at``, ``saved_path``, ``filename``, ``size_kb``).
 
-GET /api/runs/latest, /api/downloaded-cases – JSON-backed endpoints used by the existing UI/report. ``/api/downloaded-cases`` switches to the DB path when ``BAILIIKC_USE_DB_REPORTING=1`` but still returns only downloaded rows.
+GET /api/runs/latest, /api/downloaded-cases – UI/reporting endpoints. ``/api/runs/latest`` is DB-backed via ``db_reporting`` (uses run summary + aggregated download stats). ``/api/downloaded-cases`` reads legacy JSON by default but switches to the DB path when ``BAILIIKC_USE_DB_REPORTING=1`` while still returning only downloaded rows.
 
-GET /api/db/runs/latest, /api/db/downloaded-cases – SQLite-backed reporting endpoints powered by ``db_reporting`` helpers. These remain available explicitly; ``/api/runs/latest`` continues to serve telemetry JSON regardless of the flag.
+GET /api/db/runs/latest, /api/db/downloaded-cases – SQLite-backed reporting endpoints powered by ``db_reporting`` helpers. These remain available explicitly; ``/api/db/runs/latest`` is a raw summary row view without aggregates.
 
 10.2 Webhook (ChangeDetection.io)
 

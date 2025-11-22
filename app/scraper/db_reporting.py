@@ -46,6 +46,54 @@ def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
 
 
 
+
+def get_run_download_stats(run_id: int) -> Dict[str, int]:
+    """Return aggregate download counts for a given run.
+
+    The keys are:
+
+    - "total": total downloads rows for this run (all statuses)
+    - "downloaded": number of rows with status="downloaded"
+    - "failed": number of rows with status="failed"
+    - "skipped": number of rows with status="skipped"
+    - "pending": number of rows with status="pending"
+    - "in_progress": number of rows with status="in_progress"
+
+    Additional statuses (if present) are counted only toward "total". This is
+    used to back ``/api/runs/latest`` and any UI that shows run-level summary
+    stats.
+    """
+
+    conn = db.get_connection()
+    cursor = conn.execute(
+        """
+        SELECT status, COUNT(*) AS count
+        FROM downloads
+        WHERE run_id = ?
+        GROUP BY status
+        """,
+        (run_id,),
+    )
+
+    totals: Dict[str, int] = {
+        "total": 0,
+        "downloaded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "pending": 0,
+        "in_progress": 0,
+    }
+
+    for row in cursor.fetchall():
+        status = row["status"]
+        count = int(row["count"])
+        totals["total"] += count
+        if status in totals:
+            totals[status] += count
+
+    return totals
+
+
 def get_download_rows_for_run(
     run_id: Optional[int] = None, status_filter: Optional[str] = None
 ) -> List[Dict[str, Any]]:

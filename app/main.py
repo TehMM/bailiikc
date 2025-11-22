@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Generator
+from typing import Any, Dict, Generator
 
 from flask import (
     Flask,
@@ -25,7 +25,6 @@ from app.scraper import config, db, db_reporting
 from app.scraper.date_utils import sortable_date as _sortable_date
 from app.scraper.run import run_scrape
 from app.scraper.export_excel import export_latest_run_to_excel
-from app.scraper.telemetry import latest_run_json
 from app.scraper.utils import (
     build_zip,
     ensure_dirs,
@@ -527,11 +526,34 @@ def api_export_latest_xlsx() -> Response:
 
 @app.get("/api/runs/latest")
 def api_runs_latest() -> Response:
-    path = latest_run_json()
-    if not path:
+    """Return the latest run summary backed by SQLite aggregates."""
+
+    run_id = db_reporting.get_latest_run_id()
+    if run_id is None:
         return jsonify({"ok": False, "error": "no runs"}), 404
-    with open(path, "r", encoding="utf-8") as handle:
-        return Response(handle.read(), mimetype="application/json")
+
+    summary = db_reporting.get_run_summary(run_id)
+    if not summary:
+        return jsonify({"ok": False, "error": "no runs"}), 404
+
+    stats = db_reporting.get_run_download_stats(run_id)
+
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "run": {
+            "id": summary["id"],
+            "trigger": summary["trigger"],
+            "mode": summary["mode"],
+            "csv_version_id": summary["csv_version_id"],
+            "status": summary["status"],
+            "started_at": summary["started_at"],
+            "ended_at": summary["ended_at"],
+            "error_summary": summary["error_summary"],
+            "downloads": stats,
+        },
+    }
+
+    return jsonify(payload)
 
 
 @app.get("/api/metadata")

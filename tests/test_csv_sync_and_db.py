@@ -51,6 +51,9 @@ def test_csv_sync_populates_cases_and_versions(
 
     result = csv_sync.sync_csv("http://example.com/judgments.csv", session=session)
     assert result.version_id > 0
+    assert result.csv_path
+    assert Path(result.csv_path).is_file()
+    assert result.row_count > 0
 
     conn = db.get_connection()
     cursor = conn.execute("SELECT COUNT(*) AS cnt FROM csv_versions WHERE valid = 1")
@@ -61,6 +64,25 @@ def test_csv_sync_populates_cases_and_versions(
 
     case_id = db.get_case_id_by_token_norm("unreported_judgments", "FSD0151202511062025ATPLIFESCIENCE")
     assert case_id is not None
+
+
+def test_synced_csv_can_feed_cases_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_temp_paths(tmp_path, monkeypatch)
+    db.initialize_schema()
+
+    sample_csv = Path(__file__).parent / "data" / "judgments_sample.csv"
+    session = _DummySession(sample_csv.read_bytes())
+    sync_result = csv_sync.sync_csv("http://example.com/judgments.csv", session=session)
+
+    monkeypatch.delenv("BAILIIKC_USE_DB_CASES", raising=False)
+    cases_index.CASES_BY_ACTION.clear()
+    cases_index.AJAX_FNAME_INDEX.clear()
+    cases_index.CASES_ALL.clear()
+
+    cases_index.load_cases_from_csv(sync_result.csv_path)
+    assert cases_index.CASES_BY_ACTION
 
 
 def test_download_logging_helpers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

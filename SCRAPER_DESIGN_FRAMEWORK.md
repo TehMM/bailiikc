@@ -400,6 +400,10 @@ def run_scrape(params: ScrapeParams) -> RunSummary:
 
     csv_result = csv_sync.sync_csv(config.CSV_URL, http_session)
     version_id = csv_result.version_id
+    # The concrete CSV file path from sync_csv is reused to build the in-memory
+    # case index so the scrape operates on the exact payload recorded in
+    # ``csv_versions``. When DB-backed indices are enabled, the path is still
+    # captured for observability but lookup remains DB-driven.
 
     run_id = db.create_run(
         trigger=current_trigger(),      # 'ui', 'webhook', 'cli', ...

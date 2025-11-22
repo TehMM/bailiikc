@@ -379,6 +379,8 @@ def run_scrape(params: ScrapeParams) -> RunSummary:
     5. Commit and return RunSummary.
     """
 
+Current state (PR2): the legacy `run.py` integrates CSV sync + SQLite in a write-only fashion. The scraper still uses JSON/state files to decide which cases to process and how to resume, but every run now records a `runs` row and every per-case attempt updates `downloads` for observability.
+
 
 Pseudocode:
 

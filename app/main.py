@@ -301,6 +301,7 @@ def start_scrape() -> Response:
                     resume_mode=resume_mode,
                     resume_page=resume_page,
                     resume_index=resume_index,
+                    trigger="ui",
                 )
                 app.config["LAST_SUMMARY"] = summary
                 app.config["CURRENT_LOG_FILE"] = summary.get("log_file")
@@ -345,6 +346,7 @@ def resume_scrape() -> Response:
                     resume_mode=resume_mode,
                     resume_page=resume_page,
                     resume_index=resume_index,
+                    trigger="ui",
                 )
                 app.config["LAST_SUMMARY"] = summary
                 app.config["CURRENT_LOG_FILE"] = summary.get("log_file")

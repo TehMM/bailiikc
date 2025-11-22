@@ -35,6 +35,7 @@ README.md
    python -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt
+   pip install -r requirements-dev.txt  # for tests
    ```
 2. **Ensure Chromium is available** locally (or run inside Docker with bundled Playwright dependencies).
 3. **Create the data directories** (the app will auto-create them when run):
@@ -47,6 +48,13 @@ README.md
    python main.py
    ```
 5. Open <http://localhost:8080> in your browser, adjust scrape settings, and start a run.
+
+### Tests and checks
+- Run bytecode compilation and unit tests locally:
+  ```bash
+  python -m compileall app main.py
+  pytest
+  ```
 
 ## Docker Usage
 Build and run the containerised app (Chromium included for Playwright):

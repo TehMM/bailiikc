@@ -1,7 +1,7 @@
-# Current Scraper Implementation (Pre-SQLite)
+# Current Scraper Implementation
 
 ## Overview
-The existing scraper targets the Cayman Islands Judicial website’s unreported judgments page. It pulls the published judgments CSV on each run, interprets the `Actions` column tokens, and drives a Playwright-based flow (with legacy Selenium helpers unused in the current path) that issues the official `dl_bfile` AJAX requests to Box.com. Downloads, metadata, and resume information are stored entirely on disk using JSON/CSV files; SQLite and the new CSV sync scaffolding exist but are not yet used by the live pipeline.
+The existing scraper targets the Cayman Islands Judicial website’s unreported judgments page. It pulls the published judgments CSV on each run, interprets the `Actions` column tokens, and drives a Playwright-based flow (with legacy Selenium helpers unused in the current path) that issues the official `dl_bfile` AJAX requests to Box.com. Downloads, metadata, and resume information remain stored on disk using JSON/CSV files; SQLite is now used in parallel for observability (CSV versioning, per-run records, and per-case download tracking) without changing scraper control flow.
 
 ## Key Modules
 - **app/main.py**: Flask web UI with forms for scrape/resume/reset actions, webhook endpoint, and routes for reports, exports, and file serving. Launches background scrape threads that call `run_scrape`.
@@ -31,6 +31,12 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 - **run_state.json**: Additional run progress tracking (written by `save_checkpoint`).
 - **last_summary.json**: Summary of the most recent run (counts, mode, log file path) for display in the UI.
 - **scrape_log.txt / scrape_*.log**: Human-readable scrape logs stored under `/app/data/logs`, tailed by the UI for live updates.
+
+## SQLite usage (logging only)
+- **CSV sync**: Each run syncs `judgments.csv` via `csv_sync.sync_csv`, recording a `csv_versions` row and upserting `cases`.
+- **Runs table**: `run_scrape` now inserts into `runs` with trigger, mode, parameters, and the CSV version used. Completion and failures are marked at the end of the run.
+- **Downloads table**: Per-case attempts are logged during scraping with statuses (`pending`, `in_progress`, `downloaded`, `skipped`, `failed`), attempt counts, timestamps, optional file info, and error details.
+- **Behaviour**: JSON files remain the source of truth for scraper control/resume. SQLite is write-only for observability in the current implementation.
 
 ## Known Limitations / Fragility
 - The judgments CSV is fetched fresh each run without caching/versioning; network hiccups can affect availability.

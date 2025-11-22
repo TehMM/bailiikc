@@ -145,7 +145,9 @@ def _get_download_rows_for_ui() -> list[dict[str, object]]:
     """Return download rows for the UI (report + JSON API)."""
 
     if use_db_reporting():
-        rows_from_db = db_reporting.get_download_rows_for_run()
+        rows_from_db = db_reporting.get_download_rows_for_run(
+            status_filter="downloaded"
+        )
         return [dict(row) for row in rows_from_db]
 
     records = _load_download_records()

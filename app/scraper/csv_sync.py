@@ -19,6 +19,7 @@ from typing import List, Optional
 import requests
 
 from . import config, db
+from .cases_index import normalize_action_token as normalize_action_token_cases
 from .utils import log_line
 
 
@@ -36,13 +37,11 @@ class CsvSyncResult:
 def normalize_action_token(token: str) -> str:
     """Normalise a raw 'Actions' token from the judgments CSV.
 
-    Strips whitespace, uppercases the token, and removes any character that is
-    not ``A-Z`` or ``0-9``. Keep this logic aligned with the design framework
-    and migrate data if the source format changes.
+    This delegates to :func:`cases_index.normalize_action_token` to ensure the
+    scraper and CSV sync share a single canonical implementation.
     """
 
-    token = (token or "").strip().upper()
-    return re.sub(r"[^A-Z0-9]+", "", token)
+    return normalize_action_token_cases(token)
 
 
 def parse_judgment_date(raw: str) -> str:

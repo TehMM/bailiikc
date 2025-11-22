@@ -634,7 +634,13 @@ def handle_dl_bfile_from_ajax(
     case_context: Optional[Dict[str, Any]] = None,
     fid: Optional[str] = None,
 ) -> tuple[str, Dict[str, Any]]:
-    """Process a dl_bfile AJAX response using explicit mode and dedupe semantics."""
+    """Process a dl_bfile AJAX response using explicit mode and dedupe semantics.
+
+    Returns a tuple of ``(result, details)`` where ``result`` is the legacy
+    status string (e.g. ``"downloaded"``, ``"existing_file"``, ``"failed"``)
+    and ``details`` is a dictionary containing keys such as ``slug``,
+    ``box_url``, ``file_path``, ``file_size_bytes``, and ``error_message``.
+    """
 
     norm_fname = normalize_action_token(fname)
     display_name = fname or norm_fname
@@ -2116,7 +2122,6 @@ def run_scrape(
             "page_wait": page_wait,
             "per_delay": per_delay,
             "scrape_mode": mode,
-            "new_limit": row_limit,
             "max_retries": retry_limit,
             "resume": resume_enabled,
             "resume_mode": resume_mode,

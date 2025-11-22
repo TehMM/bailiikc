@@ -23,7 +23,7 @@ from flask import (
     url_for,
 )
 
-from app.scraper import config, db
+from app.scraper import config, db, db_reporting
 from app.scraper.run import run_scrape
 from app.scraper.export_excel import export_latest_run_to_excel
 from app.scraper.telemetry import latest_run_json
@@ -486,6 +486,41 @@ def api_downloaded_cases() -> Response:
 
     records = _load_download_records()
     rows = _build_download_rows(records)
+    return jsonify({"data": rows})
+
+
+@app.get("/api/db/runs/latest")
+def api_db_runs_latest() -> Response:
+    """Return the latest run summary backed by SQLite."""
+
+    run_id = db_reporting.get_latest_run_id()
+    if run_id is None:
+        return jsonify({"ok": False, "error": "no runs"}), 404
+
+    summary = db_reporting.get_run_summary(run_id)
+    if not summary:
+        return jsonify({"ok": False, "error": "no runs"}), 404
+
+    return jsonify({"ok": True, "run": summary})
+
+
+@app.get("/api/db/downloaded-cases")
+def api_db_downloaded_cases() -> Response:
+    """Return downloaded cases using DB-backed reporting helpers."""
+
+    run_id_param = request.args.get("run_id")
+    status = request.args.get("status", "downloaded")
+
+    run_id: int | None
+    if run_id_param is None or run_id_param == "":
+        run_id = None
+    else:
+        try:
+            run_id = int(run_id_param)
+        except ValueError:
+            return jsonify({"ok": False, "error": "invalid run_id"}), 400
+
+    rows = db_reporting.get_download_rows_for_run(run_id=run_id, status_filter=status)
     return jsonify({"data": rows})
 
 

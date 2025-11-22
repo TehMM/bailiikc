@@ -680,9 +680,11 @@ POST /start – Start manual run.
 
 POST /resume – Start a resume run with selected strategy.
 
-GET /report – Latest run summary + case list (from DB, not JSON files).
+GET /report – Latest run summary + case list (currently sourced from JSON files; DB-backed reporting lives beside it for observability).
 
-GET /api/runs/latest, /api/downloaded-cases – DataTables-friendly JSON from DB.
+GET /api/runs/latest, /api/downloaded-cases – Legacy JSON-backed endpoints used by the existing UI/report.
+
+GET /api/db/runs/latest, /api/db/downloaded-cases – SQLite-backed reporting endpoints powered by ``db_reporting`` helpers. These are non-breaking additions intended to replace the JSON surfaces in a later PR.
 
 10.2 Webhook (ChangeDetection.io)
 

@@ -32,6 +32,9 @@ class CsvSyncResult:
     new_case_ids: List[int]
     changed_case_ids: List[int]
     removed_case_ids: List[int]
+    # New in PR6 – the concrete CSV file used for this version, and how many rows it had.
+    csv_path: str = ""
+    row_count: int = 0
 
 
 def normalize_action_token(token: str) -> str:
@@ -326,4 +329,6 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
         new_case_ids=new_case_ids,
         changed_case_ids=changed_case_ids,
         removed_case_ids=removed_case_ids,
+        csv_path=str(csv_path),
+        row_count=row_count,
     )

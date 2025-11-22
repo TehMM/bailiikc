@@ -19,7 +19,7 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 
 ## Current Scrape Workflow
 1. **UI submission**: `app/main.py` renders forms and reads user input (base URL, waits, limits, resume options). On submit, it saves defaults, optionally resets state, and starts a background thread that calls `run_scrape` with the collected parameters.
-2. **CSV load and case index**: `run.py` invokes `load_cases_index(config.CSV_URL)` to fetch and parse `judgments.csv`, populating global indices (`CASES_BY_ACTION`, etc.).
+2. **CSV load and case index**: `run.py` syncs `judgments.csv` via `csv_sync.sync_csv`, recording a `csv_versions` row plus a concrete CSV file path and row count. That path is then passed into `load_cases_index` so the in-memory indices (`CASES_BY_ACTION`, etc.) are built from the exact payload tied to the run. When `BAILIIKC_USE_DB_CASES=1`, the CSV path is still recorded for observability while the index is built from SQLite instead.
 3. **Playwright session**: The scraper launches Chromium, loads the target page, scrolls to trigger DataTables loading, and navigates through pages/rows. It monitors `admin-ajax.php` responses to capture `dl_bfile` payloads and Box URLs.
 4. **Download handling**: When a Box URL is observed, `handle_dl_bfile_from_ajax` streams the PDF (via Playwright’s `context.request`), writes files under `/app/data/pdfs`, updates in-memory metadata, and appends entries to `downloads.jsonl`. Filename fallbacks and duplicate checks rely on helpers from `utils.py`.
 5. **Resume/state**: `Checkpoint` objects inside `run.py`, plus `state.py` helpers and scrape logs, maintain progress (`state.json`, `run_state.json`, latest scrape log). Resume modes decide whether to reuse these checkpoints or restart.

@@ -1083,6 +1083,7 @@ def _run_scrape_attempt(
     limit_pages: Optional[List[int]] = None,
     row_limit_override: Optional[int] = None,
     run_id: Optional[int] = None,
+    csv_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute a scraping run with automatic restart/resume support."""
 
@@ -1112,7 +1113,8 @@ def _run_scrape_attempt(
     log_line(
         f"[CASES_INDEX] using {'db' if cases_index.should_use_db_index() else 'csv'} backend"
     )
-    load_cases_index(config.CSV_URL)
+    effective_csv_source = csv_source or config.CSV_URL
+    load_cases_index(effective_csv_source)
     meta = load_metadata()
     downloaded_index: Dict[str, Dict[str, Any]] = {}
     for entry in meta.get("downloads", []):
@@ -2123,6 +2125,7 @@ def run_scrape(
     http_session = csv_sync.build_http_session()
     sync_result = csv_sync.sync_csv(config.CSV_URL, session=http_session)
     csv_version_id = sync_result.version_id
+    csv_source = sync_result.csv_path or config.CSV_URL
 
     params_json = json.dumps(
         {
@@ -2169,6 +2172,7 @@ def run_scrape(
             limit_pages=limit_pages,
             row_limit_override=row_limit,
             run_id=run_id,
+            csv_source=csv_source,
         )
         next_start_message = None
         return result

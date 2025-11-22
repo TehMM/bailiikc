@@ -3,12 +3,10 @@ from __future__ import annotations
 import csv
 import io
 import os
-import re
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
-from typing import Generator, Iterable
+from typing import Generator
 
 from flask import (
     Flask,
@@ -24,6 +22,7 @@ from flask import (
 )
 
 from app.scraper import config, db, db_reporting
+from app.scraper.date_utils import sortable_date as _sortable_date
 from app.scraper.run import run_scrape
 from app.scraper.export_excel import export_latest_run_to_excel
 from app.scraper.telemetry import latest_run_json
@@ -49,8 +48,6 @@ ensure_dirs()
 db.initialize_schema()
 
 
-_DATE_FORMATS: Iterable[str] = ("%Y-%m-%d", "%Y-%b-%d", "%d/%m/%Y", "%d-%b-%Y")
-
 WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "true").strip().lower() == "true"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 WEBHOOK_COOLDOWN = int(os.environ.get("WEBHOOK_COOLDOWN_SEC", "300"))
@@ -58,23 +55,10 @@ WEBHOOK_FIRST_PAGE_LIMIT = int(os.environ.get("WEBHOOK_FIRST_PAGE_LIMIT", "50"))
 _last_webhook_ts = 0.0
 
 
-def _sortable_date(value: str) -> str:
-    """Return an ISO-like string suitable for sorting judgement dates."""
+def use_db_reporting() -> bool:
+    """Return True when DB-backed reporting endpoints should be used."""
 
-    candidate = (value or "").strip()
-    if not candidate:
-        return ""
-
-    for fmt in _DATE_FORMATS:
-        try:
-            return datetime.strptime(candidate, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-
-    digits = re.sub(r"[^0-9]", "", candidate)
-    if len(digits) >= 8:
-        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
-    return ""
+    return os.environ.get("BAILIIKC_USE_DB_REPORTING", "").strip() == "1"
 
 
 def _read_last_log_lines(limit: int = 150) -> list[str]:
@@ -155,6 +139,19 @@ def _load_download_records() -> list[dict[str, object]]:
     ensure_dirs()
     records = load_json_lines(config.DOWNLOADS_LOG)
     return records
+
+
+def _get_download_rows_for_ui() -> list[dict[str, object]]:
+    """Return download rows for the UI (report + JSON API)."""
+
+    if use_db_reporting():
+        rows_from_db = db_reporting.get_download_rows_for_run(
+            status_filter="downloaded"
+        )
+        return [dict(row) for row in rows_from_db]
+
+    records = _load_download_records()
+    return _build_download_rows(records)
 
 
 def _build_download_rows(records: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -376,8 +373,7 @@ def report() -> str:
     """Render the report page with current metadata and live logs."""
 
     ensure_dirs()
-    records = _load_download_records()
-    downloads = _build_download_rows(records)
+    downloads = _get_download_rows_for_ui()
     courts = sorted({row["court"] for row in downloads if row["court"]})
     categories = sorted({row["category"] for row in downloads if row["category"]})
 
@@ -484,8 +480,7 @@ def webhook_changedetection() -> Response:
 def api_downloaded_cases() -> Response:
     """Return the downloaded cases in a JSON payload suitable for DataTables."""
 
-    records = _load_download_records()
-    rows = _build_download_rows(records)
+    rows = _get_download_rows_for_ui()
     return jsonify({"data": rows})
 
 

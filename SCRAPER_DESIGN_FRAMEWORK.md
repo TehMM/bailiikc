@@ -680,11 +680,11 @@ POST /start – Start manual run.
 
 POST /resume – Start a resume run with selected strategy.
 
-GET /report – Latest run summary + case list (currently sourced from JSON files; DB-backed reporting lives beside it for observability).
+GET /report – Latest run summary + case list of successfully downloaded cases. By default this reads the legacy JSON logs; when ``BAILIIKC_USE_DB_REPORTING=1`` it instead pulls rows from SQLite via ``db_reporting`` while keeping the row shape identical (``actions_token``, ``title``, ``subject``, ``court``, ``category``, ``judgment_date``, ``sort_judgment_date``, ``cause_number``, ``downloaded_at``, ``saved_path``, ``filename``, ``size_kb``).
 
-GET /api/runs/latest, /api/downloaded-cases – Legacy JSON-backed endpoints used by the existing UI/report.
+GET /api/runs/latest, /api/downloaded-cases – JSON-backed endpoints used by the existing UI/report. ``/api/downloaded-cases`` switches to the DB path when ``BAILIIKC_USE_DB_REPORTING=1`` but still returns only downloaded rows.
 
-GET /api/db/runs/latest, /api/db/downloaded-cases – SQLite-backed reporting endpoints powered by ``db_reporting`` helpers. These are non-breaking additions intended to replace the JSON surfaces in a later PR.
+GET /api/db/runs/latest, /api/db/downloaded-cases – SQLite-backed reporting endpoints powered by ``db_reporting`` helpers. These remain available explicitly; ``/api/runs/latest`` continues to serve telemetry JSON regardless of the flag.
 
 10.2 Webhook (ChangeDetection.io)
 

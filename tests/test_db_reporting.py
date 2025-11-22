@@ -127,6 +127,7 @@ def test_get_download_rows_for_run_basic(populated_runs_and_downloads_db: dict) 
         "downloaded_at",
         "saved_path",
         "filename",
+        "size_kb",
     }
 
     for row in rows:
@@ -142,6 +143,7 @@ def test_get_download_rows_for_run_status_filter(populated_runs_and_downloads_db
     rows = db_reporting.get_download_rows_for_run(run_id, status_filter="downloaded")
     assert rows
     assert all(row["saved_path"].endswith("example1.pdf") for row in rows)
+    assert rows[0]["size_kb"] == pytest.approx(1.0)
     assert len(rows) == 1
 
 
@@ -179,3 +181,4 @@ def test_get_download_rows_for_run_uses_latest_run_when_none(populated_runs_and_
     assert rows
     assert all("latest" in row["saved_path"] for row in rows)
     assert all(row["saved_path"].endswith("latest.pdf") for row in rows)
+    assert rows[0]["size_kb"] == pytest.approx(2.0)

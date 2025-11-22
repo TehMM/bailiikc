@@ -1,35 +1,11 @@
 from __future__ import annotations
 
-import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import db
+from .date_utils import sortable_date
 from .utils import log_line
-
-
-_DATE_FORMATS = ("%Y-%m-%d", "%Y-%b-%d", "%d/%m/%Y", "%d-%b-%Y")
-
-
-def _sortable_date(value: str) -> str:
-    """Return an ISO-like string suitable for sorting judgement dates."""
-
-    candidate = (value or "").strip()
-    if not candidate:
-        return ""
-
-    for fmt in _DATE_FORMATS:
-        try:
-            return datetime.strptime(candidate, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-
-    digits = re.sub(r"[^0-9]", "", candidate)
-    if len(digits) >= 8:
-        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
-    return ""
-
 
 
 def get_latest_run_id() -> Optional[int]:
@@ -88,6 +64,7 @@ def get_download_rows_for_run(
             d.status,
             d.last_attempt_at,
             d.file_path,
+            d.file_size_bytes,
             d.box_url_last,
             c.action_token_raw,
             c.action_token_norm,
@@ -120,6 +97,14 @@ def get_download_rows_for_run(
         actions_token = row["action_token_norm"] or row["action_token_raw"] or ""
         title = row["title"] or actions_token or saved_path
         filename = Path(saved_path).name if saved_path else ""
+        file_size_bytes = row["file_size_bytes"]
+        if file_size_bytes:
+            try:
+                size_kb = round(file_size_bytes / 1024.0, 1)
+            except TypeError:
+                size_kb = 0
+        else:
+            size_kb = 0
 
         rows.append(
             {
@@ -129,11 +114,12 @@ def get_download_rows_for_run(
                 "court": row["court"] or "",
                 "category": row["category"] or "",
                 "judgment_date": judgment_date,
-                "sort_judgment_date": _sortable_date(str(judgment_date)),
+                "sort_judgment_date": sortable_date(str(judgment_date)),
                 "cause_number": row["cause_number"] or "",
                 "downloaded_at": row["last_attempt_at"] or "",
                 "saved_path": saved_path,
                 "filename": filename,
+                "size_kb": size_kb,
             }
         )
 

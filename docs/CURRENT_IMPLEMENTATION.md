@@ -5,7 +5,7 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 
 ## Key Modules
 - **app/main.py**: Flask web UI with forms for scrape/resume/reset actions, webhook endpoint, and routes for reports, exports, and file serving. Launches background scrape threads that call `run_scrape`.
-- **main.py (repo root)**: Thin entrypoint that ensures data directories exist and starts the Flask app (used by Railway/Docker).
+- **main.py (repo root)**: Thin entrypoint that imports `app.main` (which initialises directories and schema) and starts the Flask app; suitable for local development or generic hosting environments.
 - **app/scraper/config.py**: Central constants for data paths, URLs, defaults, and HTTP headers. Defines `/app/data` layout, scrape defaults, and helper predicates for mode detection.
 - **app/scraper/run.py**: Primary scraper engine using Playwright. Loads the judgments CSV, builds in-memory case indices, coordinates page navigation and AJAX monitoring, downloads PDFs, and writes metadata/logs/state. Contains checkpoint logic and resume handling.
 - **app/scraper/cases_index.py**: CSV loader and normaliser. Parses `Actions` tokens, builds `CASES_BY_ACTION`, `AJAX_FNAME_INDEX`, and `CASES_ALL` for lookup during scraping.

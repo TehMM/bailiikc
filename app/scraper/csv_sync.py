@@ -163,8 +163,9 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
     fetched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     latest = db.get_latest_valid_csv_version()
     is_new_version = not latest or latest["sha256"] != sha256
-    # NOTE: Even if ``is_new_version`` is False, we still parse and upsert all rows
-    # for now. Future optimisation may short-circuit when the hash is unchanged.
+    # NOTE: Even if ``is_new_version`` is False, we still parse and upsert all
+    # rows for now. Future optimisation may short-circuit when the hash is
+    # unchanged.
 
     csv_path = _save_csv_copy(content, sha256)
     rows: list[dict[str, str]] = []

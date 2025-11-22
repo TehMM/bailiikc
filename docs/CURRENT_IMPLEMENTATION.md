@@ -1,7 +1,7 @@
 # Current Scraper Implementation (Pre-SQLite)
 
 ## Overview
-The existing scraper targets the Cayman Islands Judicial website’s unreported judgments page. It pulls the published judgments CSV on each run, interprets the `Actions` column tokens, and drives Selenium/Playwright flows that issue the official `dl_bfile` AJAX requests to Box.com. Downloads, metadata, and resume information are stored entirely on disk using JSON/CSV files; SQLite and the new CSV sync scaffolding exist but are not yet used by the live pipeline.
+The existing scraper targets the Cayman Islands Judicial website’s unreported judgments page. It pulls the published judgments CSV on each run, interprets the `Actions` column tokens, and drives a Playwright-based flow (with legacy Selenium helpers unused in the current path) that issues the official `dl_bfile` AJAX requests to Box.com. Downloads, metadata, and resume information are stored entirely on disk using JSON/CSV files; SQLite and the new CSV sync scaffolding exist but are not yet used by the live pipeline.
 
 ## Key Modules
 - **app/main.py**: Flask web UI with forms for scrape/resume/reset actions, webhook endpoint, and routes for reports, exports, and file serving. Launches background scrape threads that call `run_scrape`.

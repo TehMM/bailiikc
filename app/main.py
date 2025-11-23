@@ -531,6 +531,36 @@ def api_db_downloaded_cases_for_run(run_id: int) -> Response:
     return jsonify({"ok": True, "run_id": run_id, "count": len(rows), "downloads": rows})
 
 
+@app.get("/api/db/csv_versions/<int:version_id>/case-diff")
+def api_db_case_diff_for_csv_version(version_id: int) -> Response:
+    """Return new and removed cases for a given CSV version from SQLite."""
+
+    try:
+        diff = db_reporting.get_case_diff_for_csv_version(version_id)
+    except db_reporting.CsvVersionNotFoundError:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "csv_version_not_found",
+                    "csv_version_id": version_id,
+                }
+            ),
+            404,
+        )
+
+    return jsonify(
+        {
+            "ok": True,
+            "csv_version_id": diff["csv_version_id"],
+            "new_count": diff["new_count"],
+            "removed_count": diff["removed_count"],
+            "new_cases": diff["new_cases"],
+            "removed_cases": diff["removed_cases"],
+        }
+    )
+
+
 @app.get("/api/exports/latest.xlsx")
 def api_export_latest_xlsx() -> Response:
     path = export_latest_run_to_excel()

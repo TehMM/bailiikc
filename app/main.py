@@ -448,6 +448,7 @@ def _run_new_only_background() -> None:
                 limit_pages=[0],
                 row_limit=WEBHOOK_FIRST_PAGE_LIMIT,
                 start_message="[WEBHOOK] Triggered new-only scrape",
+                trigger="webhook",
             )
         except Exception as exc:  # noqa: BLE001
             log_line(f"[WEBHOOK] new-only run failed: {exc}")

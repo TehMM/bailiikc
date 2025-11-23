@@ -8,13 +8,23 @@ from typing import Optional
 
 import pandas as pd
 
-from .telemetry import EXPORTS_DIR, latest_run_json, prune_old_exports
+from .telemetry import EXPORTS_DIR, RUNS_DIR, prune_old_exports
+
+
+def _latest_run_json_path() -> Optional[str]:
+    if not os.path.isdir(RUNS_DIR):
+        return None
+
+    runs = sorted(
+        [os.path.join(RUNS_DIR, path) for path in os.listdir(RUNS_DIR) if path.endswith(".json")]
+    )
+    return runs[-1] if runs else None
 
 
 def export_latest_run_to_excel(dest_path: Optional[str] = None) -> str:
     """Create an Excel workbook from the most recent telemetry payload."""
 
-    run_path = latest_run_json()
+    run_path = _latest_run_json_path()
     if not run_path:
         raise FileNotFoundError("No run telemetry available to export")
 

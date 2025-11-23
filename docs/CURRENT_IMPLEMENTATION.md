@@ -13,7 +13,7 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 - **app/scraper/selenium_client.py**: Selenium utilities for nonce extraction and AJAX POST execution to retrieve Box URLs. Used by the legacy downloader path.
 - **app/scraper/utils.py**: Shared utilities: directory setup, logging configuration, filename sanitisation, PDF path building, metadata persistence, ZIP generation, JSON helpers, and duplicate detection.
 - **app/scraper/state.py**: Checkpoint persistence and derivation from logs (`state.json`, scrape log parsing) to support resume-on-crash flows.
-- **app/scraper/telemetry.py**: Lightweight telemetry writer producing per-run JSON files and helpers for locating the latest run and pruning exports.
+- **app/scraper/telemetry.py**: Lightweight telemetry writer producing per-run JSON files for Excel export plus pruning utilities for generated workbooks.
 - **app/scraper/export_excel.py**: Builds Excel workbooks from telemetry JSON for download via the API.
 - **app/scraper/db_reporting.py**: Read-only helpers for querying runs and downloads from SQLite to support DB-backed reporting.
 

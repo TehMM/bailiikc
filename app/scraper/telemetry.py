@@ -58,19 +58,6 @@ class RunTelemetry:
         return path
 
 
-def list_runs() -> List[str]:
-    if not os.path.isdir(RUNS_DIR):
-        return []
-    return sorted(
-        [os.path.join(RUNS_DIR, p) for p in os.listdir(RUNS_DIR) if p.endswith(".json")]
-    )
-
-
-def latest_run_json() -> Optional[str]:
-    runs = list_runs()
-    return runs[-1] if runs else None
-
-
 def prune_old_exports() -> None:
     files = sorted(
         [os.path.join(EXPORTS_DIR, p) for p in os.listdir(EXPORTS_DIR) if p.endswith(".xlsx")]
@@ -85,7 +72,5 @@ def prune_old_exports() -> None:
 
 __all__ = [
     "RunTelemetry",
-    "list_runs",
-    "latest_run_json",
     "prune_old_exports",
 ]

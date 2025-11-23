@@ -691,6 +691,109 @@ GET /api/runs/latest, /api/downloaded-cases – UI/reporting endpoints. ``/api/r
 
 GET /api/db/runs/latest, /api/db/downloaded-cases – SQLite-backed reporting endpoints powered by ``db_reporting`` helpers. These remain available explicitly; ``/api/db/runs/latest`` is a raw summary row view without aggregates.
 
+## Roadmap / PR Sequencing (DB, Reporting, Worklists)
+
+This section tracks the planned incremental steps from the current state
+towards a fully DB-first, worklist-driven scraper with RAG-friendly outputs.
+It MUST be kept up to date when plans change.
+
+- **PR13 – Run list API and csv_sync tidy-ups**
+  - Add `_parse_judgment_date` logging for unparsed date formats.
+  - Implement `db_reporting.list_recent_runs(limit)` and `GET /api/db/runs`.
+  - Fix Known Limitations docs around CSV fetch vs versioning.
+
+- **PR14 – DB-backed `/report` and `/api/downloaded-cases` behind flag**
+  - Make the DB reporting path for `/report` and `/api/downloaded-cases` fully
+    supported behind `BAILIIKC_USE_DB_REPORTING=1`.
+  - Add tests to ensure JSON vs DB-backed reporting produce compatible shapes.
+
+- **PR15 – JSON↔DB consistency checker (diagnostic only)**
+  - Add helper(s) to cross-check JSON logs against SQLite for a given run.
+  - Provide a CLI or dev-only API to surface diffs and build confidence in
+    DB-backed reporting and control flow.
+
+- **PR16 – DB-only worklist planner (no wiring yet)**
+  - Implement `worklist` helpers that derive which cases to process for a run
+    from `csv_versions` and `cases` only (`mode="full"`, `"new"`, `"resume"`).
+  - Keep this isolated from `run.py` initially and cover it with unit tests.
+
+- **PR17 – Wire new-only mode to DB worklist behind a flag**
+  - For `scrape_mode="new"` and `BAILIIKC_USE_DB_WORKLIST_FOR_NEW=1`, drive
+    scraping from the DB worklist rather than legacy JSON control flow.
+  - Maintain JSON logs for backward compatibility.
+
+- **PR18 – Wire full mode to DB worklist behind a flag**
+  - Extend the worklist-driven control flow to `mode="full"` behind
+    `BAILIIKC_USE_DB_WORKLIST_FOR_FULL=1`.
+  - Preserve the legacy path as an opt-out.
+
+- **PR19 – DB-first resume semantics**
+  - Formalise and implement resume semantics using `runs` and `downloads`
+    status/error codes.
+  - Integrate with the worklist builder for `mode="resume"`.
+
+- **PR20 – Promote DB worklists and reporting to default**
+  - Enable DB worklists and DB reporting by default, keeping legacy JSON as an
+    emergency fallback only.
+  - Update docs to reflect DB-first architecture.
+
+- **PR21+ – public-registers and RAG pipeline**
+  - Extend CSV sync and case indexing to `public-registers` as a second
+    source.
+  - Design and expose AI/RAG-oriented export endpoints and (optionally)
+    text extraction staging hooks.
+
+## Scraper Hardening Roadmap (Playwright, Box, Robustness)
+
+This section tracks planned work specifically on the scraping mechanism
+(Playwright, Box dl_bfile requests, retries, timeouts, observability). It
+complements the DB/worklist roadmap above.
+
+- **PR-S1 – Instrument the current scraper without changing behaviour**
+  - Add structured logging in `run.py` and the Playwright client for per-run
+    and per-case phases (navigation, table detection, dl_bfile request,
+    response handling).
+  - Ensure these logs feed into run telemetry JSON and the `runs`/`downloads`
+    tables where appropriate, gated by a debug flag (e.g.
+    `BAILIIKC_DEBUG_SCRAPER`).
+
+- **PR-S2 – Isolate Box/AJAX interaction into a `box_client` abstraction**
+  - Extract the dl_bfile request/response logic into a dedicated module
+    (`box_client`) with a small `BoxDownloadResult` dataclass.
+  - Make `run.py` and the Playwright client call this abstraction rather than
+    inlining request construction/parsing.
+
+- **PR-S3 – Explicit per-case state machine**
+  - Introduce a `CaseDownloadState` helper that tracks the lifecycle of a
+    case (`PENDING`, `REQUESTING`, `DOWNLOADED`, `FAILED_RETRYABLE`,
+    `FAILED_PERMANENT`, etc.) and enforces valid transitions.
+  - Ensure all updates to `downloads.status` and related fields go through
+    this state machine.
+
+- **PR-S4 – Centralised retry/backoff policy**
+  - Define a mapping from `error_code` / HTTP status to retry behaviour
+    (retryable vs permanent failure, max attempts).
+  - Implement a `decide_retry(error_code, attempt)` helper and integrate it
+    into the case processing loop.
+
+- **PR-S5 – Timeouts, page lifecycle, and Playwright robustness**
+  - Add explicit, configurable timeouts for navigation, selectors, and
+    downloads.
+  - Wrap Playwright usage in helpers that ensure proper cleanup and clear
+    error reporting when pages/timeouts misbehave.
+
+- **PR-S6 – Concurrency and resource controls (if needed)**
+  - Decide on and enforce a concurrency model (possibly single-threaded with
+    explicit caps), ensuring we never overload the upstream site or our own
+    process.
+  - Add configuration knobs and guards for maximum parallel downloads.
+
+- **PR-S7 – Offline replay harness for scraper logic**
+  - Introduce a "replay mode" that can drive the scraper from captured HTML
+    and Box response fixtures.
+  - Use this to regression-test scraper behaviour without requiring live
+    access to the judicial website.
+
 10.2 Webhook (ChangeDetection.io)
 
 POST /webhook/changedetection:

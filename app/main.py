@@ -22,6 +22,7 @@ from flask import (
 )
 
 from app.scraper import config, db, db_reporting
+from app.scraper.db_reporting import CsvVersionNotFoundError
 from app.scraper.date_utils import sortable_date as _sortable_date
 from app.scraper.run import run_scrape
 from app.scraper.export_excel import export_latest_run_to_excel
@@ -529,6 +530,36 @@ def api_db_downloaded_cases_for_run(run_id: int) -> Response:
         return jsonify({"ok": False, "error": "run_not_found", "run_id": run_id}), 404
 
     return jsonify({"ok": True, "run_id": run_id, "count": len(rows), "downloads": rows})
+
+
+@app.get("/api/db/csv_versions/<int:version_id>/case-diff")
+def api_db_case_diff_for_csv_version(version_id: int) -> Response:
+    """Return new and removed cases for a given CSV version from SQLite."""
+
+    try:
+        diff = db_reporting.get_case_diff_for_csv_version(version_id)
+    except CsvVersionNotFoundError:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "csv_version_not_found",
+                    "csv_version_id": version_id,
+                }
+            ),
+            404,
+        )
+
+    return jsonify(
+        {
+            "ok": True,
+            "csv_version_id": diff["csv_version_id"],
+            "new_count": diff["new_count"],
+            "removed_count": diff["removed_count"],
+            "new_cases": diff["new_cases"],
+            "removed_cases": diff["removed_cases"],
+        }
+    )
 
 
 @app.get("/api/exports/latest.xlsx")

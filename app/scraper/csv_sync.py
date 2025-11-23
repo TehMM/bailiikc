@@ -1,8 +1,11 @@
 """CSV sync utilities for the judgments index.
 
-This module is aligned with the SCRAPER_DESIGN_FRAMEWORK and remains
-unconnected to the live scraper for now. It can fetch the remote judgments CSV,
-record versions in SQLite, and upsert case metadata for future runs.
+This module is aligned with the SCRAPER_DESIGN_FRAMEWORK and is used by the
+live scraper to fetch the remote judgments CSV, record ``csv_versions`` rows,
+and upsert case metadata into the SQLite ``cases`` table. ``sync_csv`` returns
+the concrete CSV file path and row count so scraper runs can build their
+in-memory index from the exact payload recorded in the database (with
+``BAILIIKC_USE_DB_CASES`` enabling an optional DB-backed index).
 """
 from __future__ import annotations
 

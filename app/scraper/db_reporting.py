@@ -21,6 +21,10 @@ class RunNotFoundError(Exception):
     """Raised when a requested run identifier does not exist."""
 
 
+class CsvVersionNotFoundError(Exception):
+    """Raised when a requested CSV version does not exist or is invalid."""
+
+
 
 def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
     """Return a summary dict for the given run_id, or None if not found."""
@@ -222,3 +226,86 @@ def get_download_rows_for_run(
         )
 
     return rows
+
+
+def get_case_diff_for_csv_version(version_id: int) -> Dict[str, Any]:
+    """Return new and removed cases for the given CSV version.
+
+    The result is derived solely from the ``cases`` table invariants:
+
+    - New: cases where ``first_seen_version_id == version_id``.
+    - Removed: cases where ``last_seen_version_id == version_id`` and
+      ``is_active == 0``.
+
+    Only ``source = 'unreported_judgments'`` rows are included.
+    """
+
+    conn = db.get_connection()
+
+    cursor = conn.execute(
+        "SELECT id, valid FROM csv_versions WHERE id = ? LIMIT 1", (version_id,)
+    )
+    row = cursor.fetchone()
+    if row is None or int(row["valid"]) == 0:
+        raise CsvVersionNotFoundError(
+            f"CSV version {version_id} not found or invalid"
+        )
+
+    new_cursor = conn.execute(
+        """
+        SELECT
+            id,
+            action_token_norm,
+            title,
+            cause_number,
+            court,
+            category,
+            judgment_date,
+            is_criminal,
+            is_active,
+            source,
+            first_seen_version_id,
+            last_seen_version_id
+        FROM cases
+        WHERE source = 'unreported_judgments'
+          AND first_seen_version_id = ?
+        ORDER BY id ASC
+        """,
+        (version_id,),
+    )
+    new_columns = [col[0] for col in new_cursor.description]
+    new_cases = [dict(zip(new_columns, row)) for row in new_cursor.fetchall()]
+
+    removed_cursor = conn.execute(
+        """
+        SELECT
+            id,
+            action_token_norm,
+            title,
+            cause_number,
+            court,
+            category,
+            judgment_date,
+            is_criminal,
+            is_active,
+            source,
+            first_seen_version_id,
+            last_seen_version_id
+        FROM cases
+        WHERE source = 'unreported_judgments'
+          AND last_seen_version_id = ?
+          AND is_active = 0
+        ORDER BY id ASC
+        """,
+        (version_id,),
+    )
+    removed_columns = [col[0] for col in removed_cursor.description]
+    removed_cases = [dict(zip(removed_columns, row)) for row in removed_cursor.fetchall()]
+
+    return {
+        "csv_version_id": version_id,
+        "new_cases": new_cases,
+        "removed_cases": removed_cases,
+        "new_count": len(new_cases),
+        "removed_count": len(removed_cases),
+    }

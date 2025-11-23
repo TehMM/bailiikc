@@ -484,6 +484,21 @@ def api_downloaded_cases() -> Response:
     return jsonify({"data": rows})
 
 
+@app.get("/api/db/runs")
+def api_db_runs_list() -> Response:
+    """Return recent runs from SQLite as a JSON array."""
+
+    raw_limit = request.args.get("limit", type=int)
+    if raw_limit is None:
+        limit = 20
+    else:
+        limit = max(1, min(raw_limit, 200))
+
+    runs = db_reporting.list_recent_runs(limit)
+
+    return jsonify({"ok": True, "count": len(runs), "runs": runs})
+
+
 @app.get("/api/db/runs/latest")
 def api_db_runs_latest() -> Response:
     """Return the latest run summary backed by SQLite."""

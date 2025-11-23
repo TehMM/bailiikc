@@ -53,6 +53,41 @@ def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
     }
 
 
+def list_recent_runs(limit: int = 20) -> List[Dict[str, Any]]:
+    """Return up to ``limit`` most recent runs ordered by ``started_at`` DESC."""
+
+    if limit <= 0:
+        return []
+
+    limit = min(limit, 200)
+
+    conn = db.get_connection()
+    cursor = conn.execute(
+        """
+        SELECT id, trigger, mode, csv_version_id, status, started_at, ended_at, error_summary
+        FROM runs
+        ORDER BY started_at DESC, id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+    rows = cursor.fetchall()
+    return [
+        {
+            "id": row["id"],
+            "trigger": row["trigger"],
+            "mode": row["mode"],
+            "csv_version_id": row["csv_version_id"],
+            "status": row["status"],
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+            "error_summary": row["error_summary"],
+        }
+        for row in rows
+    ]
+
+
 
 def get_downloaded_cases_for_run(run_id: int) -> List[Dict[str, Any]]:
     """Return successfully downloaded cases for the provided run identifier."""

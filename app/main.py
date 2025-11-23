@@ -22,7 +22,6 @@ from flask import (
 )
 
 from app.scraper import config, db, db_reporting
-from app.scraper.db_reporting import CsvVersionNotFoundError
 from app.scraper.date_utils import sortable_date as _sortable_date
 from app.scraper.run import run_scrape
 from app.scraper.export_excel import export_latest_run_to_excel
@@ -538,7 +537,7 @@ def api_db_case_diff_for_csv_version(version_id: int) -> Response:
 
     try:
         diff = db_reporting.get_case_diff_for_csv_version(version_id)
-    except CsvVersionNotFoundError:
+    except db_reporting.CsvVersionNotFoundError:
         return (
             jsonify(
                 {

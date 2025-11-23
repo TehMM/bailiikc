@@ -17,6 +17,10 @@ def get_latest_run_id() -> Optional[int]:
     return int(row["id"]) if row else None
 
 
+class RunNotFoundError(Exception):
+    """Raised when a requested run identifier does not exist."""
+
+
 
 def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
     """Return a summary dict for the given run_id, or None if not found."""
@@ -45,6 +49,52 @@ def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
     }
 
 
+
+def get_downloaded_cases_for_run(run_id: int) -> List[Dict[str, Any]]:
+    """Return successfully downloaded cases for the provided run identifier."""
+
+    conn = db.get_connection()
+
+    cursor = conn.execute("SELECT 1 FROM runs WHERE id = ? LIMIT 1", (run_id,))
+    if cursor.fetchone() is None:
+        raise RunNotFoundError(f"Run {run_id} not found")
+
+    cursor = conn.execute(
+        """
+        SELECT
+            d.id AS download_id,
+            d.run_id,
+            d.case_id,
+            d.status,
+            d.attempt_count,
+            d.last_attempt_at,
+            d.file_path,
+            d.file_size_bytes,
+            d.box_url_last,
+            d.error_code,
+            d.error_message,
+            d.created_at,
+            d.updated_at,
+            c.action_token_raw,
+            c.action_token_norm,
+            c.title,
+            c.cause_number,
+            c.court,
+            c.category,
+            c.judgment_date,
+            c.is_criminal,
+            c.source
+        FROM downloads d
+        JOIN cases c ON c.id = d.case_id
+        WHERE d.run_id = ?
+          AND d.status = 'downloaded'
+        ORDER BY d.id ASC
+        """,
+        (run_id,),
+    )
+
+    columns = [col[0] for col in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
 def get_run_download_stats(run_id: int) -> Dict[str, int]:

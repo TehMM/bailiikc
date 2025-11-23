@@ -14,9 +14,9 @@ from .telemetry import EXPORTS_DIR, RUNS_DIR, prune_old_exports
 def _latest_run_json_path() -> Optional[str]:
     """Return the most recent run telemetry JSON path, if any.
 
-    This inspects ``RUNS_DIR`` for ``*.json`` files and returns the last entry
-    in sorted order. This mirrors how run telemetry JSONs are written and is
-    used by the Excel export path to select the run to export.
+    This inspects ``RUNS_DIR`` for ``*.json`` files and returns the last
+    entry in sorted order. This mirrors how run telemetry JSONs are written
+    and is used by the Excel export path to select the run to export.
     """
 
     if not os.path.isdir(RUNS_DIR):

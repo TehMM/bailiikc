@@ -519,6 +519,18 @@ def api_db_downloaded_cases() -> Response:
     return jsonify({"data": rows})
 
 
+@app.get("/api/db/runs/<int:run_id>/downloaded-cases")
+def api_db_downloaded_cases_for_run(run_id: int) -> Response:
+    """Return downloaded cases for the given run_id from SQLite."""
+
+    try:
+        rows = db_reporting.get_downloaded_cases_for_run(run_id)
+    except db_reporting.RunNotFoundError:
+        return jsonify({"ok": False, "error": "run_not_found", "run_id": run_id}), 404
+
+    return jsonify({"ok": True, "run_id": run_id, "count": len(rows), "downloads": rows})
+
+
 @app.get("/api/exports/latest.xlsx")
 def api_export_latest_xlsx() -> Response:
     path = export_latest_run_to_excel()

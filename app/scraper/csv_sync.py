@@ -76,7 +76,14 @@ def parse_judgment_date(raw: str) -> str:
     digits = re.sub(r"[^0-9]", "", candidate)
     if len(digits) >= 8:
         return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
-    # TODO: consider logging or counting unparsed date formats for monitoring.
+
+    if candidate:
+        trimmed = candidate.strip()
+        if len(trimmed) > 64:
+            trimmed = trimmed[:61] + "..."
+        log_line(
+            f"[CSV][WARN] Unable to normalise judgment date {trimmed!r}; leaving as-is."
+        )
     return candidate
 
 

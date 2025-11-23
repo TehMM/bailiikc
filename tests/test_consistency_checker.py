@@ -150,3 +150,20 @@ def test_consistency_checker_flags_mismatch(tmp_path: Path, monkeypatch: pytest.
     mismatch_issues = {diff["issue_type"] for diff in report["case_diffs"]}
     assert "field_mismatch" in mismatch_issues
     assert any("title" in diff["details"] for diff in report["case_diffs"])
+
+
+def test_consistency_checker_errors_when_no_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_temp_paths(tmp_path, monkeypatch)
+    db.initialize_schema()
+
+    _seed_json_downloads(config.DOWNLOADS_LOG, title="Seed Title")
+
+    report = compare_latest_downloads_json_vs_db()
+
+    assert report["ok"] is False
+    assert report["db_count"] == 0
+    assert report["json_count"] == 1
+    assert any(
+        diff["issue_type"] == "missing_in_db" for diff in report["case_diffs"]
+    )
+    assert any("no latest run" in err.lower() for err in report["errors"])

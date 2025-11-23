@@ -92,14 +92,22 @@ def compare_latest_downloads_json_vs_db() -> Dict[str, Any]:
         errors.append(f"error loading JSON downloads: {exc}")
         json_rows = []
 
-    run_id = db_reporting.get_latest_run_id()
+    run_id: Optional[int] = None
     try:
-        db_rows = db_reporting.get_download_rows_for_run(
-            run_id=run_id, status_filter="downloaded"
-        )
+        run_id = db_reporting.get_latest_run_id()
     except Exception as exc:  # noqa: BLE001
-        errors.append(f"error loading DB downloads: {exc}")
-        db_rows = []
+        errors.append(f"error determining latest run id: {exc}")
+
+    db_rows: List[Dict[str, Any]] = []
+    if run_id is None:
+        errors.append("no latest run found in DB")
+    else:
+        try:
+            db_rows = db_reporting.get_download_rows_for_run(
+                run_id=run_id, status_filter="downloaded"
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"error loading DB downloads: {exc}")
 
     json_index = _build_index(json_rows, "json", errors)
     db_index = _build_index(db_rows, "db", errors)
@@ -149,7 +157,7 @@ def compare_latest_downloads_json_vs_db() -> Dict[str, Any]:
             case_diffs.append(diff)
 
     report = {
-        "ok": not case_diffs and len(json_rows) == len(db_rows),
+        "ok": not errors and not case_diffs and len(json_rows) == len(db_rows),
         "run_id": run_id,
         "json_count": len(json_rows),
         "db_count": len(db_rows),
@@ -168,12 +176,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Compare JSON-based and DB-based downloaded-cases views for the latest run."
     )
-    parser.add_argument(
-        "--latest",
-        action="store_true",
-        help="Compare for the latest run (default behaviour).",
-    )
-
     parser.parse_args()
 
     comparison = compare_latest_downloads_json_vs_db()

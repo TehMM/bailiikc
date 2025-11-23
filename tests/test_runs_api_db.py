@@ -59,8 +59,6 @@ def test_api_runs_latest_returns_db_backed_summary(tmp_path: Path, monkeypatch: 
 
     main = _reload_main_module()
 
-    db.initialize_schema()
-
     csv_version_id = db.record_csv_version(
         fetched_at="2024-01-01T00:00:00Z",
         source_url="http://example.com/csv",
@@ -126,7 +124,6 @@ def test_api_runs_latest_no_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.delenv("BAILIIKC_USE_DB_REPORTING", raising=False)
 
     main = _reload_main_module()
-    db.initialize_schema()
 
     client = main.app.test_client()
     response = client.get("/api/runs/latest")

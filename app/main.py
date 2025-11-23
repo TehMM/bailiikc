@@ -5,7 +5,6 @@ import io
 import os
 import threading
 import time
-from pathlib import Path
 from typing import Any, Dict, Generator
 
 from flask import (
@@ -22,7 +21,7 @@ from flask import (
 )
 
 from app.scraper import config, db, db_reporting
-from app.scraper.date_utils import sortable_date as _sortable_date
+from app.scraper.download_rows import build_download_rows, load_download_records
 from app.scraper.run import run_scrape
 from app.scraper.export_excel import export_latest_run_to_excel
 from app.scraper.utils import (
@@ -135,9 +134,7 @@ def _metadata_to_csv(meta: dict) -> str:
 def _load_download_records() -> list[dict[str, object]]:
     """Return download records sourced from ``downloads.jsonl``."""
 
-    ensure_dirs()
-    records = load_json_lines(config.DOWNLOADS_LOG)
-    return records
+    return load_download_records()
 
 
 def _get_download_rows_for_ui() -> list[dict[str, object]]:
@@ -150,41 +147,7 @@ def _get_download_rows_for_ui() -> list[dict[str, object]]:
         return [dict(row) for row in rows_from_db]
 
     records = _load_download_records()
-    return _build_download_rows(records)
-
-
-def _build_download_rows(records: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Build structured rows for the downloads table."""
-
-    rows: list[dict[str, object]] = []
-    for entry in records:
-        if not isinstance(entry, dict):
-            continue
-
-        saved_path = entry.get("saved_path") or ""
-        title = entry.get("title") or entry.get("subject") or saved_path
-        judgment_date = entry.get("judgment_date") or ""
-        actions_token = entry.get("actions_token") or ""
-
-        filename = Path(saved_path).name if saved_path else ""
-
-        rows.append(
-            {
-                "actions_token": actions_token,
-                "title": title,
-                "subject": entry.get("subject") or "",
-                "court": entry.get("court") or "",
-                "category": entry.get("category") or "",
-                "judgment_date": judgment_date,
-                "sort_judgment_date": _sortable_date(str(judgment_date)),
-                "cause_number": entry.get("cause_number") or "",
-                "downloaded_at": entry.get("downloaded_at") or "",
-                "saved_path": saved_path,
-                "filename": filename,
-                "size_kb": round((entry.get("bytes") or 0) / 1024, 1) if entry.get("bytes") else 0,
-            }
-        )
-    return rows
+    return build_download_rows(records)
 
 
 @app.route("/debug/unreported_judgments.png")

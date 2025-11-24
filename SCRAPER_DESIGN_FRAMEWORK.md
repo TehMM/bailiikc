@@ -129,6 +129,13 @@ Flask web app (existing app/main.py) calling the engine.
 
 CLI (argparse) entrypoint for ad hoc runs.
 
+Key Modules
+
+- **app/scraper/worklist.py**: DB-backed helpers for building per-run worklists
+  (lists of cases to process) from the SQLite ``cases``/``csv_versions``
+  tables. Currently provides full/new worklists only and is not yet wired into
+  the scraper control flow.
+
 3. Data Storage & Schema
 3.1 Directory Layout
 
@@ -713,9 +720,16 @@ It MUST be kept up to date when plans change.
     DB-backed reporting and control flow.
 
 - **PR16 – DB-only worklist planner (no wiring yet)**
-  - Implement `worklist` helpers that derive which cases to process for a run
-    from `csv_versions` and `cases` only (`mode="full"`, `"new"`, `"resume"`).
-  - Keep this isolated from `run.py` initially and cover it with unit tests.
+  - Implement `app.scraper.worklist` helpers that derive which cases to process
+    for a run from the SQLite `cases` table (scoped to a given `csv_version_id`
+    and `source`).
+  - Provide `build_full_worklist(...)` and `build_new_worklist(...)` plus a
+    dispatcher `build_worklist(mode, csv_version_id, source)`.
+  - Support `"full"` (all active, non-criminal cases for the version) and
+    `"new"` (cases where `first_seen_version_id == csv_version_id`) modes.
+  - Define a `"resume"` mode stub that raises `NotImplementedError` for now;
+    DB-backed resume semantics will be implemented in PR19.
+  - Keep this isolated from `run.py` and cover it with unit tests.
 
 - **PR17 – Wire new-only mode to DB worklist behind a flag**
   - For `scrape_mode="new"` and `BAILIIKC_USE_DB_WORKLIST_FOR_NEW=1`, drive

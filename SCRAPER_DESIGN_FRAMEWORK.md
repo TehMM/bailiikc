@@ -733,13 +733,20 @@ It MUST be kept up to date when plans change.
 
 - **PR17 – Wire new-only mode to DB worklist behind a flag**
   - For `scrape_mode="new"` and `BAILIIKC_USE_DB_WORKLIST_FOR_NEW=1`, drive
-    scraping from the DB worklist rather than legacy JSON control flow.
-  - Maintain JSON logs for backward compatibility.
+    scraping from the DB-backed worklist (`worklist.build_new_worklist`) instead
+    of the legacy CSV-only planner.
+  - Guarded by `config.use_db_worklist_for_new()`; when disabled, behaviour
+    matches the legacy CSV path.
+  - Covered by tests that monkeypatch the worklist builder and assert the
+    planner consumes the DB items.
 
 - **PR18 – Wire full mode to DB worklist behind a flag**
   - Extend the worklist-driven control flow to `mode="full"` behind
-    `BAILIIKC_USE_DB_WORKLIST_FOR_FULL=1`.
-  - Preserve the legacy path as an opt-out.
+    `BAILIIKC_USE_DB_WORKLIST_FOR_FULL=1`, using
+    `worklist.build_full_worklist(csv_version_id, source)`.
+  - Guarded by `config.use_db_worklist_for_full()`; legacy CSV behaviour is
+    preserved when the flag is off.
+  - Tests confirm the flag routing and worklist consumption.
 
 - **PR19 – DB-first resume semantics**
   - Formalise and implement resume semantics using `runs` and `downloads`

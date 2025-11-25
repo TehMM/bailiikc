@@ -51,6 +51,7 @@ from .cases_index import (
     normalize_action_token,
 )
 from .csv_sync import normalize_action_token as normalize_action_token_db
+from .logging_utils import _scraper_event
 from .state import clear_checkpoint, derive_checkpoint_from_logs, load_checkpoint, save_checkpoint
 from .telemetry import RunTelemetry
 from .utils import (
@@ -713,6 +714,7 @@ def handle_dl_bfile_from_ajax(
     http_client: Optional[Any] = None,
     case_context: Optional[Dict[str, Any]] = None,
     fid: Optional[str] = None,
+    run_id: Optional[int] = None,
 ) -> tuple[str, Dict[str, Any]]:
     """Process a dl_bfile AJAX response using explicit mode and dedupe semantics.
 
@@ -732,18 +734,34 @@ def handle_dl_bfile_from_ajax(
         "file_size_bytes": None,
         "error_message": None,
     }
+
+    def _return_result(result: str, details: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+        try:
+            raw_size = details.get("file_size_bytes") if isinstance(details, dict) else None
+            size_bytes = int(raw_size) if isinstance(raw_size, (int, float)) else 0
+        except Exception:
+            size_bytes = 0
+        _scraper_event(
+            "box",
+            token=norm_fname,
+            result=result,
+            run_id=run_id,
+            size_bytes=size_bytes,
+            error_message=details.get("error_message") if isinstance(details, dict) else None,
+        )
+        return result, details
     if not norm_fname:
         log_line(
             f"[AJAX][WARN] Unable to normalise fname token '{display_name}'; skipping."
         )
-        return "failed", {**download_details, "error_message": "invalid_token"}
+        return _return_result("failed", {**download_details, "error_message": "invalid_token"})
 
     if processed_this_run is not None and canonical_token:
         if canonical_token in processed_this_run:
             log_line(
                 f"[AJAX] fname {display_name} already processed earlier in this run; ignoring duplicate response."
             )
-            return "duplicate_in_run", {**download_details, "slug": norm_fname}
+            return _return_result("duplicate_in_run", {**download_details, "slug": norm_fname})
 
     case_row = case_context.get("case") if case_context else None
     if case_row is None:
@@ -828,7 +846,10 @@ def handle_dl_bfile_from_ajax(
                 page_index=page_index_hint,
                 row_index=row_index_hint,
             )
-        return "existing_file", {**download_details, "file_path": str(final_path.name)}
+        return _return_result(
+            "existing_file",
+            {**download_details, "file_path": str(final_path.name), "file_size_bytes": size_bytes},
+        )
 
     if is_new_mode(mode) and checkpoint is not None:
         processed_tokens = checkpoint.processed_tokens
@@ -836,7 +857,7 @@ def handle_dl_bfile_from_ajax(
             log_line(
                 f"[AJAX] {display_name} previously completed; skip in NEW mode."
             )
-            return "checkpoint_skip", download_details
+            return _return_result("checkpoint_skip", download_details)
 
     meta = metadata or {}
     meta_entry: Optional[Dict[str, Any]] = None
@@ -865,7 +886,10 @@ def handle_dl_bfile_from_ajax(
                 page_index=page_index_hint,
                 row_index=row_index_hint,
             )
-        return "existing_file", {**download_details, "file_path": str(pdf_path.name)}
+        return _return_result(
+            "existing_file",
+            {**download_details, "file_path": str(pdf_path.name), "file_size_bytes": pdf_path.stat().st_size},
+        )
 
     try:
         if pdf_path.exists() and pdf_path.stat().st_size > 0:
@@ -896,7 +920,10 @@ def handle_dl_bfile_from_ajax(
                     page_index=page_index_hint,
                     row_index=row_index_hint,
                 )
-            return "existing_file", {**download_details, "file_path": str(pdf_path.name)}
+            return _return_result(
+                "existing_file",
+                {**download_details, "file_path": str(pdf_path.name), "file_size_bytes": pdf_path.stat().st_size},
+            )
     except OSError:
         pass
 
@@ -904,7 +931,7 @@ def handle_dl_bfile_from_ajax(
         log_line(
             f"[AJAX][STOP] Insufficient disk space (<{config.MIN_FREE_MB} MB free); aborting before download."
         )
-        return "disk_full", {**download_details, "error_message": "disk_full"}
+        return _return_result("disk_full", {**download_details, "error_message": "disk_full"})
 
     success = False
     error: Optional[str] = None
@@ -944,7 +971,7 @@ def handle_dl_bfile_from_ajax(
             f"[AJAX] Download failed for {display_name} -> {final_path.name}: {error}"
         )
         final_path.unlink(missing_ok=True)
-        return "failed", {**download_details, "error_message": error or "unknown"}
+        return _return_result("failed", {**download_details, "error_message": error or "unknown"})
 
     size_bytes = final_path.stat().st_size
     log_line(
@@ -1002,12 +1029,15 @@ def handle_dl_bfile_from_ajax(
             row_index=row_index_hint,
         )
 
-    return "downloaded", {
-        **download_details,
-        "file_path": saved_path_value,
-        "file_size_bytes": size_bytes,
-        "box_url": box_url,
-    }
+    return _return_result(
+        "downloaded",
+        {
+            **download_details,
+            "file_path": saved_path_value,
+            "file_size_bytes": size_bytes,
+            "box_url": box_url,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1186,8 +1216,12 @@ def _run_scrape_attempt(
 
     telemetry = RunTelemetry(scrape_mode)
 
-    log_line(
-        f"[SCRAPER][NAV] starting run_id={run_id or 'n/a'} mode={scrape_mode} base_url={base_url}"
+    _scraper_event(
+        "nav",
+        run_id=run_id,
+        mode=scrape_mode,
+        base_url=base_url,
+        csv_source=csv_source or config.CSV_URL,
     )
 
     log_line("=== Starting scraping run (Playwright, response-capture) ===")
@@ -1202,8 +1236,10 @@ def _run_scrape_attempt(
     )
     effective_csv_source = csv_source or config.CSV_URL
     load_cases_index(effective_csv_source)
-    log_line(
-        f"[SCRAPER][PLAN] backend={'db' if cases_index.should_use_db_index() else 'csv'} total_cases={len(CASES_BY_ACTION)}"
+    _scraper_event(
+        "plan",
+        index_backend="db" if cases_index.should_use_db_index() else "csv",
+        total_cases=len(CASES_BY_ACTION),
     )
     meta = load_metadata()
     downloaded_index: Dict[str, Dict[str, Any]] = {}
@@ -1221,8 +1257,11 @@ def _run_scrape_attempt(
         sync_result,
         source=worklist.DEFAULT_SOURCE,
     )
-    log_line(
-        f"[SCRAPER][PLAN] planned_cases={len(planned_cases_by_token)} apply_filter={_should_apply_worklist_filter(scrape_mode)}"
+    _scraper_event(
+        "plan",
+        scrape_mode=scrape_mode,
+        planned_cases=len(planned_cases_by_token),
+        use_worklist_filter=_should_apply_worklist_filter(scrape_mode),
     )
     allowed_tokens: Optional[Set[str]] = None
     if planned_cases_by_token and _should_apply_worklist_filter(scrape_mode):
@@ -1382,6 +1421,13 @@ def _run_scrape_attempt(
             log_line(
                 f"[RUN] Resume requested -> page_index={resume_page_index}, row_index={resume_row_index}"
             )
+            _scraper_event(
+                "state",
+                source="resume_param",
+                resume_mode=scrape_mode,
+                dt_page_index=resume_page_index,
+                row_index=resume_row_index,
+            )
         elif (
             checkpoint is not None
             and resume_enabled
@@ -1393,6 +1439,13 @@ def _run_scrape_attempt(
             resume_row_index = checkpoint.row_index
             log_line(
                 f"[RUN] Resume checkpoint -> page_index={resume_page_index}, row_index={resume_row_index}"
+            )
+            _scraper_event(
+                "state",
+                source="checkpoint_state",
+                resume_mode=scrape_mode,
+                dt_page_index=resume_page_index,
+                row_index=resume_row_index,
             )
         else:
             if checkpoint is not None:
@@ -1531,6 +1584,7 @@ def _run_scrape_attempt(
                                 http_client=http_fetcher,
                                 case_context=case_context,
                                 fid=fid_param,
+                                run_id=run_id,
                             )
 
                             if norm_fname:
@@ -1682,8 +1736,12 @@ def _run_scrape_attempt(
                                 log_line(
                                     "[RUN] Consecutive already-downloaded threshold reached; halting NEW mode run."
                                 )
-                                log_line(
-                                    f"[SCRAPER][TABLE] row_limit_reached mode=new consecutive_existing={consecutive_existing} limit={config.SCRAPE_NEW_CONSECUTIVE_LIMIT}"
+                                _scraper_event(
+                                    "table",
+                                    reason="consecutive_existing_limit",
+                                    mode="new",
+                                    consecutive_existing=consecutive_existing,
+                                    limit=config.SCRAPE_NEW_CONSECUTIVE_LIMIT,
                                 )
                                 row_limit_reached = True
                                 active = False
@@ -1727,7 +1785,7 @@ def _run_scrape_attempt(
                     else:
                         try:
                             total_pages = max(1, _get_total_pages(page))
-                            log_line(f"[SCRAPER][TABLE] total_pages={total_pages}")
+                            _scraper_event("table", total_pages=total_pages)
                         except PWError as exc:
                             if _is_target_closed_error(exc):
                                 log_line(
@@ -1768,8 +1826,11 @@ def _run_scrape_attempt(
                             try:
                                 buttons = page.locator("button:has(i.icon-dl)")
                                 count = buttons.count()
-                                log_line(
-                                    f"[SCRAPER][TABLE] page_index={page_index_zero} rows_found={count}"
+                                _scraper_event(
+                                    "table",
+                                    page_index=page_index_zero,
+                                    page_number=page_number,
+                                    rows_found=count,
                                 )
                             except PWError as exc:
                                 if _is_target_closed_error(exc):
@@ -1826,8 +1887,12 @@ def _run_scrape_attempt(
                                     log_line(
                                         "Row inspection limit reached for 'new' mode; stopping pagination loop."
                                     )
-                                    log_line(
-                                        f"[SCRAPER][TABLE] row_limit_reached mode=new inspected={rows_evaluated} limit={row_limit}"
+                                    _scraper_event(
+                                        "table",
+                                        reason="row_limit_reached",
+                                        mode=scrape_mode,
+                                        inspected_rows=rows_evaluated,
+                                        row_limit=row_limit,
                                     )
                                     row_limit_reached = True
                                     break
@@ -1910,8 +1975,14 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[AJAX][WARN] Skipping button index {i} on page {page_number}: unable to normalise fname token."
                                     )
-                                    log_line(
-                                        f"[SCRAPER][DECISION] token={fname_token or ''} decision=skip reason=invalid_token"
+                                    _scraper_event(
+                                        "decision",
+                                        token=fname_key,
+                                        raw_token=fname_token,
+                                        decision="skip",
+                                        reason="invalid_token",
+                                        case_id=case_id_for_logging,
+                                        run_id=run_id,
                                     )
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
@@ -1925,8 +1996,14 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] fname={fname_token} already handled earlier in this run; skipping duplicate button."
                                     )
-                                    log_line(
-                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=in_run_dup"
+                                    _scraper_event(
+                                        "decision",
+                                        token=fname_key,
+                                        raw_token=fname_token,
+                                        decision="skip",
+                                        reason="in_run_dup",
+                                        case_id=case_id_for_logging,
+                                        run_id=run_id,
                                     )
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
@@ -1940,8 +2017,14 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] Button for fname={fname_token} already clicked on page {page_number}; skipping duplicate element."
                                     )
-                                    log_line(
-                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=in_run_dup"
+                                    _scraper_event(
+                                        "decision",
+                                        token=fname_key,
+                                        raw_token=fname_token,
+                                        decision="skip",
+                                        reason="in_run_dup",
+                                        case_id=case_id_for_logging,
+                                        run_id=run_id,
                                     )
                                     _bump_reason(summary["skip_reasons"], "in_run_dup")
                                     _log_skip_status(case_id_for_logging, "in_run_dup")
@@ -1951,8 +2034,14 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] fname={fname_token} not in planned worklist; skipping click."
                                     )
-                                    log_line(
-                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=worklist_filtered"
+                                    _scraper_event(
+                                        "decision",
+                                        token=fname_key,
+                                        raw_token=fname_token,
+                                        decision="skip",
+                                        reason="worklist_filtered",
+                                        case_id=case_id_for_logging,
+                                        run_id=run_id,
                                     )
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
@@ -1966,8 +2055,14 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP][csv_miss] No CSV entry for fname={fname_token}; skipping."
                                     )
-                                    log_line(
-                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=csv_miss"
+                                    _scraper_event(
+                                        "decision",
+                                        token=fname_key,
+                                        raw_token=fname_token,
+                                        decision="skip",
+                                        reason="csv_miss",
+                                        case_id=case_id_for_logging,
+                                        run_id=run_id,
                                     )
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
@@ -1982,8 +2077,14 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] fname={fname_token} already downloaded as {label}; skipping click."
                                     )
-                                    log_line(
-                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=already_downloaded"
+                                    _scraper_event(
+                                        "decision",
+                                        token=fname_key,
+                                        raw_token=fname_token,
+                                        decision="skip",
+                                        reason="already_downloaded",
+                                        case_id=case_id_for_logging,
+                                        run_id=run_id,
                                     )
                                     if checkpoint is not None:
                                         checkpoint.record_download(
@@ -2008,8 +2109,12 @@ def _run_scrape_attempt(
                                             log_line(
                                                 "[RUN] Consecutive already-downloaded threshold reached; halting NEW mode run."
                                             )
-                                            log_line(
-                                                f"[SCRAPER][TABLE] row_limit_reached mode=new consecutive_existing={consecutive_existing} limit={config.SCRAPE_NEW_CONSECUTIVE_LIMIT}"
+                                            _scraper_event(
+                                                "table",
+                                                reason="consecutive_existing_limit",
+                                                mode="new",
+                                                consecutive_existing=consecutive_existing,
+                                                limit=config.SCRAPE_NEW_CONSECUTIVE_LIMIT,
                                             )
                                             row_limit_reached = True
                                             break
@@ -2023,8 +2128,14 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] fname={fname_token} recorded in checkpoint; skipping click in NEW mode."
                                     )
-                                    log_line(
-                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=seen_history"
+                                    _scraper_event(
+                                        "decision",
+                                        token=fname_key,
+                                        raw_token=fname_token,
+                                        decision="skip",
+                                        reason="seen_history",
+                                        case_id=case_id_for_logging,
+                                        run_id=run_id,
                                     )
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
@@ -2038,6 +2149,13 @@ def _run_scrape_attempt(
                                         ):
                                             log_line(
                                                 "[RUN] Consecutive already-downloaded threshold reached; halting NEW mode run."
+                                            )
+                                            _scraper_event(
+                                                "table",
+                                                reason="consecutive_existing_limit",
+                                                mode="new",
+                                                consecutive_existing=consecutive_existing,
+                                                limit=config.SCRAPE_NEW_CONSECUTIVE_LIMIT,
                                             )
                                             row_limit_reached = True
                                             break
@@ -2249,16 +2367,46 @@ def run_scrape(
         state: Optional[Dict[str, Any]] = None
         if normalized_resume in {"state", "auto"}:
             state = load_checkpoint()
+            if state is not None:
+                _scraper_event(
+                    "state",
+                    source="checkpoint_file",
+                    resume_mode=normalized_resume,
+                    dt_page_index=state.get("dt_page_index"),
+                    row_index=state.get("button_index"),
+                )
         if state is None and normalized_resume in {"logs", "auto"}:
             state = derive_checkpoint_from_logs()
+            if state is not None:
+                _scraper_event(
+                    "state",
+                    source="logs",
+                    resume_mode=normalized_resume,
+                    dt_page_index=state.get("dt_page_index"),
+                    row_index=state.get("row_index") or state.get("button_index"),
+                )
         if state is not None:
             resume_state = dict(state)
         if resume_page is not None:
             resume_state = resume_state or {}
             resume_state["dt_page_index"] = resume_page
+            _scraper_event(
+                "state",
+                source="cli_override",
+                resume_mode=normalized_resume,
+                dt_page_index=resume_page,
+                row_index=(resume_state or {}).get("button_index"),
+            )
         if resume_index is not None:
             resume_state = resume_state or {}
             resume_state["button_index"] = resume_index
+            _scraper_event(
+                "state",
+                source="cli_override",
+                resume_mode=normalized_resume,
+                dt_page_index=(resume_state or {}).get("dt_page_index"),
+                row_index=resume_index,
+            )
 
     next_start_message = start_message
     run_id: Optional[int] = None
@@ -2267,6 +2415,15 @@ def run_scrape(
     sync_result = csv_sync.sync_csv(config.CSV_URL, session=http_session)
     csv_version_id = sync_result.version_id
     csv_source = sync_result.csv_path or config.CSV_URL
+
+    _scraper_event(
+        "plan",
+        csv_version_id=sync_result.version_id,
+        csv_row_count=sync_result.row_count,
+        new_case_ids=len(sync_result.new_case_ids),
+        changed_case_ids=len(sync_result.changed_case_ids),
+        removed_case_ids=len(sync_result.removed_case_ids),
+    )
 
     params_json = json.dumps(
         {
@@ -2327,6 +2484,12 @@ def run_scrape(
                 log_line(f"[DB][WARN] Unable to mark run completed: {exc}")
         return result
     except Exception as exc:  # noqa: BLE001
+        _scraper_event(
+            "error",
+            run_id=run_id,
+            mode=mode,
+            error=_short_error_message(exc),
+        )
         if run_id is not None:
             try:
                 db.mark_run_failed(run_id, _short_error_message(exc))

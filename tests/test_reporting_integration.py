@@ -33,7 +33,7 @@ def test_get_download_rows_for_ui_json_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _configure_temp_paths(tmp_path, monkeypatch)
-    monkeypatch.delenv("BAILIIKC_USE_DB_REPORTING", raising=False)
+    monkeypatch.setenv("BAILIIKC_USE_DB_REPORTING", "0")
 
     downloads_log = config.DOWNLOADS_LOG
     downloads_log.parent.mkdir(parents=True, exist_ok=True)

@@ -77,7 +77,7 @@ def test_load_case_index_from_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 @pytest.mark.usefixtures("populated_db")
 def test_db_index_matches_csv_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sample_csv = Path(__file__).parent / "data" / "judgments_sample.csv"
-    monkeypatch.delenv("BAILIIKC_USE_DB_CASES", raising=False)
+    monkeypatch.setenv("BAILIIKC_USE_DB_CASES", "0")
     cases_index.load_cases_from_csv(str(sample_csv))
     index_csv = dict(cases_index.CASES_BY_ACTION)
 

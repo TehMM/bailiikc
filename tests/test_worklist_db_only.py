@@ -89,8 +89,8 @@ def test_build_worklist_dispatches_by_mode(
     assert {i.case_id for i in full_items} == set(sync_result.new_case_ids)
     assert {i.case_id for i in new_items} == set(sync_result.new_case_ids)
 
-    with pytest.raises(NotImplementedError):
-        worklist.build_worklist("resume", version_id)
+    resume_items = worklist.build_worklist("resume", version_id)
+    assert resume_items == []
 
     with pytest.raises(ValueError):
         worklist.build_worklist("unknown-mode", version_id)

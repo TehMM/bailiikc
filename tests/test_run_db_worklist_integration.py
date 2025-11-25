@@ -104,6 +104,7 @@ def test_legacy_planner_used_when_flags_disabled(monkeypatch, tmp_path):
     csv_path = tmp_path / "judgments_sample.csv"
     csv_path.write_text((Path(__file__).parent / "data" / "judgments_sample.csv").read_text())
 
+    monkeypatch.setenv("BAILIIKC_USE_DB_CASES", "0")
     cases_index.load_cases_from_csv(str(csv_path))
 
     monkeypatch.setattr(run.config, "use_db_worklist_for_new", lambda: False)

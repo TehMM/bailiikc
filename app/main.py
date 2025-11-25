@@ -56,7 +56,7 @@ _last_webhook_ts = 0.0
 def use_db_reporting() -> bool:
     """Return True when DB-backed reporting endpoints should be used."""
 
-    return os.environ.get("BAILIIKC_USE_DB_REPORTING", "").strip() == "1"
+    return config.use_db_reporting()
 
 
 def _read_last_log_lines(limit: int = 150) -> list[str]:

@@ -85,10 +85,20 @@ def _should_apply_worklist_filter(scrape_mode: str) -> bool:
     return (
         (is_new_mode(scrape_mode) and config.use_db_worklist_for_new())
         or (is_full_mode(scrape_mode) and config.use_db_worklist_for_full())
-        # Resume planning is not yet threaded through run.py; this branch keeps
-        # flag handling ready for when it is.
         or (scrape_mode.strip().lower() == "resume" and config.use_db_worklist_for_resume())
     )
+
+
+def _normalize_scrape_mode(raw: str) -> str:
+    raw = (raw or "").strip().lower()
+    if is_full_mode(raw):
+        return "full"
+    if is_new_mode(raw):
+        return "new"
+    if raw == "resume":
+        return "resume"
+    log_line(f"[RUN] Unknown scrape_mode={raw!r}; defaulting to 'new'.")
+    return "new"
 
 ADMIN_AJAX = "https://judicial.ky/wp-admin/admin-ajax.php"
 
@@ -170,6 +180,15 @@ def _plan_cases_for_full_mode(
     return _legacy_plan_cases_for_full_mode(sync_result, source=source)
 
 
+def _plan_cases_for_resume_mode(
+    sync_result: csv_sync.CsvSyncResult, *, source: str
+) -> List[CaseRow]:
+    if config.use_db_worklist_for_resume():
+        db_items = worklist.build_resume_worklist(sync_result.version_id, source=source)
+        return _adapt_work_items_to_case_rows(db_items)
+    return []
+
+
 def _prepare_planned_cases(
     scrape_mode: str,
     sync_result: Optional[csv_sync.CsvSyncResult],
@@ -184,6 +203,8 @@ def _prepare_planned_cases(
         planned = _plan_cases_for_new_mode(sync_result, source=source)
     elif is_full_mode(scrape_mode):
         planned = _plan_cases_for_full_mode(sync_result, source=source)
+    elif scrape_mode.strip().lower() == "resume":
+        planned = _plan_cases_for_resume_mode(sync_result, source=source)
 
     planned_by_token: Dict[str, CaseRow] = {}
     planned_case_ids: Dict[str, int] = {}
@@ -646,13 +667,21 @@ def queue_or_download_file(
     http_client: Optional[Any] = None,
     max_retries: int = 3,
     timeout: int = 120,
+    token: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Download ``url`` to ``dest_path`` with retries and validation."""
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     last_error: Optional[str] = None
+    safe_url = url
+    try:
+        parsed = urllib.parse.urlparse(url)
+        safe_url = urllib.parse.urlunparse(parsed._replace(query=""))
+    except Exception:
+        safe_url = url
 
     for attempt in range(1, max_retries + 1):
+        status: Optional[int] = None
         try:
             if http_client is not None:
                 response = http_client(url, timeout=timeout)
@@ -674,10 +703,14 @@ def queue_or_download_file(
                     raise RuntimeError("Response is not a PDF")
 
                 dest_path.write_bytes(body_bytes)
+                log_line(
+                    f"[SCRAPER][BOX] token={token or ''} url={safe_url} status={status or 'unknown'} bytes={len(body_bytes)}"
+                )
                 return True, None
 
             with requests.get(url, stream=True, timeout=timeout) as resp:
                 resp.raise_for_status()
+                status = resp.status_code
                 with dest_path.open("wb") as handle:
                     first_chunk = True
                     for chunk in resp.iter_content(chunk_size=8192):
@@ -692,10 +725,16 @@ def queue_or_download_file(
             if dest_path.stat().st_size <= 0:
                 raise RuntimeError("Empty download")
 
+            log_line(
+                f"[SCRAPER][BOX] token={token or ''} url={safe_url} status={status or 'unknown'} bytes={dest_path.stat().st_size}"
+            )
             return True, None
 
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
+            log_line(
+                f"[SCRAPER][BOX] token={token or ''} url={safe_url} status={status or 'error'} error={exc}"
+            )
             log_line(
                 f"[AJAX] Download attempt {attempt} for {url} failed: {exc}"
             )
@@ -936,6 +975,7 @@ def handle_dl_bfile_from_ajax(
             box_url,
             pdf_path,
             http_client=http_client,
+            token=norm_fname,
         )
     except OSError as exc:
         error = str(exc)
@@ -955,6 +995,7 @@ def handle_dl_bfile_from_ajax(
                         box_url,
                         fallback_path,
                         http_client=http_client,
+                        token=norm_fname,
                     )
                 except OSError as exc:
                     error = str(exc)
@@ -1207,6 +1248,10 @@ def _run_scrape_attempt(
 
     telemetry = RunTelemetry(scrape_mode)
 
+    log_line(
+        f"[SCRAPER][NAV] starting run_id={run_id or 'n/a'} mode={scrape_mode} base_url={base_url}"
+    )
+
     log_line("=== Starting scraping run (Playwright, response-capture) ===")
     log_line(f"Target base URL: {base_url}")
     log_line(
@@ -1216,6 +1261,9 @@ def _run_scrape_attempt(
 
     log_line(
         f"[CASES_INDEX] using {'db' if cases_index.should_use_db_index() else 'csv'} backend"
+    )
+    log_line(
+        f"[SCRAPER][PLAN] backend={'db' if cases_index.should_use_db_index() else 'csv'} total_cases={len(CASES_BY_ACTION)}"
     )
     effective_csv_source = csv_source or config.CSV_URL
     load_cases_index(effective_csv_source)
@@ -1234,6 +1282,9 @@ def _run_scrape_attempt(
         scrape_mode,
         sync_result,
         source=worklist.DEFAULT_SOURCE,
+    )
+    log_line(
+        f"[SCRAPER][PLAN] planned_cases={len(planned_cases_by_token)} apply_filter={_should_apply_worklist_filter(scrape_mode)}"
     )
     allowed_tokens: Optional[Set[str]] = None
     if planned_cases_by_token and _should_apply_worklist_filter(scrape_mode):
@@ -1693,6 +1744,9 @@ def _run_scrape_attempt(
                                 log_line(
                                     "[RUN] Consecutive already-downloaded threshold reached; halting NEW mode run."
                                 )
+                                log_line(
+                                    f"[SCRAPER][TABLE] row_limit_reached mode=new consecutive_existing={consecutive_existing} limit={config.SCRAPE_NEW_CONSECUTIVE_LIMIT}"
+                                )
                                 row_limit_reached = True
                                 active = False
 
@@ -1735,6 +1789,7 @@ def _run_scrape_attempt(
                     else:
                         try:
                             total_pages = max(1, _get_total_pages(page))
+                            log_line(f"[SCRAPER][TABLE] total_pages={total_pages}")
                         except PWError as exc:
                             if _is_target_closed_error(exc):
                                 log_line(
@@ -1775,6 +1830,9 @@ def _run_scrape_attempt(
                             try:
                                 buttons = page.locator("button:has(i.icon-dl)")
                                 count = buttons.count()
+                                log_line(
+                                    f"[SCRAPER][TABLE] page_index={page_index_zero} rows_found={count}"
+                                )
                             except PWError as exc:
                                 if _is_target_closed_error(exc):
                                     log_line(
@@ -1829,6 +1887,9 @@ def _run_scrape_attempt(
                                 ):
                                     log_line(
                                         "Row inspection limit reached for 'new' mode; stopping pagination loop."
+                                    )
+                                    log_line(
+                                        f"[SCRAPER][TABLE] row_limit_reached mode=new inspected={rows_evaluated} limit={row_limit}"
                                     )
                                     row_limit_reached = True
                                     break
@@ -1911,6 +1972,9 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[AJAX][WARN] Skipping button index {i} on page {page_number}: unable to normalise fname token."
                                     )
+                                    log_line(
+                                        f"[SCRAPER][DECISION] token={fname_token or ''} decision=skip reason=invalid_token"
+                                    )
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     _log_skip_status(case_id_for_logging, "invalid_token")
@@ -1922,6 +1986,9 @@ def _run_scrape_attempt(
                                 ):
                                     log_line(
                                         f"[SKIP] fname={fname_token} already handled earlier in this run; skipping duplicate button."
+                                    )
+                                    log_line(
+                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=in_run_dup"
                                     )
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
@@ -1935,6 +2002,9 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP] Button for fname={fname_token} already clicked on page {page_number}; skipping duplicate element."
                                     )
+                                    log_line(
+                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=in_run_dup"
+                                    )
                                     _bump_reason(summary["skip_reasons"], "in_run_dup")
                                     _log_skip_status(case_id_for_logging, "in_run_dup")
                                     continue
@@ -1942,6 +2012,9 @@ def _run_scrape_attempt(
                                 if allowed_tokens is not None and fname_key not in allowed_tokens:
                                     log_line(
                                         f"[SKIP] fname={fname_token} not in planned worklist; skipping click."
+                                    )
+                                    log_line(
+                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=worklist_filtered"
                                     )
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
@@ -1955,6 +2028,9 @@ def _run_scrape_attempt(
                                     log_line(
                                         f"[SKIP][csv_miss] No CSV entry for fname={fname_token}; skipping."
                                     )
+                                    log_line(
+                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=csv_miss"
+                                    )
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
                                     summary["skipped"] += 1
@@ -1967,6 +2043,9 @@ def _run_scrape_attempt(
                                     label = metadata_entry.get("title") or fname_key
                                     log_line(
                                         f"[SKIP] fname={fname_token} already downloaded as {label}; skipping click."
+                                    )
+                                    log_line(
+                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=already_downloaded"
                                     )
                                     if checkpoint is not None:
                                         checkpoint.record_download(
@@ -1991,6 +2070,9 @@ def _run_scrape_attempt(
                                             log_line(
                                                 "[RUN] Consecutive already-downloaded threshold reached; halting NEW mode run."
                                             )
+                                            log_line(
+                                                f"[SCRAPER][TABLE] row_limit_reached mode=new consecutive_existing={consecutive_existing} limit={config.SCRAPE_NEW_CONSECUTIVE_LIMIT}"
+                                            )
                                             row_limit_reached = True
                                             break
                                     continue
@@ -2002,6 +2084,9 @@ def _run_scrape_attempt(
                                 ):
                                     log_line(
                                         f"[SKIP] fname={fname_token} recorded in checkpoint; skipping click in NEW mode."
+                                    )
+                                    log_line(
+                                        f"[SCRAPER][DECISION] token={fname_key} decision=skip reason=seen_history"
                                     )
                                     if checkpoint is not None:
                                         checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
@@ -2208,15 +2293,7 @@ def run_scrape(
     log_path = setup_run_logger()
 
     raw_mode = (scrape_mode or config.SCRAPE_MODE_DEFAULT).strip().lower()
-    if is_full_mode(raw_mode):
-        mode = "full"
-    elif is_new_mode(raw_mode):
-        mode = "new"
-    else:
-        log_line(
-            f"[RUN] Unknown scrape_mode={raw_mode!r}; defaulting to 'new'."
-        )
-        mode = "new"
+    mode = _normalize_scrape_mode(raw_mode)
 
     row_limit = new_limit if new_limit is not None else config.SCRAPE_NEW_LIMIT
     retry_limit = max_retries if max_retries is not None else config.SCRAPER_MAX_RETRIES
@@ -2270,11 +2347,10 @@ def run_scrape(
         sort_keys=True,
     )
 
-    mode_for_db = "resume" if resume_enabled and normalized_resume != "none" else mode
     try:
         run_id = db.create_run(
             trigger=trigger or "cli",
-            mode=mode_for_db,
+            mode=mode,
             csv_version_id=csv_version_id,
             params_json=params_json,
         )
@@ -2326,7 +2402,11 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument("--base-url", default=config.DEFAULT_BASE_URL)
     parser.add_argument("--page-wait", type=int, default=config.PAGE_WAIT_SECONDS)
     parser.add_argument("--per-download-delay", type=float, default=config.PER_DOWNLOAD_DELAY)
-    parser.add_argument("--scrape-mode", choices=["new", "full"], default=config.SCRAPE_MODE_DEFAULT)
+    parser.add_argument(
+        "--scrape-mode",
+        choices=["new", "full", "resume"],
+        default=config.SCRAPE_MODE_DEFAULT,
+    )
     parser.add_argument("--new-limit", type=int, default=config.SCRAPE_NEW_LIMIT)
     parser.add_argument("--max-retries", type=int, default=config.SCRAPER_MAX_RETRIES)
     parser.add_argument(

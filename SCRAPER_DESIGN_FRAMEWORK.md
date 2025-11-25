@@ -749,16 +749,23 @@ It MUST be kept up to date when plans change.
     preserved when the flag is off.
   - Tests confirm the flag routing and worklist consumption.
 
-- **PR19 – DB-first resume semantics (implemented in worklist.py)**
+- **PR19 – DB-first resume semantics (implemented in worklist + planning helpers)**
   - Formalise and implement resume semantics using `runs` and `downloads`
     status/error codes.
   - Integrate with the worklist builder for `mode="resume"`; run.py wiring
-    remains optional/flagged.
+    remains optional/flagged and is activated in PR21 for flagged resume
+    runs.
 
 - **PR20 – Promote DB worklists and reporting to default (implemented)**
   - Enable DB worklists and DB reporting by default, keeping legacy JSON as an
     emergency fallback only.
   - Update docs to reflect DB-first architecture.
+
+- **PR21 – Wire DB resume worklists into run.py (flagged, implemented)**
+  - When `scrape_mode="resume"` and `BAILIIKC_USE_DB_WORKLIST_FOR_RESUME=1`,
+    run.py now plans via `worklist.build_resume_worklist` and filters
+    pagination clicks to the DB-derived tokens.
+  - Defaults continue to run `new`/`full` as before; resume remains opt-in.
 
 - **PR21+ – public-registers and RAG pipeline**
   - Extend CSV sync and case indexing to `public-registers` as a second

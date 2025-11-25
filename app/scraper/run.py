@@ -51,6 +51,7 @@ from .cases_index import (
     normalize_action_token,
 )
 from .csv_sync import normalize_action_token as normalize_action_token_db
+from .download_state import CaseDownloadState
 from .logging_utils import _scraper_event
 from .state import clear_checkpoint, derive_checkpoint_from_logs, load_checkpoint, save_checkpoint
 from .telemetry import RunTelemetry
@@ -1301,70 +1302,10 @@ def _run_scrape_attempt(
         if run_id is None or case_id is None:
             return
         try:
-            db.ensure_download_row(run_id, case_id)
-            db.update_download_status(
-                run_id=run_id,
-                case_id=case_id,
-                status="skipped",
-                attempt_count=0,
-                last_attempt_at=_now_iso(),
-                error_code=reason,
-            )
+            state = CaseDownloadState.load(run_id=run_id, case_id=case_id)
+            state.mark_skipped(reason)
         except Exception as exc:  # noqa: BLE001
             log_line(f"[DB][WARN] Unable to record skip for case_id={case_id}: {exc}")
-
-    def _start_download_attempt(case_id: Optional[int], box_url: Optional[str]) -> Optional[int]:
-        if run_id is None or case_id is None:
-            return None
-        try:
-            row = db.ensure_download_row(run_id, case_id)
-            attempt = int(row["attempt_count"]) + 1
-            db.update_download_status(
-                run_id=run_id,
-                case_id=case_id,
-                status="in_progress",
-                attempt_count=attempt,
-                last_attempt_at=_now_iso(),
-                box_url_last=box_url,
-            )
-            return attempt
-        except Exception as exc:  # noqa: BLE001
-            log_line(
-                f"[DB][WARN] Unable to start download attempt for case_id={case_id}: {exc}"
-            )
-            return None
-
-    def _finish_download_attempt(
-        case_id: Optional[int],
-        status: str,
-        attempt_count: Optional[int],
-        *,
-        file_path: Optional[str] = None,
-        file_size_bytes: Optional[int] = None,
-        box_url_last: Optional[str] = None,
-        error_code: Optional[str] = None,
-        error_message: Optional[str] = None,
-    ) -> None:
-        if run_id is None or case_id is None:
-            return
-        attempts = attempt_count if attempt_count is not None else 0
-        try:
-            db.update_download_status(
-                run_id=run_id,
-                case_id=case_id,
-                status=status,
-                attempt_count=attempts,
-                last_attempt_at=_now_iso(),
-                file_path=file_path,
-                file_size_bytes=file_size_bytes,
-                box_url_last=box_url_last,
-                error_code=error_code,
-                error_message=error_message,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log_line(
-                f"[DB][WARN] Unable to update download status for case_id={case_id}: {exc}"
-            )
 
     def _finalize_telemetry(payload: Dict[str, Any]) -> None:
         try:
@@ -1576,7 +1517,18 @@ def _run_scrape_attempt(
                                 fname_param or norm_fname or ""
                             )
                             case_id = _lookup_case_id(db_token_norm)
-                            attempt_count_db = _start_download_attempt(case_id, box_url)
+                            state: Optional[CaseDownloadState] = None
+                            if run_id is not None and case_id is not None:
+                                try:
+                                    state = CaseDownloadState.start(
+                                        run_id=run_id,
+                                        case_id=case_id,
+                                        box_url=box_url,
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    log_line(
+                                        f"[DB][WARN] Unable to start download attempt for case_id={case_id}: {exc}"
+                                    )
                             result, download_info = handle_dl_bfile_from_ajax(
                                 mode=scrape_mode,
                                 fname=fname_param or norm_fname,
@@ -1647,35 +1599,35 @@ def _run_scrape_attempt(
                                 summary.setdefault("stop_reason", "disk_full")
                                 disk_full_encountered = True
 
-                            status_for_db: Optional[str] = None
-                            error_code: Optional[str] = None
                             error_message = download_info.get("error_message") if isinstance(download_info, dict) else None
                             file_path = download_info.get("file_path") if isinstance(download_info, dict) else None
                             file_size_bytes = download_info.get("file_size_bytes") if isinstance(download_info, dict) else None
                             box_url_last = download_info.get("box_url") if isinstance(download_info, dict) else box_url
 
-                            if result == "downloaded":
-                                status_for_db = "downloaded"
-                            elif result in {"existing_file", "checkpoint_skip", "duplicate_in_run"}:
-                                status_for_db = "skipped"
-                            elif result == "failed":
-                                status_for_db = "failed"
-                                error_code = "unknown"
-                            elif result == "disk_full":
-                                status_for_db = "failed"
-                                error_code = "disk_full"
-
-                            if status_for_db:
-                                _finish_download_attempt(
-                                    case_id,
-                                    status_for_db,
-                                    attempt_count_db if status_for_db != "skipped" else attempt_count_db or 0,
-                                    file_path=file_path,
-                                    file_size_bytes=file_size_bytes,
-                                    box_url_last=box_url_last,
-                                    error_code=error_code,
-                                    error_message=error_message,
-                                )
+                            if state is not None:
+                                try:
+                                    if result == "downloaded":
+                                        state.mark_downloaded(
+                                            file_path=file_path,
+                                            file_size_bytes=file_size_bytes,
+                                            box_url=box_url_last,
+                                        )
+                                    elif result in {"existing_file", "checkpoint_skip", "duplicate_in_run"}:
+                                        state.mark_skipped(reason=result)
+                                    elif result == "disk_full":
+                                        state.mark_failed(
+                                            error_code="disk_full",
+                                            error_message=error_message,
+                                        )
+                                    elif result == "failed":
+                                        state.mark_failed(
+                                            error_code="download_other",
+                                            error_message=error_message,
+                                        )
+                                except Exception as exc:  # noqa: BLE001
+                                    log_line(
+                                        f"[DB][WARN] Unable to update download status for case_id={case_id}: {exc}"
+                                    )
 
                             if disk_full_encountered:
                                 active = False

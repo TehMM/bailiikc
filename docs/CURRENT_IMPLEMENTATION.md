@@ -50,6 +50,11 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 - **Behaviour**: JSON files remain the source of truth for scraper control/resume. SQLite is read for reporting (/api/runs/latest, /api/db/ endpoints, and optional DB-backed /report or /api/downloaded-cases) while continuing to mirror run and download activity during a scrape.
 - **Consistency checker (JSON vs DB)**: `app.scraper.consistency.compare_latest_downloads_json_vs_db()` computes a diagnostic report comparing the JSON-based and DB-based views of downloaded cases for the latest run. This is exposed as a CLI via `python -m app.scraper.consistency` and is intended for internal validation while DB-backed reporting and control flow are adopted. Any errors or mismatches cause the CLI to exit non-zero.
 
+## Scrape logs
+- Structured scraper logs follow a `[SCRAPER][PHASE] key=value, ...` pattern so they can be grepped or machine-parsed.
+- Phases include `NAV` (run setup), `PLAN` (CSV sync, case index selection, and worklist planning), `TABLE` (pagination, row counts, limits), `DECISION` (per-token skip/download choices), `BOX` (Box download results), `STATE` (checkpoint/resume decisions), and `ERROR` (unexpected run-level failures).
+- For quick diagnosis, grep `[SCRAPER][ERROR]` for fatal issues and `[SCRAPER][BOX]` plus `[SCRAPER][DECISION]` to see why specific tokens were downloaded or skipped.
+
 ## Known Limitations / Fragility
 - The judgments CSV is still fetched from the remote URL on each run. While `csv_sync.sync_csv` now records `csv_versions` rows and local CSV files for versioning, there is no offline fallback when the source is unavailable, so network hiccups can still prevent a run from starting.
 - Resume relies on JSON checkpoints and log parsing, leading to complexity when recovering mid-run.

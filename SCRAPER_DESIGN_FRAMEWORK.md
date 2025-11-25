@@ -785,6 +785,11 @@ complements the DB/worklist roadmap above.
     response handling).
   - Ensure these logs feed into run telemetry JSON and the `runs`/`downloads`
     tables where appropriate.
+  - Implement a stable `[SCRAPER][PHASE] key=value` vocabulary across
+    navigation (`NAV`), planning (`PLAN`), pagination (`TABLE`), per-token
+    choices (`DECISION`), Box downloads (`BOX`), checkpoint/resume decisions
+    (`STATE`), and fatal errors (`ERROR`) so log parsing can answer "what
+    happened to token X" or "why did run Y stop".
 
 - **PR-S2 – Isolate Box/AJAX interaction into a `box_client` abstraction**
   - Extract the dl_bfile request/response logic into a dedicated module

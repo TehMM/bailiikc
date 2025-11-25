@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 
 import pytest
@@ -97,18 +98,19 @@ def _seed_db_with_download(csv_version_id: int) -> None:
 
 def _seed_json_downloads(downloads_log: Path, *, title: str) -> None:
     downloads_log.parent.mkdir(parents=True, exist_ok=True)
-    downloads_log.write_text(
-        (
-            '{"actions_token": "TOK-SEED", "title": "'
-            + title
-            + '", "subject": "'
-            + title
-            + '", "court": "Seed Court", "category": "Seed Category", "judgment_date": "2024-03-01", '
-            '"cause_number": "CASE-001", "downloaded_at": "2024-03-02T00:00:00Z", '
-            '"saved_path": "pdfs/seed.pdf", "bytes": 2048}\n'
-        ),
-        encoding="utf-8",
-    )
+    payload = {
+        "actions_token": "TOK-SEED",
+        "title": title,
+        "subject": title,
+        "court": "Seed Court",
+        "category": "Seed Category",
+        "judgment_date": "2024-03-01",
+        "cause_number": "CASE-001",
+        "downloaded_at": "2024-03-02T00:00:00Z",
+        "saved_path": "pdfs/seed.pdf",
+        "bytes": 2048,
+    }
+    downloads_log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
 
 def _setup_db_and_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, title: str) -> None:

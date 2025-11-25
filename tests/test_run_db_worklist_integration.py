@@ -131,3 +131,55 @@ def test_legacy_planner_used_when_flags_disabled(monkeypatch, tmp_path):
     assert len(planned_full) == len(cases_index.CASES_ALL)
     assert ids_new == {}
     assert ids_full == {}
+
+
+def test_resume_mode_uses_db_worklist_when_flag_enabled(monkeypatch):
+    fake_items = [
+        worklist.WorkItem(
+            case_id=5,
+            action_token_norm="TOKRESUME",
+            action_token_raw="tokresume",
+            title="Resume Case",
+            court="Court",
+            category="Cat",
+            judgment_date="2024-02-02",
+            cause_number="789/2024",
+            is_criminal=False,
+            is_active=True,
+            first_seen_version_id=4,
+            last_seen_version_id=4,
+            source=worklist.DEFAULT_SOURCE,
+        )
+    ]
+    calls = []
+
+    monkeypatch.setenv("BAILIIKC_USE_DB_WORKLIST_FOR_RESUME", "1")
+    monkeypatch.setattr(
+        run.worklist,
+        "build_resume_worklist",
+        lambda version_id, source: calls.append((version_id, source)) or list(fake_items),
+    )
+
+    planned, ids = run._prepare_planned_cases(
+        "resume", _make_sync_result(13), source=worklist.DEFAULT_SOURCE
+    )
+
+    assert calls == [(13, worklist.DEFAULT_SOURCE)]
+    assert set(planned.keys()) == {"TOKRESUME"}
+    assert ids["TOKRESUME"] == 5
+
+
+def test_resume_mode_uses_legacy_path_when_flag_disabled(monkeypatch):
+    monkeypatch.setenv("BAILIIKC_USE_DB_WORKLIST_FOR_RESUME", "0")
+
+    def _stub(*_args, **_kwargs):
+        raise AssertionError("build_resume_worklist should not be called")
+
+    monkeypatch.setattr(run.worklist, "build_resume_worklist", _stub)
+
+    planned, ids = run._prepare_planned_cases(
+        "resume", _make_sync_result(3), source=worklist.DEFAULT_SOURCE
+    )
+
+    assert planned == {}
+    assert ids == {}

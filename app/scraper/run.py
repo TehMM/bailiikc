@@ -886,9 +886,14 @@ def handle_dl_bfile_from_ajax(
                 page_index=page_index_hint,
                 row_index=row_index_hint,
             )
+        # Do not assume the pretty pdf_path exists; metadata may point to a hashed
+        # fallback filename, so avoid stat() here to prevent spurious failures.
         return _return_result(
             "existing_file",
-            {**download_details, "file_path": str(pdf_path.name), "file_size_bytes": pdf_path.stat().st_size},
+            {
+                **download_details,
+                "file_path": str(pdf_path.name),
+            },
         )
 
     try:

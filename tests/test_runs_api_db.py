@@ -55,7 +55,7 @@ def _insert_case(conn, csv_version_id: int, token_suffix: str) -> int:
 
 def test_api_runs_latest_returns_db_backed_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_temp_paths(tmp_path, monkeypatch)
-    monkeypatch.delenv("BAILIIKC_USE_DB_REPORTING", raising=False)
+    monkeypatch.setenv("BAILIIKC_USE_DB_REPORTING", "0")
 
     main = _reload_main_module()
 
@@ -121,7 +121,7 @@ def test_api_runs_latest_returns_db_backed_summary(tmp_path: Path, monkeypatch: 
 
 def test_api_runs_latest_no_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_temp_paths(tmp_path, monkeypatch)
-    monkeypatch.delenv("BAILIIKC_USE_DB_REPORTING", raising=False)
+    monkeypatch.setenv("BAILIIKC_USE_DB_REPORTING", "0")
 
     main = _reload_main_module()
 

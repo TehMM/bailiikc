@@ -133,8 +133,9 @@ Key Modules
 
 - **app/scraper/worklist.py**: DB-backed helpers for building per-run worklists
   (lists of cases to process) from the SQLite ``cases``/``csv_versions``
-  tables. Currently provides full/new worklists only and is not yet wired into
-  the scraper control flow.
+  tables. Provides full/new/resume worklists; resume derives retries from
+  prior runs/downloads. Wiring into the scraper control flow for resume mode
+  remains optional/flagged.
 
 3. Data Storage & Schema
 3.1 Directory Layout
@@ -728,7 +729,7 @@ It MUST be kept up to date when plans change.
   - Support `"full"` (all active, non-criminal cases for the version) and
     `"new"` (cases where `first_seen_version_id == csv_version_id`) modes.
   - Define a `"resume"` mode stub that raises `NotImplementedError` for now;
-    DB-backed resume semantics will be implemented in PR19.
+    DB-backed resume semantics are implemented later in PR19.
   - Keep this isolated from `run.py` and cover it with unit tests.
 
 - **PR17 – Wire new-only mode to DB worklist behind a flag**
@@ -748,12 +749,13 @@ It MUST be kept up to date when plans change.
     preserved when the flag is off.
   - Tests confirm the flag routing and worklist consumption.
 
-- **PR19 – DB-first resume semantics**
+- **PR19 – DB-first resume semantics (implemented in worklist.py)**
   - Formalise and implement resume semantics using `runs` and `downloads`
     status/error codes.
-  - Integrate with the worklist builder for `mode="resume"`.
+  - Integrate with the worklist builder for `mode="resume"`; run.py wiring
+    remains optional/flagged.
 
-- **PR20 – Promote DB worklists and reporting to default**
+- **PR20 – Promote DB worklists and reporting to default (implemented)**
   - Enable DB worklists and DB reporting by default, keeping legacy JSON as an
     emergency fallback only.
   - Update docs to reflect DB-first architecture.

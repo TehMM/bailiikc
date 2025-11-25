@@ -32,11 +32,11 @@ Each ``CaseRow`` contains at least the following fields used by callers:
     - cause_number: str
     - extra: Dict[str, str] (raw CSV columns and helpers)
 
-By default, callers use ``load_cases_from_csv``. When the environment variable
-``BAILIIKC_USE_DB_CASES`` is set to ``"1"``, the in-memory index is populated
-from the database instead via ``load_cases_index_from_db``. This behaviour is
-controlled by ``should_use_db_index`` and is backwards compatible: the default
-remains the CSV-based path.
+By default, callers use ``load_cases_index_from_db``. When the environment
+variable ``BAILIIKC_USE_DB_CASES`` is set to ``"0"``, the in-memory index falls
+back to CSV via ``load_cases_from_csv``. This behaviour is controlled by
+``should_use_db_index`` and remains backwards compatible for deployments that
+still prefer the legacy CSV path.
 """
 
 import csv
@@ -306,7 +306,7 @@ def load_cases_index_from_db(
 def should_use_db_index() -> bool:
     """Return True when DB-backed case indexing should be used."""
 
-    return os.environ.get("BAILIIKC_USE_DB_CASES", "").strip() == "1"
+    return config.use_db_cases()
 
 
 def find_case_by_fname(fname: str, *, strict: bool = False) -> Optional[CaseRow]:

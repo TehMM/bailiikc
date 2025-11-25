@@ -76,7 +76,7 @@ def test_synced_csv_can_feed_cases_index(
     session = _DummySession(sample_csv.read_bytes())
     sync_result = csv_sync.sync_csv("http://example.com/judgments.csv", session=session)
 
-    monkeypatch.delenv("BAILIIKC_USE_DB_CASES", raising=False)
+    monkeypatch.setenv("BAILIIKC_USE_DB_CASES", "0")
     cases_index.CASES_BY_ACTION.clear()
     cases_index.AJAX_FNAME_INDEX.clear()
     cases_index.CASES_ALL.clear()

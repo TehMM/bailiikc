@@ -173,6 +173,8 @@ def build_resume_worklist_for_run(
         )
         return []
 
+    # ``cases`` has one row per id; ``GROUP BY`` only collapses multiple download
+    # attempts for the same case so we return a single WorkItem each.
     cursor = conn.execute(
         """
         SELECT
@@ -218,7 +220,8 @@ def _select_run_for_resume(
 
     Baseline semantics:
       - Select the most recent run for ``csv_version_id`` whose status is not
-        ``completed``.
+        ``completed`` (including currently running entries, so a stalled run
+        can be retried).
       - Prefer runs with ``mode = 'resume'`` if present by ordering on
         ``started_at``; otherwise accept ``new``/``full`` runs.
       - Only consider runs whose planned source matches the requested source
@@ -250,6 +253,9 @@ def _select_run_for_resume(
                 if isinstance(loaded, dict):
                     run_params = loaded
             except json.JSONDecodeError:
+                log_line(
+                    "[WORKLIST] resume mode: could not decode params_json; assuming source matches"
+                )
                 run_params = {}
 
         param_source = run_params.get("target_source") or run_params.get("source")

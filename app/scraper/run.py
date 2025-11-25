@@ -85,6 +85,8 @@ def _should_apply_worklist_filter(scrape_mode: str) -> bool:
     return (
         (is_new_mode(scrape_mode) and config.use_db_worklist_for_new())
         or (is_full_mode(scrape_mode) and config.use_db_worklist_for_full())
+        # Resume planning is not yet threaded through run.py; this branch keeps
+        # flag handling ready for when it is.
         or (scrape_mode.strip().lower() == "resume" and config.use_db_worklist_for_resume())
     )
 

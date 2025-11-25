@@ -41,12 +41,6 @@ NEW_ONLY_PAGES: int = int(os.getenv("NEW_ONLY_PAGES", "2"))
 DOWNLOAD_TIMEOUT_S: int = int(os.getenv("DOWNLOAD_TIMEOUT_S", "120"))
 DOWNLOAD_RETRIES: int = int(os.getenv("DOWNLOAD_RETRIES", "3"))
 
-USE_DB_REPORTING = os.getenv("BAILIIKC_USE_DB_REPORTING", "1") == "1"
-USE_DB_CASES = os.getenv("BAILIIKC_USE_DB_CASES", "1") == "1"
-USE_DB_WORKLIST_FOR_NEW = os.getenv("BAILIIKC_USE_DB_WORKLIST_FOR_NEW", "1") == "1"
-USE_DB_WORKLIST_FOR_FULL = os.getenv("BAILIIKC_USE_DB_WORKLIST_FOR_FULL", "1") == "1"
-USE_DB_WORKLIST_FOR_RESUME = os.getenv("BAILIIKC_USE_DB_WORKLIST_FOR_RESUME", "1") == "1"
-
 COMMON_HEADERS: dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "

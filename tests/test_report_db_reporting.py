@@ -126,7 +126,7 @@ def test_downloaded_cases_endpoint_matches_json_and_db(
     _seed_db_with_download(csv_version_id)
     _seed_json_downloads(config.DOWNLOADS_LOG)
 
-    monkeypatch.delenv("BAILIIKC_USE_DB_REPORTING", raising=False)
+    monkeypatch.setenv("BAILIIKC_USE_DB_REPORTING", "0")
     main = _reload_main_module()
     client = main.app.test_client()
 
@@ -180,7 +180,7 @@ def test_report_renders_in_both_reporting_modes(
     _seed_db_with_download(csv_version_id)
     _seed_json_downloads(config.DOWNLOADS_LOG)
 
-    monkeypatch.delenv("BAILIIKC_USE_DB_REPORTING", raising=False)
+    monkeypatch.setenv("BAILIIKC_USE_DB_REPORTING", "0")
     main = _reload_main_module()
     client = main.app.test_client()
     resp_legacy = client.get("/report")

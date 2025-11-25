@@ -306,7 +306,7 @@ def load_cases_index_from_db(
 def should_use_db_index() -> bool:
     """Return True when DB-backed case indexing should be used."""
 
-    return os.environ.get("BAILIIKC_USE_DB_CASES", "").strip() == "1"
+    return os.environ.get("BAILIIKC_USE_DB_CASES", "1").strip() == "1"
 
 
 def find_case_by_fname(fname: str, *, strict: bool = False) -> Optional[CaseRow]:

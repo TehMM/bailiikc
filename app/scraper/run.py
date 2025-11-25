@@ -30,8 +30,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
-import requests
-
 from playwright.sync_api import (
     Browser,
     BrowserContext,
@@ -43,7 +41,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-from . import config, csv_sync, db
+from . import box_client, config, csv_sync, db
 from .config import is_full_mode, is_new_mode
 from .cases_index import (
     CASES_BY_ACTION,
@@ -671,77 +669,17 @@ def queue_or_download_file(
 ) -> tuple[bool, Optional[str]]:
     """Download ``url`` to ``dest_path`` with retries and validation."""
 
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    last_error: Optional[str] = None
-    safe_url = url
-    try:
-        parsed = urllib.parse.urlparse(url)
-        safe_url = urllib.parse.urlunparse(parsed._replace(query=""))
-    except Exception:
-        safe_url = url
-
-    for attempt in range(1, max_retries + 1):
-        status: Optional[int] = None
-        try:
-            if http_client is not None:
-                response = http_client(url, timeout=timeout)
-                status = getattr(response, "status", None)
-                if status is None:
-                    status = getattr(response, "status_code", None)
-                if status is not None and int(status) >= 400:
-                    raise RuntimeError(f"HTTP {status}")
-
-                body = response.body() if hasattr(response, "body") else response.content
-                if isinstance(body, str):
-                    body_bytes = body.encode("utf-8")
-                elif isinstance(body, (bytes, bytearray)):
-                    body_bytes = bytes(body)
-                else:
-                    body_bytes = bytes(body)
-
-                if not body_bytes.startswith(b"%PDF"):
-                    raise RuntimeError("Response is not a PDF")
-
-                dest_path.write_bytes(body_bytes)
-                log_line(
-                    f"[SCRAPER][BOX] token={token or ''} url={safe_url} status={status or 'unknown'} bytes={len(body_bytes)}"
-                )
-                return True, None
-
-            with requests.get(url, stream=True, timeout=timeout) as resp:
-                resp.raise_for_status()
-                status = resp.status_code
-                with dest_path.open("wb") as handle:
-                    first_chunk = True
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if not chunk:
-                            continue
-                        if first_chunk:
-                            if not chunk.startswith(b"%PDF"):
-                                raise RuntimeError("Response is not a PDF")
-                            first_chunk = False
-                        handle.write(chunk)
-
-            if dest_path.stat().st_size <= 0:
-                raise RuntimeError("Empty download")
-
-            log_line(
-                f"[SCRAPER][BOX] token={token or ''} url={safe_url} status={status or 'unknown'} bytes={dest_path.stat().st_size}"
-            )
-            return True, None
-
-        except Exception as exc:  # noqa: BLE001
-            last_error = str(exc)
-            log_line(
-                f"[SCRAPER][BOX] token={token or ''} url={safe_url} status={status or 'error'} error={exc}"
-            )
-            log_line(
-                f"[AJAX] Download attempt {attempt} for {url} failed: {exc}"
-            )
-            dest_path.unlink(missing_ok=True)
-            time.sleep(min(2 ** attempt, 5))
-
-    return False, last_error
+    result = box_client.download_pdf(
+        url,
+        dest_path,
+        http_client=http_client,
+        max_retries=max_retries,
+        timeout=timeout,
+        token=token,
+    )
+    if result.ok:
+        return True, None
+    return False, result.error_message
 
 
 def _label_for_entry(
@@ -1262,11 +1200,11 @@ def _run_scrape_attempt(
     log_line(
         f"[CASES_INDEX] using {'db' if cases_index.should_use_db_index() else 'csv'} backend"
     )
+    effective_csv_source = csv_source or config.CSV_URL
+    load_cases_index(effective_csv_source)
     log_line(
         f"[SCRAPER][PLAN] backend={'db' if cases_index.should_use_db_index() else 'csv'} total_cases={len(CASES_BY_ACTION)}"
     )
-    effective_csv_source = csv_source or config.CSV_URL
-    load_cases_index(effective_csv_source)
     meta = load_metadata()
     downloaded_index: Dict[str, Dict[str, Any]] = {}
     for entry in meta.get("downloads", []):

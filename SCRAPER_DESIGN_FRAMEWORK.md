@@ -784,14 +784,15 @@ complements the DB/worklist roadmap above.
     and per-case phases (navigation, table detection, dl_bfile request,
     response handling).
   - Ensure these logs feed into run telemetry JSON and the `runs`/`downloads`
-    tables where appropriate, gated by a debug flag (e.g.
-    `BAILIIKC_DEBUG_SCRAPER`).
+    tables where appropriate.
 
 - **PR-S2 – Isolate Box/AJAX interaction into a `box_client` abstraction**
   - Extract the dl_bfile request/response logic into a dedicated module
     (`box_client`) with a small `BoxDownloadResult` dataclass.
   - Make `run.py` and the Playwright client call this abstraction rather than
-    inlining request construction/parsing.
+    inlining request construction/parsing. (Implemented: `download_pdf`
+    centralises Box HTTP handling and `[SCRAPER][BOX]` logging; `run.py`
+    delegates its download helper to this module.)
 
 - **PR-S3 – Explicit per-case state machine**
   - Introduce a `CaseDownloadState` helper that tracks the lifecycle of a

@@ -5,7 +5,7 @@ from app.scraper import run
 
 def test_box_logging(monkeypatch, tmp_path: Path):
     messages = []
-    monkeypatch.setattr(run, "log_line", lambda msg: messages.append(str(msg)))
+    monkeypatch.setattr(run.box_client, "log_line", lambda msg: messages.append(str(msg)))
 
     def fake_http_client(url, timeout=None):  # noqa: ANN001
         class Resp:

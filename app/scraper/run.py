@@ -74,6 +74,13 @@ from .utils import (
 )
 from . import worklist
 
+
+def _should_apply_worklist_filter(scrape_mode: str) -> bool:
+    return (
+        (is_new_mode(scrape_mode) and config.use_db_worklist_for_new())
+        or (is_full_mode(scrape_mode) and config.use_db_worklist_for_full())
+    )
+
 ADMIN_AJAX = "https://judicial.ky/wp-admin/admin-ajax.php"
 
 _ONCLICK_FNAME_RE = re.compile(r"dl_bfile[^'\"]*['\"]([A-Za-z0-9]+)['\"]", re.IGNORECASE)
@@ -1219,7 +1226,9 @@ def _run_scrape_attempt(
         sync_result,
         source=worklist.DEFAULT_SOURCE,
     )
-    allowed_tokens = set(planned_cases_by_token) if planned_cases_by_token else None
+    allowed_tokens: Optional[Set[str]] = None
+    if planned_cases_by_token and _should_apply_worklist_filter(scrape_mode):
+        allowed_tokens = set(planned_cases_by_token)
 
     summary: Dict[str, Any] = {
         "base_url": base_url,

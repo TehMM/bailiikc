@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.scraper import cases_index, run, worklist
@@ -79,6 +80,26 @@ def test_full_mode_uses_db_worklist_when_flag_enabled(monkeypatch):
     assert ids["TOKENTWO"] == 9
 
 
+def test_worklist_filter_applied_only_when_flags_enabled(monkeypatch):
+    monkeypatch.setattr(run.config, "use_db_worklist_for_new", lambda: False)
+    monkeypatch.setattr(run.config, "use_db_worklist_for_full", lambda: False)
+
+    assert run._should_apply_worklist_filter("new") is False
+    assert run._should_apply_worklist_filter("full") is False
+
+    monkeypatch.setattr(run.config, "use_db_worklist_for_new", lambda: True)
+    monkeypatch.setattr(run.config, "use_db_worklist_for_full", lambda: False)
+
+    assert run._should_apply_worklist_filter("new") is True
+    assert run._should_apply_worklist_filter("full") is False
+
+    monkeypatch.setattr(run.config, "use_db_worklist_for_new", lambda: False)
+    monkeypatch.setattr(run.config, "use_db_worklist_for_full", lambda: True)
+
+    assert run._should_apply_worklist_filter("new") is False
+    assert run._should_apply_worklist_filter("full") is True
+
+
 def test_legacy_planner_used_when_flags_disabled(monkeypatch, tmp_path):
     csv_path = tmp_path / "judgments_sample.csv"
     csv_path.write_text((Path(__file__).parent / "data" / "judgments_sample.csv").read_text())
@@ -109,4 +130,3 @@ def test_legacy_planner_used_when_flags_disabled(monkeypatch, tmp_path):
     assert len(planned_full) == len(cases_index.CASES_ALL)
     assert ids_new == {}
     assert ids_full == {}
-from pathlib import Path

@@ -28,7 +28,7 @@ import time
 import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 import requests
 
@@ -47,6 +47,8 @@ from . import config, csv_sync, db
 from .config import is_full_mode, is_new_mode
 from .cases_index import (
     CASES_BY_ACTION,
+    CASES_ALL,
+    CaseRow,
     load_cases_from_csv as load_cases_index,
     normalize_action_token,
 )
@@ -70,6 +72,7 @@ from .utils import (
     save_json_file,
     setup_run_logger,
 )
+from . import worklist
 
 ADMIN_AJAX = "https://judicial.ky/wp-admin/admin-ajax.php"
 
@@ -97,6 +100,90 @@ def _short_error_message(exc: Exception, max_length: int = 200) -> str:
     if len(message) > max_length:
         return message[: max_length - 3] + "..."
     return message
+
+
+def _work_item_to_case_row(item: worklist.WorkItem) -> CaseRow:
+    token = item.action_token_norm or normalize_action_token(item.action_token_raw)
+    return CaseRow(
+        action=token,
+        code=token,
+        suffix="",
+        title=item.title,
+        subject=item.title,
+        court=item.court,
+        category=item.category,
+        judgment_date=item.judgment_date,
+        cause_number=item.cause_number,
+        extra={"case_id": item.case_id, "source": item.source},
+    )
+
+
+def _adapt_work_items_to_case_rows(items: Iterable[worklist.WorkItem]) -> List[CaseRow]:
+    return [_work_item_to_case_row(item) for item in items]
+
+
+def _legacy_plan_cases_for_new_mode(
+    sync_result: csv_sync.CsvSyncResult, *, source: str
+) -> List[CaseRow]:
+    _ = sync_result, source
+    return list(CASES_ALL)
+
+
+def _legacy_plan_cases_for_full_mode(
+    sync_result: csv_sync.CsvSyncResult, *, source: str
+) -> List[CaseRow]:
+    _ = sync_result, source
+    return list(CASES_ALL)
+
+
+def _plan_cases_for_new_mode(
+    sync_result: csv_sync.CsvSyncResult, *, source: str
+) -> List[CaseRow]:
+    if config.use_db_worklist_for_new():
+        db_items = worklist.build_new_worklist(sync_result.version_id, source=source)
+        return _adapt_work_items_to_case_rows(db_items)
+    return _legacy_plan_cases_for_new_mode(sync_result, source=source)
+
+
+def _plan_cases_for_full_mode(
+    sync_result: csv_sync.CsvSyncResult, *, source: str
+) -> List[CaseRow]:
+    if config.use_db_worklist_for_full():
+        db_items = worklist.build_full_worklist(sync_result.version_id, source=source)
+        return _adapt_work_items_to_case_rows(db_items)
+    return _legacy_plan_cases_for_full_mode(sync_result, source=source)
+
+
+def _prepare_planned_cases(
+    scrape_mode: str,
+    sync_result: Optional[csv_sync.CsvSyncResult],
+    *,
+    source: str,
+) -> tuple[Dict[str, CaseRow], Dict[str, int]]:
+    if sync_result is None:
+        return {}, {}
+
+    planned: List[CaseRow] = []
+    if is_new_mode(scrape_mode):
+        planned = _plan_cases_for_new_mode(sync_result, source=source)
+    elif is_full_mode(scrape_mode):
+        planned = _plan_cases_for_full_mode(sync_result, source=source)
+
+    planned_by_token: Dict[str, CaseRow] = {}
+    planned_case_ids: Dict[str, int] = {}
+    for case in planned:
+        token = normalize_action_token(getattr(case, "action", ""))
+        if not token:
+            continue
+        planned_by_token[token] = case
+        extra = getattr(case, "extra", None)
+        if isinstance(extra, dict) and "case_id" in extra:
+            try:
+                planned_case_ids[token] = int(extra.get("case_id"))
+            except Exception:
+                continue
+
+    return planned_by_token, planned_case_ids
 
 
 class Checkpoint:
@@ -1084,6 +1171,7 @@ def _run_scrape_attempt(
     row_limit_override: Optional[int] = None,
     run_id: Optional[int] = None,
     csv_source: Optional[str] = None,
+    sync_result: Optional[csv_sync.CsvSyncResult] = None,
 ) -> Dict[str, Any]:
     """Execute a scraping run with automatic restart/resume support."""
 
@@ -1126,6 +1214,13 @@ def _run_scrape_attempt(
         if entry.get("downloaded") and has_local_pdf(entry):
             downloaded_index[slug_value] = entry
 
+    planned_cases_by_token, planned_case_ids = _prepare_planned_cases(
+        scrape_mode,
+        sync_result,
+        source=worklist.DEFAULT_SOURCE,
+    )
+    allowed_tokens = set(planned_cases_by_token) if planned_cases_by_token else None
+
     summary: Dict[str, Any] = {
         "base_url": base_url,
         "processed": 0,
@@ -1133,7 +1228,7 @@ def _run_scrape_attempt(
         "failed": 0,
         "skipped": 0,
         "inspected_rows": 0,
-        "total_cases": len(CASES_BY_ACTION),
+        "total_cases": len(allowed_tokens) if allowed_tokens is not None else len(CASES_BY_ACTION),
         "log_file": str(log_path),
         "scrape_mode": scrape_mode,
         "skip_reasons": {},
@@ -1143,6 +1238,8 @@ def _run_scrape_attempt(
     def _lookup_case_id(token_norm: str) -> Optional[int]:
         if run_id is None or not token_norm:
             return None
+        if token_norm in planned_case_ids:
+            return planned_case_ids[token_norm]
         try:
             return db.get_case_id_by_token_norm("unreported_judgments", token_norm)
         except Exception as exc:  # noqa: BLE001
@@ -1824,7 +1921,18 @@ def _run_scrape_attempt(
                                     _log_skip_status(case_id_for_logging, "in_run_dup")
                                     continue
 
-                                case_for_fname = CASES_BY_ACTION.get(fname_key)
+                                if allowed_tokens is not None and fname_key not in allowed_tokens:
+                                    log_line(
+                                        f"[SKIP] fname={fname_token} not in planned worklist; skipping click."
+                                    )
+                                    if checkpoint is not None:
+                                        checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
+                                    summary["skipped"] += 1
+                                    _bump_reason(summary["skip_reasons"], "worklist_filtered")
+                                    _log_skip_status(case_id_for_logging, "worklist_filtered")
+                                    continue
+
+                                case_for_fname = planned_cases_by_token.get(fname_key) or CASES_BY_ACTION.get(fname_key)
                                 if case_for_fname is None:
                                     log_line(
                                         f"[SKIP][csv_miss] No CSV entry for fname={fname_token}; skipping."
@@ -2173,6 +2281,7 @@ def run_scrape(
             row_limit_override=row_limit,
             run_id=run_id,
             csv_source=csv_source,
+            sync_result=sync_result,
         )
         next_start_message = None
         return result

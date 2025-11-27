@@ -823,10 +823,39 @@ complements the DB/worklist roadmap above.
     - Records a failed attempt due to scraping or IO errors.
 
 - **PR-S4 – Centralised retry/backoff policy**
-  - Define a mapping from `error_code` / HTTP status to retry behaviour
-    (retryable vs permanent failure, max attempts).
-  - Implement a `decide_retry(error_code, attempt)` helper and integrate it
-    into the case processing loop.
+  - Introduce a small `retry_policy` helper with a single entrypoint
+    `decide_retry(error_code: Optional[str], attempt: int) -> bool` that
+    owns all logic for “should we click again for this case in this run?”.
+  - Standardise a small set of scraper-level `error_code` values:
+    - `download_other` – generic download failure (network, unexpected HTTP, etc).
+    - `disk_full` – out of space before/during download (non-retryable).
+    - `invalid_token`, `csv_miss`, `worklist_filtered`, `seen_history`,
+      `already_downloaded`, `in_run_dup` – logical skip reasons (non-retryable).
+  - Policy:
+    - `disk_full` is always non-retryable for the run; the scraper sets a
+      `stop_reason` and halts NEW/FULL rather than trying again.
+    - Logical skip reasons (`invalid_token`, `csv_miss`, `worklist_filtered`,
+      `seen_history`, `already_downloaded`, `in_run_dup`) are never retried.
+    - `download_other` may be retried up to a small cap (e.g. 3 attempts per
+      `(run_id, case_id)`), treating transient HTTP/network issues as
+      retryable but bounded. The current implementation performs a single
+      retry sweep per run while enforcing the cap via the authoritative
+      `CaseDownloadState.attempt_count` value.
+  - Integration points:
+    - Extend the `failed_items` entries collected in `run.py` to include
+      `case_id`, `error_code`, and `attempt` (derived from
+      `CaseDownloadState.attempt_count` when the failure occurred).
+    - Update `retry_failed_downloads(...)` to:
+      - For each failed item, call `decide_retry(error_code, attempt)`.
+      - Skip non-retryable items and emit `[SCRAPER][DECISION]` events with
+        `decision=skip_retry`, `reason=<error_code>` and `attempt`.
+      - For retryable items, re-click the corresponding download button on
+        the DataTable page; subsequent Box/Playwright handling and DB
+        updates proceed via the existing `CaseDownloadState` and
+        `handle_dl_bfile_from_ajax` flow.
+    - Ensure that all retry decisions (both “retry” and “do not retry”) are
+      reflected in `[SCRAPER][STATE]` / `[SCRAPER][DECISION]` logs so we can
+      reconstruct the rationale for each case.
 
 - **PR-S5 – Timeouts, page lifecycle, and Playwright robustness**
   - Add explicit, configurable timeouts for navigation, selectors, and

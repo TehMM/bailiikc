@@ -52,6 +52,7 @@ from .cases_index import (
 )
 from .csv_sync import normalize_action_token as normalize_action_token_db
 from .download_state import CaseDownloadState
+from .retry_policy import decide_retry
 from .logging_utils import _scraper_event
 from .state import clear_checkpoint, derive_checkpoint_from_logs, load_checkpoint, save_checkpoint
 from .telemetry import RunTelemetry
@@ -1059,6 +1060,7 @@ def retry_failed_downloads(
     pending_by_fname: Dict[str, Dict[str, Any]],
     processed_this_run: Set[str],
     checkpoint: Optional[Checkpoint],
+    run_id: Optional[int] = None,
 ) -> None:
     """Retry download clicks for items that previously failed."""
 
@@ -1070,6 +1072,9 @@ def retry_failed_downloads(
 
     log_line(f"[RETRY] Attempting {len(failed_items)} failed download retries.")
 
+    clicked = 0
+    skipped = 0
+
     for item in list(failed_items):
         if page.is_closed():
             log_line("[RETRY] Page closed before retry could complete; aborting remaining retries.")
@@ -1078,6 +1083,40 @@ def retry_failed_downloads(
         fname = item.get("fname")
         if not fname:
             continue
+
+        error_code = item.get("error_code") or "download_other"
+        attempt = int(item.get("attempt") or 1)
+
+        case_id = item.get("case_id")
+        if run_id is not None and isinstance(case_id, int):
+            try:
+                state = CaseDownloadState.load(run_id=run_id, case_id=case_id)
+                if state.attempt_count > 0:
+                    attempt = state.attempt_count
+            except Exception as exc:  # noqa: BLE001
+                log_line(
+                    f"[RETRY] Unable to load download state for run_id={run_id}, case_id={case_id}: {exc}"
+                )
+
+        if not decide_retry(error_code, attempt):
+            _scraper_event(
+                "decision",
+                token=fname,
+                decision="skip_retry",
+                reason=error_code,
+                attempt=attempt,
+            )
+            skipped += 1
+            continue
+
+        _scraper_event(
+            "decision",
+            token=fname,
+            decision="retry_click",
+            reason=error_code,
+            attempt=attempt,
+        )
+        clicked += 1
 
         page_index = int(item.get("page_index", 0))
         button_index = int(item.get("button_index", 0))
@@ -1145,6 +1184,10 @@ def retry_failed_downloads(
 
         if checkpoint is not None:
             checkpoint.mark_position(page_index, button_index, mode=scrape_mode)
+
+    log_line(
+        f"[RETRY] Completed retries: clicked={clicked}, skipped={skipped}, total_failed_items={len(failed_items)}."
+    )
 
 # ---------------------------------------------------------------------------
 # Main entrypoint
@@ -1564,6 +1607,8 @@ def _run_scrape_attempt(
                             elif result == "failed":
                                 summary["failed"] += 1
                                 _bump_reason(summary["fail_reasons"], "download_other")
+                                error_code_for_retry = "download_other"
+                                attempt_for_retry = state.attempt_count if state is not None else 1
                                 if norm_fname and case_context:
                                     if not any(item.get("fname") == norm_fname for item in failed_items):
                                         failed_items.append(
@@ -1576,6 +1621,9 @@ def _run_scrape_attempt(
                                                 "case": case_context.get("case"),
                                                 "slug": case_context.get("slug"),
                                                 "fid": case_context.get("fid"),
+                                                "case_id": case_id,
+                                                "error_code": error_code_for_retry,
+                                                "attempt": attempt_for_retry,
                                             }
                                         )
                             elif result == "existing_file":
@@ -2222,6 +2270,7 @@ def _run_scrape_attempt(
                             pending_by_fname=pending_by_fname,
                             processed_this_run=processed_this_run,
                             checkpoint=checkpoint if is_new_mode(scrape_mode) else None,
+                            run_id=run_id,
                         )
 
                     time.sleep(2.5)

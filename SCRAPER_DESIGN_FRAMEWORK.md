@@ -799,12 +799,28 @@ complements the DB/worklist roadmap above.
     centralises Box HTTP handling and `[SCRAPER][BOX]` logging; `run.py`
     delegates its download helper to this module.)
 
-- **PR-S3 – Explicit per-case state machine**
-  - Introduce a `CaseDownloadState` helper that tracks the lifecycle of a
-    case (`PENDING`, `REQUESTING`, `DOWNLOADED`, `FAILED_RETRYABLE`,
-    `FAILED_PERMANENT`, etc.) and enforces valid transitions.
-  - Ensure all updates to `downloads.status` and related fields go through
-    this state machine.
+- **PR-S3 – Explicit per-case download state machine**
+  - Introduce a `CaseDownloadState` helper that wraps the `downloads` row for a `(run_id, case_id)` pair and centralises all status transitions for that case within a run.
+  - Use a constrained `DownloadStatus` enum with the following values:
+    - `pending`: initial state for a case/run before any attempt has started.
+    - `in_progress`: a Playwright/Box attempt is currently being made for this case in this run.
+    - `downloaded`: a PDF has been successfully saved for this case in this run (terminal state).
+    - `skipped`: this case was deliberately not attempted (e.g. worklist filter, already downloaded) or treated as a permanent skip for this run.
+    - `failed`: this case encountered an error in this run (e.g. network, disk full) and may be retried by higher-level logic.
+  - `CaseDownloadState.start(run_id, case_id, box_url)`:
+    - Ensures a `downloads` row exists for the `(run_id, case_id)` pair.
+    - Increments `attempt_count` and sets `status="in_progress"`, `last_attempt_at` and `box_url_last` for this attempt.
+    - Emits a `[SCRAPER][STATE]` event capturing `from_status`, `to_status`, `attempt`, `run_id`, `case_id`, and `box_url`.
+  - `CaseDownloadState.mark_downloaded(...)`, `.mark_skipped(reason)`, and `.mark_failed(error_code, error_message)`:
+    - Perform guarded transitions to `downloaded`, `skipped`, and `failed` respectively, updating `status`, `attempt_count`, timestamps and error fields in the `downloads` row.
+    - Emit a `[SCRAPER][STATE]` event for each transition with `from_status`, `to_status`, `attempt`, `run_id`, `case_id`, and any relevant file/error metadata.
+  - Transitions are restricted:
+    - `downloaded` is treated as terminal; attempting to move from `downloaded` to any other status logs a `[SCRAPER][ERROR] invalid_transition_after_download` event and leaves the DB row unchanged.
+    - Other transitions (e.g. `pending → in_progress`, `in_progress → downloaded|skipped|failed`) are allowed; callers never write `downloads.status` directly.
+  - The scraper core (`run.py`) must use `CaseDownloadState` whenever it:
+    - Starts a Box/Playwright attempt for a case.
+    - Decides to skip a case (e.g. worklist filter, already downloaded, invalid token).
+    - Records a failed attempt due to scraping or IO errors.
 
 - **PR-S4 – Centralised retry/backoff policy**
   - Define a mapping from `error_code` / HTTP status to retry behaviour

@@ -55,6 +55,65 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 - Phases include `NAV` (run setup), `PLAN` (CSV sync, case index selection, and worklist planning), `TABLE` (pagination, row counts, limits), `DECISION` (per-token skip/download choices), `BOX` (Box download results), `STATE` (checkpoint/resume decisions), and `ERROR` (unexpected run-level failures).
 - For quick diagnosis, grep `[SCRAPER][ERROR]` for fatal issues and `[SCRAPER][BOX]` plus `[SCRAPER][DECISION]` to see why specific tokens were downloaded or skipped.
 
+## Download state machine and DB-backed attempt logging
+
+- **Downloads table semantics**
+  - The `downloads` table tracks per-run, per-case attempt state. Each row is identified by `(run_id, case_id)` and carries:
+    - `status` – one of `pending`, `in_progress`, `downloaded`, `skipped`, `failed`.
+    - `attempt_count` – number of attempts made for this case in this run.
+    - `last_attempt_at` – ISO8601 UTC timestamp of the most recent attempt.
+    - `file_path` / `file_size_bytes` – last known file path and size when a download succeeds (or when earlier logic recorded these).
+    - `box_url_last` – last Box URL used for this case.
+    - `error_code` / `error_message` – a coarse error category and message for failures or permanent skips.
+  - Rows are created lazily via `db.ensure_download_row(run_id, case_id)` whenever the scraper first needs to log activity for a case in a given run.
+
+- **CaseDownloadState helper**
+  - `app.scraper.download_state.CaseDownloadState` is a small state machine wrapper around the `downloads` row:
+    - `CaseDownloadState.load(run_id, case_id)`:
+      - Ensures a `downloads` row exists (if `case_id` is not `None`) and returns a `CaseDownloadState` with the current `status`, `attempt_count`, and `download_id`.
+      - For unknown or malformed `status` values in the DB, it falls back to `pending` rather than raising.
+    - `CaseDownloadState.start(run_id, case_id, box_url)`:
+      - Ensures a row exists and, if allowed, transitions the case to `in_progress` for this run:
+        - Increments `attempt_count`.
+        - Sets `status="in_progress"`, updates `last_attempt_at`, and records `box_url_last`.
+        - Emits `[SCRAPER][STATE]` with `from_status`, `to_status`, `attempt`, `run_id`, `case_id`, `download_id`, and `box_url`.
+      - If the current status is already `downloaded`, the transition is rejected, a `[SCRAPER][ERROR] invalid_transition_after_download` event is logged, and the DB row is left unchanged.
+    - `CaseDownloadState.mark_downloaded(file_path, file_size_bytes, box_url)`:
+      - Moves the case to `downloaded` for this run, updating `status`, `last_attempt_at`, `file_path`, `file_size_bytes`, and `box_url_last`.
+      - Emits a `[SCRAPER][STATE]` event describing the transition and file metadata.
+    - `CaseDownloadState.mark_skipped(reason)`:
+      - Marks the case as `skipped` for this run with a permanent reason, updating `status`, `last_attempt_at`, and `error_code=reason`.
+      - Used both for pre-click skip decisions (e.g. worklist filters, CSV misses, already-downloaded cases) and for “pseudo-success” results where no new download occurs.
+      - Emits a `[SCRAPER][STATE]` event including `reason` and current attempt metadata.
+    - `CaseDownloadState.mark_failed(error_code, error_message)`:
+      - Marks the case as `failed` for this run, updating `status`, `last_attempt_at`, `error_code`, and `error_message` (while leaving `file_path`/`file_size_bytes` untouched).
+      - Emits a `[SCRAPER][STATE]` event with error details.
+
+- **Mapping scraper results to download states**
+  - The Playwright AJAX handler in `run.py` integrates `CaseDownloadState` as follows for each `dl_bfile` response when a `case_id` is known:
+    - Before calling `handle_dl_bfile_from_ajax`, it calls `CaseDownloadState.start(...)` to mark the attempt as `in_progress`.
+    - It then calls `handle_dl_bfile_from_ajax(...)`, which returns `(result, download_info)` where `result` is one of:
+      - `"downloaded"` – a new file has been saved.
+      - `"existing_file"` – a local PDF already exists or metadata/local file combination confirms a prior download.
+      - `"checkpoint_skip"` – NEW-mode checkpoint indicates this token was processed in a prior run.
+      - `"duplicate_in_run"` – in-run dedupe for repeated AJAX responses.
+      - `"failed"` – the download attempt failed (e.g. network, HTTP, filesystem).
+      - `"disk_full"` – disk-space guard triggered before or during download.
+    - The `result` is mapped to the state machine:
+      - `"downloaded"` → `state.mark_downloaded(file_path, file_size_bytes, box_url_last)`.
+      - `"existing_file"`, `"checkpoint_skip"`, `"duplicate_in_run"` → `state.mark_skipped(reason=result)`.
+      - `"disk_full"` → `state.mark_failed(error_code="disk_full", error_message=download_info.error_message)`.
+      - `"failed"` → `state.mark_failed(error_code="download_other", error_message=download_info.error_message)`.
+  - Skip decisions made earlier in the control flow (e.g. invalid token, worklist filtering, CSV miss, already downloaded in metadata, seen in checkpoint) call:
+    - `_log_skip_status(case_id, reason)` → `CaseDownloadState.load(...).mark_skipped(reason)`; this ensures each skip is mirrored in the `downloads` table with `status="skipped"` and `error_code=reason`.
+
+- **Invariants**
+  - Each `(run_id, case_id)` has at most one logical state at any time, derived from the `downloads.status` value.
+  - `downloaded` is terminal for that run:
+    - Any later attempt to move the case to a non-`downloaded` status is rejected by `CaseDownloadState`, which logs a `[SCRAPER][ERROR] invalid_transition_after_download` and leaves the DB row unchanged.
+  - Scraper code never updates `downloads.status` directly; all write paths go through `CaseDownloadState` or `db.ensure_download_row` (for row creation only).
+  - All state transitions are echoed into structured logs via `[SCRAPER][STATE]` so that an operator can answer “what happened to case X in run Y?” by reading the DB and/or log stream.
+
 ## Known Limitations / Fragility
 - The judgments CSV is still fetched from the remote URL on each run. While `csv_sync.sync_csv` now records `csv_versions` rows and local CSV files for versioning, there is no offline fallback when the source is unavailable, so network hiccups can still prevent a run from starting.
 - Resume relies on JSON checkpoints and log parsing, leading to complexity when recovering mid-run.

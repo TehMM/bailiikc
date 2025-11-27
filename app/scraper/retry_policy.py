@@ -5,18 +5,24 @@ from typing import Optional
 from .logging_utils import _scraper_event
 
 _ERROR_RETRY_LIMITS = {
+    # Transient download failures (HTTP/network/Box) – bounded retries.
     "download_other": 3,
 }
 
 
 NON_RETRYABLE_ERROR_CODES = {
+    # Hard, run-scoped environmental failure.
     "disk_full",
+    # Logical skips – never retried.
     "invalid_token",
     "csv_miss",
     "worklist_filtered",
     "seen_history",
     "already_downloaded",
     "in_run_dup",
+    "exists_ok",
+    # Click-level failures are bounded in-page and should not be retried globally.
+    "click_timeout",
 }
 
 
@@ -30,22 +36,49 @@ def decide_retry(error_code: Optional[str], attempt: int) -> bool:
     (i.e. the attempt_count recorded in the downloads row for
     the failed attempt).
     """
-    code = (error_code or "").strip() or None
-    if code is None:
+    code = (error_code or "").strip()
+    if not code:
+        _scraper_event(
+            "state",
+            decision_phase="retry_decision",
+            error_code=None,
+            attempt=attempt,
+            max_attempts=None,
+            will_retry=False,
+            reason="missing_error_code",
+        )
         return False
 
     if code in NON_RETRYABLE_ERROR_CODES:
+        _scraper_event(
+            "state",
+            decision_phase="retry_decision",
+            error_code=code,
+            attempt=attempt,
+            max_attempts=None,
+            will_retry=False,
+            reason="non_retryable_error_code",
+        )
         return False
 
     max_attempts = _ERROR_RETRY_LIMITS.get(code)
     if max_attempts is None:
+        _scraper_event(
+            "state",
+            decision_phase="retry_decision",
+            error_code=code,
+            attempt=attempt,
+            max_attempts=None,
+            will_retry=False,
+            reason="no_retry_policy_for_code",
+        )
         return False
 
     should_retry = attempt < max_attempts
 
     _scraper_event(
         "state",
-        phase="retry_decision",
+        decision_phase="retry_decision",
         error_code=code,
         attempt=attempt,
         max_attempts=max_attempts,

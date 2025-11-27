@@ -41,6 +41,25 @@ NEW_ONLY_PAGES: int = int(os.getenv("NEW_ONLY_PAGES", "2"))
 DOWNLOAD_TIMEOUT_S: int = int(os.getenv("DOWNLOAD_TIMEOUT_S", "120"))
 DOWNLOAD_RETRIES: int = int(os.getenv("DOWNLOAD_RETRIES", "3"))
 
+# Playwright timeouts (milliseconds unless stated otherwise)
+PLAYWRIGHT_NAV_TIMEOUT_MS: int = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", "20000"))
+PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS: int = int(
+    os.getenv("PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS", "20000")
+)
+PLAYWRIGHT_TABLE_WAIT_MS: int = int(os.getenv("PLAYWRIGHT_TABLE_WAIT_MS", "15000"))
+PLAYWRIGHT_CLICK_TIMEOUT_MS: int = int(os.getenv("PLAYWRIGHT_CLICK_TIMEOUT_MS", "2000"))
+
+# Short sleeps (seconds) for click pacing and retry settle
+PLAYWRIGHT_POST_CLICK_SLEEP_SECONDS: float = float(
+    os.getenv("PLAYWRIGHT_POST_CLICK_SLEEP_SECONDS", "0.4")
+)
+PLAYWRIGHT_RETRY_PAGE_SETTLE_SECONDS: float = float(
+    os.getenv("PLAYWRIGHT_RETRY_PAGE_SETTLE_SECONDS", "0.3")
+)
+PLAYWRIGHT_RETRY_AFTER_SWEEP_SECONDS: float = float(
+    os.getenv("PLAYWRIGHT_RETRY_AFTER_SWEEP_SECONDS", "2.5")
+)
+
 COMMON_HEADERS: dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "

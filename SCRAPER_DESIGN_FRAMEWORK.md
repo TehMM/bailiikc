@@ -827,16 +827,21 @@ complements the DB/worklist roadmap above.
     `decide_retry(error_code: Optional[str], attempt: int) -> bool` that
     owns all logic for “should we click again for this case in this run?”.
   - Standardise a small set of scraper-level `error_code` values:
-    - `download_other` – generic download failure (network, unexpected HTTP, etc).
-    - `disk_full` – out of space before/during download (non-retryable).
-    - `invalid_token`, `csv_miss`, `worklist_filtered`, `seen_history`,
-      `already_downloaded`, `in_run_dup` – logical skip reasons (non-retryable).
+    - Retryable (bounded by attempt caps):
+      - `download_other` – generic download failure (network, unexpected HTTP, etc).
+    - Non-retryable (fail closed):
+      - `disk_full` – out of space before/during download.
+      - Logical skips: `invalid_token`, `csv_miss`, `worklist_filtered`, `seen_history`,
+        `already_downloaded`, `in_run_dup`, `exists_ok`.
+      - Click failures already retried locally: `click_timeout`.
   - Policy:
     - `disk_full` is always non-retryable for the run; the scraper sets a
       `stop_reason` and halts NEW/FULL rather than trying again.
     - Logical skip reasons (`invalid_token`, `csv_miss`, `worklist_filtered`,
-      `seen_history`, `already_downloaded`, `in_run_dup`) are never retried.
-    - `download_other` may be retried up to a small cap (e.g. 3 attempts per
+      `seen_history`, `already_downloaded`, `in_run_dup`, `exists_ok`) are never retried.
+    - `click_timeout` failures are logged to the DB (when a case_id is known) and
+      captured in `failed_items` but treated as non-retryable at the policy layer.
+    - `download_other` may be retried up to a small cap (3 attempts per
       `(run_id, case_id)`), treating transient HTTP/network issues as
       retryable but bounded. The current implementation performs a single
       retry sweep per run while enforcing the cap via the authoritative
@@ -859,7 +864,7 @@ complements the DB/worklist roadmap above.
 
 - **PR-S5 – Timeouts, page lifecycle, and Playwright robustness**
   - Add explicit, configurable timeouts for navigation, selectors, and
-    downloads.
+    downloads (see `PLAYWRIGHT_*` knobs in `app/scraper/config.py`).
   - Wrap Playwright usage in helpers that ensure proper cleanup and clear
     error reporting when pages/timeouts misbehave.
 

@@ -43,7 +43,7 @@ class CaseDownloadState:
         status_value = (
             row["status"]
             if row is not None and "status" in row.keys()
-            else DownloadStatus.PENDING
+            else DownloadStatus.PENDING.value
         )
         status = _safe_status(status_value)
         attempt_count = (
@@ -152,11 +152,22 @@ class CaseDownloadState:
         if not self._ensure_can_transition(target_status):
             return
 
+        if self.case_id is None:
+            _scraper_event(
+                "state",
+                run_id=self.run_id,
+                case_id=None,
+                from_status=self.status.value,
+                to_status=target_status.value,
+                reason=reason or error_code or "no_case_id",
+            )
+            return
+
         prev = self.status
         self.status = target_status
         db.update_download_status(
             run_id=self.run_id,
-            case_id=self.case_id if self.case_id is not None else -1,
+            case_id=self.case_id,
             status=self.status.value,
             attempt_count=self.attempt_count,
             last_attempt_at=_now_iso(),

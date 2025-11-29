@@ -166,3 +166,19 @@ def test_download_state_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert row["status"] == DownloadStatus.FAILED.value
     assert row["error_code"] == "disk_full"
     assert row["error_message"] == "no space left"
+
+
+def test_download_state_failed_with_default_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_temp_paths(tmp_path, monkeypatch)
+    db.initialize_schema()
+    ids = _create_run_and_case()
+
+    state = CaseDownloadState.start(
+        run_id=ids["run_id"],
+        case_id=ids["case_id"],
+        box_url="https://example.com/box",
+    )
+    state.mark_failed(error_message="unhandled")
+
+    row = _select_download(ids["run_id"], ids["case_id"])
+    assert row["error_code"] == "internal_error"

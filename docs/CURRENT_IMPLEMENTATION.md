@@ -158,3 +158,10 @@ The harness never mutates the main `/app/data/pdfs` directory or JSON logs; it t
 - Resume relies on JSON checkpoints and log parsing, leading to complexity when recovering mid-run.
 - Disk space guardrails are basic (free-space checks via `utils.disk_has_room`), and filename length issues require fallbacks.
 - The Playwright AJAX capture flow is delicate; nonce/session handling and Box URL extraction were tuned through trial and error and should remain untouched for now.
+
+### Error codes, retries, and validation
+
+- `downloads.error_code` values follow the internal taxonomy in `app.scraper.error_codes.ErrorCode` and are logged alongside failures for traceability.
+- `CaseDownloadState.mark_failed` records `error_code`/`error_message` to keep DB rows and structured logs aligned.
+- Box downloads validate `%PDF` headers and a minimum size before writing; replay stubs are padded to satisfy the same check.
+- Retry behaviour is driven by `retry_policy.decide_retry`, using `error_code`/HTTP status to decide and `compute_backoff_seconds` for bounded exponential delays.

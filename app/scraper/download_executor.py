@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from . import config
 from .logging_utils import _scraper_event
 
-DownloadFn = Callable[[], Tuple[bool, Optional[str]]]
+DownloadFn = Callable[[], Tuple[bool, Optional[dict[str, Any]]]]
 
 
 class DownloadExecutor:
@@ -31,7 +31,7 @@ class DownloadExecutor:
         self._in_flight: int = 0
         self._peak_in_flight: int = 0
 
-    def submit(self, token: str, fn: DownloadFn) -> Tuple[bool, Optional[str]]:
+    def submit(self, token: str, fn: DownloadFn) -> Tuple[bool, Optional[dict[str, Any]]]:
         """
         Execute ``fn`` synchronously or via a thread pool based on configuration.
 
@@ -56,14 +56,14 @@ class DownloadExecutor:
             self._in_flight += 1
             self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
 
-        def _wrapped() -> Tuple[bool, Optional[str]]:
+        def _wrapped() -> Tuple[bool, Optional[dict[str, Any]]]:
             try:
                 return fn()
             finally:
                 with self._lock:
                     self._in_flight -= 1
 
-        future: Future[Tuple[bool, Optional[str]]] = self._executor.submit(_wrapped)
+        future: Future[Tuple[bool, Optional[dict[str, Any]]]] = self._executor.submit(_wrapped)
         return future.result()
 
     @property

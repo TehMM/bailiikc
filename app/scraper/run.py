@@ -54,6 +54,7 @@ from .cases_index import (
 )
 from .csv_sync import normalize_action_token as normalize_action_token_db
 from .download_state import CaseDownloadState
+from .error_codes import ErrorCode
 from .retry_policy import decide_retry
 from .logging_utils import _scraper_event
 from .state import clear_checkpoint, derive_checkpoint_from_logs, load_checkpoint, save_checkpoint
@@ -804,7 +805,7 @@ def queue_or_download_file(
     max_retries: int = 3,
     timeout: int = config.PLAYWRIGHT_DOWNLOAD_TIMEOUT_SECONDS,
     token: Optional[str] = None,
-) -> tuple[bool, Optional[str]]:
+) -> tuple[bool, Optional[dict[str, Any]]]:
     """Download ``url`` to ``dest_path`` with retries and validation."""
 
     if config.REPLAY_SKIP_NETWORK:
@@ -815,20 +816,30 @@ def queue_or_download_file(
             token=token or url,
         )
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        dest_path.write_bytes(REPLAY_STUB_PDF_HEADER)
-        return True, None
+        padded = REPLAY_STUB_PDF_HEADER + (b"0" * max(0, box_client.MIN_PDF_BYTES - len(REPLAY_STUB_PDF_HEADER)))
+        dest_path.write_bytes(padded)
+        return True, {"file_path": str(dest_path)}
 
-    result = box_client.download_pdf(
-        url,
-        dest_path,
-        http_client=http_client,
-        max_retries=max_retries,
-        timeout=timeout,
-        token=token,
-    )
-    if result.ok:
-        return True, None
-    return False, result.error_message
+    try:
+        result = box_client.download_pdf(
+            url,
+            dest_path,
+            http_client=http_client,
+            max_retries=max_retries,
+            timeout=timeout,
+            token=token,
+        )
+        if result.ok:
+            return True, {"status_code": result.status_code}
+        return False, {"error_code": ErrorCode.INTERNAL, "error_message": "download_failed"}
+    except box_client.DownloadError as exc:
+        return False, {
+            "error_code": exc.error_code,
+            "error_message": str(exc),
+            "http_status": getattr(exc, "http_status", None),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return False, {"error_code": ErrorCode.INTERNAL, "error_message": str(exc)}
 
 
 def _log_download_executor_summary(executor: Optional[DownloadExecutor]) -> None:
@@ -896,6 +907,7 @@ def handle_dl_bfile_from_ajax(
         "file_path": None,
         "file_size_bytes": None,
         "error_message": None,
+        "error_code": None,
     }
 
     def _return_result(result: str, details: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
@@ -911,6 +923,7 @@ def handle_dl_bfile_from_ajax(
             run_id=run_id,
             size_bytes=size_bytes,
             error_message=details.get("error_message") if isinstance(details, dict) else None,
+            error_code=details.get("error_code") if isinstance(details, dict) else None,
         )
         return result, details
     if not norm_fname:
@@ -1102,10 +1115,10 @@ def handle_dl_bfile_from_ajax(
         return _return_result("disk_full", {**download_details, "error_message": "disk_full"})
 
     success = False
-    error: Optional[str] = None
+    error_info: Optional[dict[str, Any]] = None
     download_path = pdf_path
 
-    def _download() -> Tuple[bool, Optional[str]]:
+    def _download() -> Tuple[bool, Optional[dict[str, Any]]]:
         return queue_or_download_file(
             box_url,
             download_path,
@@ -1115,18 +1128,26 @@ def handle_dl_bfile_from_ajax(
             token=norm_fname,
         )
 
-    def _execute_download() -> Tuple[bool, Optional[str]]:
+    def _execute_download() -> Tuple[bool, Optional[dict[str, Any]]]:
         try:
             if download_executor is not None:
                 return download_executor.submit(norm_fname, _download)
             return _download()
         except OSError as exc:  # noqa: PERF203
-            return False, str(exc)
+            return False, {"error_code": ErrorCode.INTERNAL, "error_message": str(exc)}
 
-    success, error = _execute_download()
+    success, error_info = _execute_download()
 
-    if not success and error:
-        lowered = error.lower()
+    error_message: Optional[str] = None
+    error_code: Optional[str] = None
+    if error_info:
+        error_message = (
+            error_info.get("error_message") if isinstance(error_info, dict) else str(error_info)
+        )
+        error_code = error_info.get("error_code") if isinstance(error_info, dict) else None
+
+    if not success and error_message:
+        lowered = error_message.lower()
         if "file name too long" in lowered or "errno 36" in lowered or "errno 63" in lowered:
             fallback_path = hashed_fallback_path(downloads_dir, subject_label)
             if fallback_path != pdf_path:
@@ -1135,14 +1156,24 @@ def handle_dl_bfile_from_ajax(
                 )
                 final_path = fallback_path
                 download_path = fallback_path
-                success, error = _execute_download()
+                success, error_info = _execute_download()
+                if error_info:
+                    error_message = error_info.get("error_message")
+                    error_code = error_info.get("error_code")
 
     if not success:
         log_line(
-            f"[AJAX] Download failed for {display_name} -> {final_path.name}: {error}"
+            f"[AJAX] Download failed for {display_name} -> {final_path.name}: {error_message}"
         )
         final_path.unlink(missing_ok=True)
-        return _return_result("failed", {**download_details, "error_message": error or "unknown"})
+        return _return_result(
+            "failed",
+            {
+                **download_details,
+                "error_message": error_message or "unknown",
+                "error_code": error_code or ErrorCode.INTERNAL,
+            },
+        )
 
     size_bytes = final_path.stat().st_size
     log_line(
@@ -1249,7 +1280,8 @@ def retry_failed_downloads(
         if not fname:
             continue
 
-        error_code = item.get("error_code") or "download_other"
+        error_code = item.get("error_code") or ErrorCode.INTERNAL
+        http_status = item.get("http_status") if isinstance(item, dict) else None
         attempt = int(item.get("attempt") or 1)
 
         case_id = item.get("case_id")
@@ -1272,7 +1304,12 @@ def retry_failed_downloads(
             case_id=case_id,
         )
 
-        if not decide_retry(error_code, attempt):
+        if not decide_retry(
+            attempt_index=attempt,
+            max_attempts=config.DOWNLOAD_RETRIES,
+            error_code=error_code,
+            http_status=http_status,
+        ):
             _scraper_event(
                 "decision",
                 token=fname,
@@ -1281,6 +1318,7 @@ def retry_failed_downloads(
                 attempt=attempt,
                 run_id=run_id,
                 case_id=case_id,
+                http_status=http_status,
             )
             skipped += 1
             continue
@@ -1293,6 +1331,7 @@ def retry_failed_downloads(
             attempt=attempt,
             run_id=run_id,
             case_id=case_id,
+            http_status=http_status,
         )
         clicked += 1
 
@@ -1859,8 +1898,11 @@ def _run_scrape_attempt(
                                         _remove_failed_record(norm_fname)
                                 elif result == "failed":
                                     summary["failed"] += 1
-                                    _bump_reason(summary["fail_reasons"], "download_other")
-                                    error_code_for_retry = "download_other"
+                                    download_info_dict = download_info if isinstance(download_info, dict) else {}
+                                    error_code_for_retry = (
+                                        download_info_dict.get("error_code") or ErrorCode.INTERNAL
+                                    )
+                                    _bump_reason(summary["fail_reasons"], error_code_for_retry)
                                     attempt_for_retry = state.attempt_count if state is not None else 1
                                     if norm_fname and case_context:
                                         if not any(item.get("fname") == norm_fname for item in failed_items):
@@ -1876,6 +1918,7 @@ def _run_scrape_attempt(
                                                     "fid": case_context.get("fid"),
                                                     "case_id": case_id,
                                                     "error_code": error_code_for_retry,
+                                                    "http_status": download_info_dict.get("http_status"),
                                                     "attempt": attempt_for_retry,
                                                 }
                                             )
@@ -1901,6 +1944,7 @@ def _run_scrape_attempt(
                                     disk_full_encountered = True
     
                                 error_message = download_info.get("error_message") if isinstance(download_info, dict) else None
+                                error_code = download_info.get("error_code") if isinstance(download_info, dict) else None
                                 file_path = download_info.get("file_path") if isinstance(download_info, dict) else None
                                 file_size_bytes = download_info.get("file_size_bytes") if isinstance(download_info, dict) else None
                                 box_url_last = download_info.get("box_url") if isinstance(download_info, dict) else box_url
@@ -1922,7 +1966,7 @@ def _run_scrape_attempt(
                                             )
                                         elif result == "failed":
                                             state.mark_failed(
-                                                error_code="download_other",
+                                                error_code=error_code or ErrorCode.INTERNAL,
                                                 error_message=error_message,
                                             )
                                     except Exception as exc:  # noqa: BLE001

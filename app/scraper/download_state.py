@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any, Optional
 
 from . import db
+from .error_codes import ErrorCode
 from .logging_utils import _scraper_event
 
 
@@ -222,12 +223,24 @@ class CaseDownloadState:
 
         self._mark_result(target_status=DownloadStatus.SKIPPED, reason=reason)
 
-    def mark_failed(self, *, error_code: str, error_message: Optional[str]) -> None:
-        """Mark this case as failed for this attempt."""
+    def mark_failed(
+        self,
+        *,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Mark this case as failed for this attempt.
+
+        ``error_code`` is optional for backwards compatibility. When omitted the
+        failure will be recorded using ``internal_error`` to ensure DB rows and
+        logs still capture a reason for the failure.
+        """
+
+        final_error_code = error_code or ErrorCode.INTERNAL
 
         self._mark_result(
             target_status=DownloadStatus.FAILED,
-            error_code=error_code,
+            error_code=final_error_code,
             error_message=error_message,
         )
 

@@ -873,7 +873,11 @@ complements the DB/worklist roadmap above.
     `PLAYWRIGHT_SELECTOR_TIMEOUT_SECONDS` (`BAILIIKC_SELECTOR_TIMEOUT_SECONDS`,
     default 20s), and `PLAYWRIGHT_DOWNLOAD_TIMEOUT_SECONDS`
     (`BAILIIKC_DOWNLOAD_TIMEOUT_SECONDS`, default 120s). Click pacing
-    timeouts remain configurable via dedicated knobs.
+    timeouts remain configurable via dedicated knobs:
+    `PLAYWRIGHT_CLICK_TIMEOUT_MS`, `PLAYWRIGHT_POST_CLICK_SLEEP_SECONDS`,
+    `PLAYWRIGHT_RETRY_PAGE_SETTLE_SECONDS`, and
+    `PLAYWRIGHT_RETRY_AFTER_SWEEP_SECONDS`. All values can be tuned via the
+    environment without code changes.
   - Wrap Playwright usage in helpers that ensure proper cleanup and clear
     error reporting when pages/timeouts misbehave.
 

@@ -2001,6 +2001,16 @@ def _run_scrape_attempt(
                                     )
                                     break
 
+                                if not _wait_for_datatable_ready(
+                                    page,
+                                    page_index=page_index_zero,
+                                    phase="pagination_nav",
+                                ):
+                                    log_line(
+                                        f"[RUN] DataTable not ready after navigating to page {page_number}; stopping pagination loop."
+                                    )
+                                    break
+
                                 if checkpoint is not None:
                                     checkpoint.mark_page(page_index_zero, reset_row=False, mode=scrape_mode)
                                 _persist_state(page_index_zero, -1)

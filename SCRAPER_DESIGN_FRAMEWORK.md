@@ -951,6 +951,7 @@ Config safety and guardrails:
   - No planned cases: suspicious if `cases_total > 0` and `cases_downloaded == 0`, otherwise ok.
   - Planned cases present: suspicious if `cases_attempted == 0`; ok when `coverage_ratio >= 0.95` and `cases_failed == 0`; partial when `coverage_ratio >= 0.6`; failed when `coverage_ratio < 0.1` with failures recorded; otherwise partial.
 - Persist coverage and `run_health` back to the `runs` row and expose them via reporting helpers and APIs (`/api/db/runs`, `/api/db/runs/<run_id>/health`).
+- Download diagnostics must validate `run_id` early: `summarise_downloads_for_run` should raise `RunNotFoundError` when the run row is missing so HTTP endpoints can return a 404 (`/api/db/runs/<run_id>/download-summary`, `/api/db/runs/<run_id>/health`).
 
 11.1 Health & diagnostics
 

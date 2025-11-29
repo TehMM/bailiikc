@@ -79,6 +79,7 @@ from .utils import (
     setup_run_logger,
 )
 from . import worklist
+from .config_validation import validate_runtime_config
 
 
 def _should_apply_worklist_filter(scrape_mode: str) -> bool:
@@ -2812,6 +2813,9 @@ def run_scrape(
     try:
         result = run_with_retries(_attempt, max_retries=max(1, retry_limit))
         if run_id is not None:
+            result.setdefault("run_id", run_id)
+        result.setdefault("csv_version_id", csv_version_id)
+        if run_id is not None:
             try:
                 db.mark_run_completed(run_id)
             except Exception as exc:  # noqa: BLE001
@@ -2858,6 +2862,7 @@ if __name__ == "__main__":  # pragma: no cover
     args = parser.parse_args()
 
     ensure_dirs()
+    validate_runtime_config("cli", mode=args.scrape_mode)
     run_scrape(
         base_url=args.base_url,
         page_wait=args.page_wait,

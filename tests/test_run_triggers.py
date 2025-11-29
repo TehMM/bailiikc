@@ -51,7 +51,7 @@ def test_ui_scrape_uses_ui_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     def fake_run_scrape(*args, **kwargs):
         calls["args"] = args
         calls["kwargs"] = kwargs
-        return {"log_file": "dummy.log"}
+        return {"log_file": "dummy.log", "run_id": 1}
 
     monkeypatch.setattr(main, "run_scrape", fake_run_scrape)
     monkeypatch.setattr(main.threading, "Thread", _DummyThread)
@@ -81,9 +81,7 @@ def test_webhook_uses_webhook_trigger(tmp_path: Path, monkeypatch: pytest.Monkey
     _configure_temp_paths(tmp_path, monkeypatch)
     db.initialize_schema()
 
-    monkeypatch.setenv("WEBHOOK_ENABLED", "true")
-    monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
-    monkeypatch.setenv("WEBHOOK_COOLDOWN_SEC", "0")
+    monkeypatch.setattr(config, "WEBHOOK_SHARED_SECRET", "test-secret")
 
     main = _reload_main_module()
 
@@ -92,22 +90,26 @@ def test_webhook_uses_webhook_trigger(tmp_path: Path, monkeypatch: pytest.Monkey
     def fake_run_scrape(*args, **kwargs):
         calls["args"] = args
         calls["kwargs"] = kwargs
-        return {"log_file": "dummy.log"}
+        return {"log_file": "dummy.log", "run_id": 1}
 
     monkeypatch.setattr(main, "run_scrape", fake_run_scrape)
-    monkeypatch.setattr(main.threading, "Thread", _DummyThread)
 
     client = main.app.test_client()
-    resp = client.post("/webhook/changedetection?token=test-secret")
+    resp = client.post(
+        "/webhook/changedetection",
+        json={"target_source": "unreported_judgments", "mode": "new", "new_limit": 5},
+        headers={"X-Webhook-Token": "test-secret"},
+    )
 
-    assert resp.status_code == 202
+    assert resp.status_code == 200
     data = resp.get_json()
     assert data["ok"] is True
-    assert data.get("triggered") == "new-only"
+    assert data.get("run_id") == 1
 
     assert "kwargs" in calls
     kwargs = calls["kwargs"]
     assert kwargs["trigger"] == "webhook"
     assert kwargs["scrape_mode"] == "new"
-    assert kwargs["new_limit"] == main.WEBHOOK_FIRST_PAGE_LIMIT
-    assert kwargs["row_limit"] == main.WEBHOOK_FIRST_PAGE_LIMIT
+    assert kwargs["new_limit"] == 5
+    assert kwargs["row_limit"] == 5
+    assert kwargs["limit_pages"] == [0]

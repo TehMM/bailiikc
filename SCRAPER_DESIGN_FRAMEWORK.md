@@ -918,19 +918,10 @@ complements the DB/worklist roadmap above.
 
 POST /webhook/changedetection:
 
-Validates a shared secret/token from headers or query.
-
-Restricts run to:
-
-mode="new".
-
-target_source="unreported_judgments".
-
-Reasonable new_limit (e.g. max 20–50).
-
-Uses resume_strategy="none" (or a safe default).
-
-Returns JSON with run_id, counts, and simple status.
+- Authentication: shared secret `BAILIIKC_WEBHOOK_SHARED_SECRET` is required. Token may be supplied via `X-Webhook-Token` header or `?token=` query string. When the secret is unset, the route responds with `{ok: false, error: "webhook_disabled"}` and 404 to avoid accidental exposure. Invalid tokens return 403 with `{ok: false, error: "invalid_token"}` and a `[SCRAPER][ERROR] phase=webhook` event.
+- Payload: accepts JSON or form/query parameters. Required fields are `mode="new"` and `target_source="unreported_judgments"`; `new_limit` is optional and defaults to `min(SCRAPE_NEW_LIMIT, WEBHOOK_NEW_LIMIT_MAX)`. `new_limit` must be >=1 and is clamped to `WEBHOOK_NEW_LIMIT_MAX` (default 50), emitting a `[SCRAPER][STATE] phase=webhook kind=limit_clamped` event when clamped.
+- Behaviour: executes a synchronous “new” scrape with `trigger="webhook"`, `resume_mode="none"`, and `limit_pages=[0]` to bound runtime. `run_scrape` records the run row and returns the summary used in the HTTP response.
+- Response: on success returns 200 JSON `{ok, entrypoint:"webhook", mode:"new", target_source:"unreported_judgments", run_id, csv_version_id, summary:{processed, downloaded, skipped, failed}}`. Invalid payloads respond with 400 `{ok: false, error: "invalid_params", details:[...]}`. Config validation failures respond with `{ok: false, error: "config_invalid"}`.
 
 11. General Web-Scraping Conventions (Project-Wide)
 
@@ -945,6 +936,12 @@ Use requests with sensible timeouts, not default infinite waits.
 Catch and log requests.Timeout and other network errors explicitly.
 
 Introduce random jitter into delays to avoid obvious scraping patterns.
+
+Config safety and guardrails:
+
+- `app.scraper.config_validation.validate_runtime_config(entrypoint, mode)` enforces runtime invariants before any scrape runs. Entry points (CLI, UI, webhook, replay) must call this to block dangerous combinations.
+- `REPLAY_SKIP_NETWORK` is only allowed for `entrypoint in {"replay", "tests"}`; enabling it elsewhere raises a `ValueError` with a `[SCRAPER][ERROR] phase=config` log.
+- Download executor knobs (`ENABLE_DOWNLOAD_EXECUTOR`, `MAX_PARALLEL_DOWNLOADS`, `MAX_PENDING_DOWNLOADS`) are clamped to sane minimums rather than crashing. Invalid timeouts or negative `MIN_FREE_MB` values raise clear configuration errors.
 
 12. Extension Points (AI / Jina / Firecrawl / AgentQL / Multion)
 

@@ -827,20 +827,28 @@ complements the DB/worklist roadmap above.
     `decide_retry(error_code: Optional[str], attempt: int) -> bool` that
     owns all logic for “should we click again for this case in this run?”.
   - Standardise a small set of scraper-level `error_code` values:
-    - `download_other` – generic download failure (network, unexpected HTTP, etc).
-    - `disk_full` – out of space before/during download (non-retryable).
-    - `invalid_token`, `csv_miss`, `worklist_filtered`, `seen_history`,
-      `already_downloaded`, `in_run_dup` – logical skip reasons (non-retryable).
+    - Retryable (bounded by attempt caps):
+      - `download_other` – generic download failure (network, unexpected HTTP, etc).
+    - Non-retryable (fail closed):
+      - `disk_full` – out of space before/during download.
+      - Logical skips: `invalid_token`, `csv_miss`, `worklist_filtered`, `seen_history`,
+        `already_downloaded`, `in_run_dup`, `exists_ok`.
+      - Click failures already retried locally: `click_timeout`.
   - Policy:
     - `disk_full` is always non-retryable for the run; the scraper sets a
       `stop_reason` and halts NEW/FULL rather than trying again.
     - Logical skip reasons (`invalid_token`, `csv_miss`, `worklist_filtered`,
-      `seen_history`, `already_downloaded`, `in_run_dup`) are never retried.
-    - `download_other` may be retried up to a small cap (e.g. 3 attempts per
+      `seen_history`, `already_downloaded`, `in_run_dup`, `exists_ok`) are never retried.
+    - `click_timeout` failures are logged to the DB (when a case_id is known) and
+      captured in `failed_items` but treated as non-retryable at the policy layer.
+    - `download_other` may be retried up to a small cap (3 attempts per
       `(run_id, case_id)`), treating transient HTTP/network issues as
       retryable but bounded. The current implementation performs a single
       retry sweep per run while enforcing the cap via the authoritative
       `CaseDownloadState.attempt_count` value.
+    - `decide_retry` emits a structured `[SCRAPER][STATE] phase="retry_decision"`
+      event with a `kind` field (`non_retryable`, `retryable`, `capped`, etc.) so
+      decisions remain reconstructable even for unknown error codes.
   - Integration points:
     - Extend the `failed_items` entries collected in `run.py` to include
       `case_id`, `error_code`, and `attempt` (derived from
@@ -859,7 +867,17 @@ complements the DB/worklist roadmap above.
 
 - **PR-S5 – Timeouts, page lifecycle, and Playwright robustness**
   - Add explicit, configurable timeouts for navigation, selectors, and
-    downloads.
+    downloads (see `PLAYWRIGHT_*` knobs in `app/scraper/config.py`). New config
+    names derive from `BAILIIKC_*` env vars: `PLAYWRIGHT_NAV_TIMEOUT_SECONDS`
+    (`BAILIIKC_NAV_TIMEOUT_SECONDS`, default 25s),
+    `PLAYWRIGHT_SELECTOR_TIMEOUT_SECONDS` (`BAILIIKC_SELECTOR_TIMEOUT_SECONDS`,
+    default 20s), and `PLAYWRIGHT_DOWNLOAD_TIMEOUT_SECONDS`
+    (`BAILIIKC_DOWNLOAD_TIMEOUT_SECONDS`, default 120s). Click pacing
+    timeouts remain configurable via dedicated knobs:
+    `PLAYWRIGHT_CLICK_TIMEOUT_MS`, `PLAYWRIGHT_POST_CLICK_SLEEP_SECONDS`,
+    `PLAYWRIGHT_RETRY_PAGE_SETTLE_SECONDS`, and
+    `PLAYWRIGHT_RETRY_AFTER_SWEEP_SECONDS`. All values can be tuned via the
+    environment without code changes.
   - Wrap Playwright usage in helpers that ensure proper cleanup and clear
     error reporting when pages/timeouts misbehave.
 

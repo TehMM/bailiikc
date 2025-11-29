@@ -41,6 +41,43 @@ NEW_ONLY_PAGES: int = int(os.getenv("NEW_ONLY_PAGES", "2"))
 DOWNLOAD_TIMEOUT_S: int = int(os.getenv("DOWNLOAD_TIMEOUT_S", "120"))
 DOWNLOAD_RETRIES: int = int(os.getenv("DOWNLOAD_RETRIES", "3"))
 
+def _parse_timeout_seconds(env_var: str, default: int, *, minimum: int = 1) -> int:
+    """Parse a timeout value in seconds from the environment with bounds."""
+
+    try:
+        value = int(os.getenv(env_var, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+# Playwright timeouts (seconds)
+# Navigation timeout for page.goto calls.
+PLAYWRIGHT_NAV_TIMEOUT_SECONDS: int = _parse_timeout_seconds(
+    "BAILIIKC_NAV_TIMEOUT_SECONDS", 25
+)
+# Selector waits (e.g., DataTable readiness, click targets).
+PLAYWRIGHT_SELECTOR_TIMEOUT_SECONDS: int = _parse_timeout_seconds(
+    "BAILIIKC_SELECTOR_TIMEOUT_SECONDS", 20
+)
+# Download timeout applied to Box/HTTP fetches.
+PLAYWRIGHT_DOWNLOAD_TIMEOUT_SECONDS: int = _parse_timeout_seconds(
+    "BAILIIKC_DOWNLOAD_TIMEOUT_SECONDS", 120
+)
+# Click-level timeout remains in milliseconds to match Playwright API expectations.
+PLAYWRIGHT_CLICK_TIMEOUT_MS: int = int(os.getenv("PLAYWRIGHT_CLICK_TIMEOUT_MS", "2000"))
+
+# Short sleeps (seconds) for click pacing and retry settle
+PLAYWRIGHT_POST_CLICK_SLEEP_SECONDS: float = float(
+    os.getenv("PLAYWRIGHT_POST_CLICK_SLEEP_SECONDS", "0.4")
+)
+PLAYWRIGHT_RETRY_PAGE_SETTLE_SECONDS: float = float(
+    os.getenv("PLAYWRIGHT_RETRY_PAGE_SETTLE_SECONDS", "0.3")
+)
+PLAYWRIGHT_RETRY_AFTER_SWEEP_SECONDS: float = float(
+    os.getenv("PLAYWRIGHT_RETRY_AFTER_SWEEP_SECONDS", "2.5")
+)
+
 COMMON_HEADERS: dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "

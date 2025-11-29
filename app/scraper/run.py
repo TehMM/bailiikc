@@ -42,7 +42,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-from . import box_client, config, csv_sync, db
+from . import box_client, config, csv_sync, db, db_reporting
 from .download_executor import DownloadExecutor
 from .config import is_full_mode, is_new_mode
 from .cases_index import (
@@ -2812,14 +2812,31 @@ def run_scrape(
 
     try:
         result = run_with_retries(_attempt, max_retries=max(1, retry_limit))
+        coverage: Dict[str, Any] = {}
         if run_id is not None:
             result.setdefault("run_id", run_id)
         result.setdefault("csv_version_id", csv_version_id)
         if run_id is not None:
             try:
+                coverage = db_reporting.get_run_coverage(run_id)
+                result.update(coverage)
+            except Exception as coverage_exc:  # noqa: BLE001
+                log_line(f"[DB][WARN] Unable to compute coverage for run_id={run_id}: {coverage_exc}")
+            if coverage:
+                try:
+                    db.update_run_coverage(run_id, coverage)
+                except Exception as exc:  # noqa: BLE001
+                    log_line(
+                        f"[DB][WARN] Unable to persist coverage for run_id={run_id}: {exc}"
+                    )
+            try:
                 db.mark_run_completed(run_id)
             except Exception as exc:  # noqa: BLE001
                 log_line(f"[DB][WARN] Unable to mark run completed: {exc}")
+        try:
+            save_json_file(config.SUMMARY_FILE, result)
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"[RUN][WARN] Unable to write summary with coverage: {exc}")
         return result
     except Exception as exc:  # noqa: BLE001
         _scraper_event(
@@ -2829,6 +2846,13 @@ def run_scrape(
             error=_short_error_message(exc),
         )
         if run_id is not None:
+            try:
+                coverage = db_reporting.get_run_coverage(run_id)
+                db.update_run_coverage(run_id, coverage)
+            except Exception as coverage_exc:  # noqa: BLE001
+                log_line(
+                    f"[DB][WARN] Unable to compute or persist coverage for failed run {run_id}: {coverage_exc}"
+                )
             try:
                 db.mark_run_failed(run_id, _short_error_message(exc))
             except Exception as mark_exc:  # noqa: BLE001

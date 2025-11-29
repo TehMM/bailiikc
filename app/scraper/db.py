@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
 
 from . import config
 
@@ -142,6 +142,41 @@ def initialize_schema() -> None:
     with conn:
         for statement in statements:
             conn.execute(statement)
+        _ensure_run_columns(conn)
+
+
+def _ensure_run_columns(conn: sqlite3.Connection) -> None:
+    """Add coverage-related run columns if they are missing.
+
+    This performs lightweight ``ALTER TABLE`` calls only when needed to avoid
+    destructive migrations while keeping the ``runs`` schema current.
+    """
+
+    cursor = conn.execute("PRAGMA table_info(runs)")
+    existing = {row[1] for row in cursor.fetchall()}
+
+    columns: dict[str, str] = {
+        "cases_total": "INTEGER",
+        "cases_planned": "INTEGER",
+        "cases_attempted": "INTEGER",
+        "cases_downloaded": "INTEGER",
+        "cases_failed": "INTEGER",
+        "cases_skipped": "INTEGER",
+        "coverage_ratio": "REAL",
+        "run_health": "TEXT",
+    }
+
+    for name, ddl_type in columns.items():
+        if name in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {ddl_type}")
+        except sqlite3.OperationalError as exc:  # pragma: no cover - defensive
+            # In multi-process scenarios a concurrent migration may have added
+            # the column between PRAGMA inspection and ALTER TABLE. Only ignore
+            # duplicate-column errors; re-raise anything else so it is visible.
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def _utc_now() -> str:
@@ -249,6 +284,38 @@ def mark_run_failed(run_id: int, error_summary: str) -> None:
             WHERE id = ?
             """,
             (_utc_now(), error_summary, run_id),
+        )
+
+
+def update_run_coverage(run_id: int, coverage: Mapping[str, object]) -> None:
+    """Persist coverage metrics for a run.
+
+    Missing keys are ignored so callers can supply partial updates.
+    """
+
+    allowed = (
+        "cases_total",
+        "cases_planned",
+        "cases_attempted",
+        "cases_downloaded",
+        "cases_failed",
+        "cases_skipped",
+        "coverage_ratio",
+        "run_health",
+    )
+    assignments = [key for key in allowed if key in coverage]
+    if not assignments:
+        return
+
+    placeholders = ", ".join(f"{key} = ?" for key in assignments)
+    values = [coverage[key] for key in assignments]
+    values.append(run_id)
+
+    conn = get_connection()
+    with conn:
+        conn.execute(
+            f"UPDATE runs SET {placeholders} WHERE id = ?",
+            values,
         )
 
 

@@ -12,6 +12,15 @@
         <a href="{{ url_for('start_scrape') }}" class="button" onclick="event.preventDefault(); document.getElementById('run-again-form').submit();">Run Again</a>
         <a href="{{ url_for('api_export_latest_xlsx') }}" class="button">Export latest run (Excel)</a>
     </div>
+    {% if last_summary and last_summary.run_health %}
+    <div class="summary-badges">
+        <span class="badge">Run health: {{ last_summary.run_health|upper }}</span>
+        <span class="badge">Coverage: {{ last_summary.cases_downloaded | default(0) }} / {{ last_summary.cases_planned | default(0) }}</span>
+        {% if last_summary.cases_failed %}
+        <span class="badge warning">Failed: {{ last_summary.cases_failed }}</span>
+        {% endif %}
+    </div>
+    {% endif %}
     {% if last_summary %}
     <ul class="summary-list">
         <li><strong>Total CSV Entries:</strong> {{ last_summary.total_cases }}</li>

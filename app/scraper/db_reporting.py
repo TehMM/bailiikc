@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import db
+from . import config, db, worklist
 from .date_utils import sortable_date
 from .utils import log_line
 
@@ -32,7 +32,23 @@ def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
     conn = db.get_connection()
     cursor = conn.execute(
         """
-        SELECT id, trigger, mode, csv_version_id, status, started_at, ended_at, error_summary
+        SELECT
+            id,
+            trigger,
+            mode,
+            csv_version_id,
+            status,
+            started_at,
+            ended_at,
+            error_summary,
+            cases_total,
+            cases_planned,
+            cases_attempted,
+            cases_downloaded,
+            cases_failed,
+            cases_skipped,
+            coverage_ratio,
+            run_health
         FROM runs WHERE id = ?
         """,
         (run_id,),
@@ -50,6 +66,14 @@ def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
         "started_at": row["started_at"],
         "ended_at": row["ended_at"],
         "error_summary": row["error_summary"],
+        "cases_total": row["cases_total"],
+        "cases_planned": row["cases_planned"],
+        "cases_attempted": row["cases_attempted"],
+        "cases_downloaded": row["cases_downloaded"],
+        "cases_failed": row["cases_failed"],
+        "cases_skipped": row["cases_skipped"],
+        "coverage_ratio": row["coverage_ratio"],
+        "run_health": row["run_health"],
     }
 
 
@@ -64,7 +88,23 @@ def list_recent_runs(limit: int = 20) -> List[Dict[str, Any]]:
     conn = db.get_connection()
     cursor = conn.execute(
         """
-        SELECT id, trigger, mode, csv_version_id, status, started_at, ended_at, error_summary
+        SELECT
+            id,
+            trigger,
+            mode,
+            csv_version_id,
+            status,
+            started_at,
+            ended_at,
+            error_summary,
+            cases_total,
+            cases_planned,
+            cases_attempted,
+            cases_downloaded,
+            cases_failed,
+            cases_skipped,
+            coverage_ratio,
+            run_health
         FROM runs
         ORDER BY started_at DESC, id DESC
         LIMIT ?
@@ -83,9 +123,154 @@ def list_recent_runs(limit: int = 20) -> List[Dict[str, Any]]:
             "started_at": row["started_at"],
             "ended_at": row["ended_at"],
             "error_summary": row["error_summary"],
+            "cases_total": row["cases_total"],
+            "cases_planned": row["cases_planned"],
+            "cases_attempted": row["cases_attempted"],
+            "cases_downloaded": row["cases_downloaded"],
+            "cases_failed": row["cases_failed"],
+            "cases_skipped": row["cases_skipped"],
+            "coverage_ratio": row["coverage_ratio"],
+            "run_health": row["run_health"],
         }
         for row in rows
     ]
+
+
+def _count_cases_total(csv_version_id: int) -> int:
+    conn = db.get_connection()
+    cursor = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM cases
+        WHERE source = 'unreported_judgments'
+          AND is_active = 1
+          AND first_seen_version_id <= ?
+          AND last_seen_version_id >= ?
+        """,
+        (csv_version_id, csv_version_id),
+    )
+    row = cursor.fetchone()
+    return int(row["count"]) if row else 0
+
+
+def _count_planned_cases(run_id: int, mode: str, csv_version_id: int) -> Optional[int]:
+    normalized_mode = (mode or "").strip().lower()
+    if normalized_mode == "new" and config.use_db_worklist_for_new():
+        return len(worklist.build_new_worklist(csv_version_id))
+    if normalized_mode == "full" and config.use_db_worklist_for_full():
+        return len(worklist.build_full_worklist(csv_version_id))
+    if normalized_mode == "resume" and config.use_db_worklist_for_resume():
+        return len(worklist.build_resume_worklist_for_run(run_id))
+    return None
+
+
+def get_run_coverage(run_id: int) -> Dict[str, Any]:
+    """Return coverage metrics for a run, including a derived health flag."""
+
+    conn = db.get_connection()
+    cursor = conn.execute(
+        "SELECT id, mode, csv_version_id FROM runs WHERE id = ? LIMIT 1", (run_id,)
+    )
+    run_row = cursor.fetchone()
+    if not run_row:
+        raise RunNotFoundError(f"Run {run_id} not found")
+
+    mode = (run_row["mode"] or "").strip().lower()
+    csv_version_value = run_row["csv_version_id"]
+    csv_version_id: Optional[int]
+    cases_total = 0
+    planned: Optional[int] = None
+    if csv_version_value is not None:
+        csv_version_id = int(csv_version_value)
+        cases_total = _count_cases_total(csv_version_id)
+        planned = _count_planned_cases(run_id, mode, csv_version_id)
+
+    download_cursor = conn.execute(
+        """
+        SELECT status, COUNT(DISTINCT case_id) AS count
+        FROM downloads
+        WHERE run_id = ?
+        GROUP BY status
+        """,
+        (run_id,),
+    )
+
+    attempted = 0
+    downloaded = 0
+    failed = 0
+    skipped = 0
+    for row in download_cursor.fetchall():
+        status = row["status"] or ""
+        count = int(row["count"])
+        attempted += count
+        if status == "downloaded":
+            downloaded += count
+        elif status == "failed":
+            failed += count
+        elif status == "skipped":
+            skipped += count
+
+    if planned is None:
+        planned_cursor = conn.execute(
+            "SELECT COUNT(DISTINCT case_id) AS count FROM downloads WHERE run_id = ?",
+            (run_id,),
+        )
+        planned_row = planned_cursor.fetchone()
+        planned = int(planned_row["count"]) if planned_row else 0
+
+    denominator = max(planned or 0, 1)
+    coverage_ratio = downloaded / denominator if denominator else 0.0
+    attempt_ratio = attempted / denominator if denominator else 0.0
+
+    run_health = _classify_run_health(
+        planned_cases=planned,
+        cases_total=cases_total,
+        downloaded=downloaded,
+        failed=failed,
+        attempted=attempted,
+        coverage_ratio=coverage_ratio,
+        attempt_ratio=attempt_ratio,
+    )
+
+    return {
+        "run_id": run_id,
+        "cases_total": cases_total,
+        "cases_planned": planned,
+        "cases_attempted": attempted,
+        "cases_downloaded": downloaded,
+        "cases_failed": failed,
+        "cases_skipped": skipped,
+        "coverage_ratio": coverage_ratio,
+        "run_health": run_health,
+    }
+
+
+def _classify_run_health(
+    *,
+    planned_cases: int,
+    cases_total: int,
+    downloaded: int,
+    failed: int,
+    attempted: int,
+    coverage_ratio: float,
+    attempt_ratio: float,
+) -> str:
+    if planned_cases <= 0:
+        if downloaded == 0 and cases_total > 0:
+            return "suspicious"
+        return "ok"
+
+    if attempted == 0:
+        return "suspicious"
+
+    if coverage_ratio >= 0.95 and failed == 0:
+        return "ok"
+    if coverage_ratio >= 0.6:
+        return "partial"
+    if coverage_ratio < 0.1 and (failed > 0 or attempt_ratio == 0):
+        return "failed"
+
+    return "partial"
 
 
 

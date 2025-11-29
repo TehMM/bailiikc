@@ -24,6 +24,7 @@ from app.scraper import config, db, db_reporting
 from app.scraper.download_rows import build_download_rows, load_download_records
 from app.scraper.run import run_scrape
 from app.scraper.config_validation import validate_runtime_config
+from app.scraper.healthcheck import run_health_checks
 from app.scraper.export_excel import export_latest_run_to_excel
 from app.scraper.utils import (
     build_zip,
@@ -581,6 +582,19 @@ def api_db_runs_list() -> Response:
     return jsonify({"ok": True, "count": len(runs), "runs": runs})
 
 
+@app.get("/api/db/runs/<int:run_id>/health")
+def api_db_run_health(run_id: int) -> Response:
+    """Return coverage and health classification for a run."""
+
+    try:
+        coverage = db_reporting.get_run_coverage(run_id)
+    except db_reporting.RunNotFoundError:
+        return jsonify({"ok": False, "error": "run_not_found", "run_id": run_id}), 404
+
+    payload = {"ok": True, **coverage}
+    return jsonify(payload)
+
+
 @app.get("/api/db/runs/latest")
 def api_db_runs_latest() -> Response:
     """Return the latest run summary backed by SQLite."""
@@ -656,6 +670,15 @@ def api_db_case_diff_for_csv_version(version_id: int) -> Response:
             "removed_cases": diff["removed_cases"],
         }
     )
+
+
+@app.get("/api/health")
+def api_health() -> Response:
+    """Return a JSON health summary for configuration, filesystem, and DB."""
+
+    result = run_health_checks(entrypoint="ui")
+    status = 200 if result.ok else 503
+    return jsonify({"ok": result.ok, "checks": result.checks}), status
 
 
 @app.get("/api/exports/latest.xlsx")

@@ -15,6 +15,7 @@ RUN_STATE_FILE: Path = DATA_DIR / "run_state.json"
 DOWNLOADS_LOG: Path = DATA_DIR / "downloads.jsonl"
 SUMMARY_FILE: Path = DATA_DIR / "last_summary.json"
 HISTORY_ACTIONS_FILE: Path = DATA_DIR / "history_actions.json"
+REPLAY_FIXTURES_DIR: Path = DATA_DIR / "replay_fixtures"
 # SQLite database path (new infrastructure); JSON files above remain active
 # for the current scraper implementation.
 DB_PATH: Path = DATA_DIR / "bailiikc.db"
@@ -77,6 +78,26 @@ PLAYWRIGHT_RETRY_PAGE_SETTLE_SECONDS: float = float(
 PLAYWRIGHT_RETRY_AFTER_SWEEP_SECONDS: float = float(
     os.getenv("PLAYWRIGHT_RETRY_AFTER_SWEEP_SECONDS", "2.5")
 )
+
+# Concurrency controls
+# Max number of Box downloads allowed in-flight at once (bounded executor).
+MAX_PARALLEL_DOWNLOADS: int = int(os.getenv("BAILIIKC_MAX_PARALLEL_DOWNLOADS", "1"))
+# Max queue depth before falling back to synchronous execution.
+MAX_PENDING_DOWNLOADS: int = int(os.getenv("BAILIIKC_MAX_PENDING_DOWNLOADS", "100"))
+# Global enable/disable for the download executor abstraction.
+ENABLE_DOWNLOAD_EXECUTOR: bool = os.getenv(
+    "BAILIIKC_ENABLE_DOWNLOAD_EXECUTOR", "1"
+).strip().lower() not in {"0", "false"}
+
+# Replay + offline controls
+REPLAY_SKIP_NETWORK: bool = os.getenv("BAILIIKC_REPLAY_SKIP_NETWORK", "0").strip().lower() not in {
+    "0",
+    "false",
+}
+RECORD_REPLAY_FIXTURES: bool = os.getenv("BAILIIKC_RECORD_REPLAY_FIXTURES", "0").strip().lower() not in {
+    "0",
+    "false",
+}
 
 COMMON_HEADERS: dict[str, str] = {
     "User-Agent": (

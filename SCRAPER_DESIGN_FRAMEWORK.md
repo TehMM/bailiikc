@@ -882,16 +882,36 @@ complements the DB/worklist roadmap above.
     error reporting when pages/timeouts misbehave.
 
 - **PR-S6 – Concurrency and resource controls (if needed)**
-  - Decide on and enforce a concurrency model (possibly single-threaded with
-    explicit caps), ensuring we never overload the upstream site or our own
-    process.
-  - Add configuration knobs and guards for maximum parallel downloads.
+  - Concurrency remains single-browser/single-page by default, but download
+    capacity is now explicit via a `DownloadExecutor` wrapper around Box HTTP
+    fetches. The executor clamps worker counts to at least 1 and is disabled
+    when `BAILIIKC_ENABLE_DOWNLOAD_EXECUTOR=0`.
+  - Resource knobs (all env-driven, defined in `config.py`):
+    - `BAILIIKC_MAX_PARALLEL_DOWNLOADS` → `MAX_PARALLEL_DOWNLOADS` (default 1).
+    - `BAILIIKC_MAX_PENDING_DOWNLOADS` → `MAX_PENDING_DOWNLOADS` (default 100
+      queued items before falling back to synchronous execution).
+    - `BAILIIKC_ENABLE_DOWNLOAD_EXECUTOR` gates the executor entirely; when off
+      or when `MAX_PARALLEL_DOWNLOADS <= 1`, downloads execute inline.
+  - Telemetry for peak in-flight downloads is emitted via
+    `[SCRAPER][STATE][download_executor]` with `peak_in_flight` and
+    `max_parallel` to keep observability aligned with the existing log format.
+  - Queue saturation emits a `[SCRAPER][STATE]` `queue_overflow` event and
+    forces synchronous execution rather than dropping work, preserving
+    per-case serialisation and DB invariants.
 
 - **PR-S7 – Offline replay harness for scraper logic**
-  - Introduce a "replay mode" that can drive the scraper from captured HTML
-    and Box response fixtures.
-  - Use this to regression-test scraper behaviour without requiring live
-    access to the judicial website.
+  - Introduce fixture capture during `dl_bfile` handling when
+    `BAILIIKC_RECORD_REPLAY_FIXTURES=1`, writing JSONL under
+    `/app/data/replay_fixtures/run_<id>_dl_bfile.jsonl` with the payload, Box
+    URL, mode, tokens, and case context snapshot for each observed response.
+  - Add `app/scraper/replay_harness.py` to consume those fixtures offline,
+    reusing `handle_dl_bfile_from_ajax` with sandboxed paths. A `ReplayConfig`
+    selects dry-run vs. sandbox output roots; dry-run forces
+    `REPLAY_SKIP_NETWORK` to avoid real HTTP. `[SCRAPER][REPLAY]` events mark
+    start/end and download stubs.
+  - `BAILIIKC_REPLAY_SKIP_NETWORK` short-circuits Box downloads in replay mode
+    (and can be set manually) while preserving the downstream state machine and
+    logging flow.
 
 10.2 Webhook (ChangeDetection.io)
 

@@ -41,12 +41,30 @@ NEW_ONLY_PAGES: int = int(os.getenv("NEW_ONLY_PAGES", "2"))
 DOWNLOAD_TIMEOUT_S: int = int(os.getenv("DOWNLOAD_TIMEOUT_S", "120"))
 DOWNLOAD_RETRIES: int = int(os.getenv("DOWNLOAD_RETRIES", "3"))
 
-# Playwright timeouts (milliseconds unless stated otherwise)
-PLAYWRIGHT_NAV_TIMEOUT_MS: int = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", "20000"))
-PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS: int = int(
-    os.getenv("PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS", "20000")
+def _parse_timeout_seconds(env_var: str, default: int, *, minimum: int = 1) -> int:
+    """Parse a timeout value in seconds from the environment with bounds."""
+
+    try:
+        value = int(os.getenv(env_var, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+# Playwright timeouts (seconds)
+# Navigation timeout for page.goto calls.
+PLAYWRIGHT_NAV_TIMEOUT_SECONDS: int = _parse_timeout_seconds(
+    "BAILIIKC_NAV_TIMEOUT_SECONDS", 25
 )
-PLAYWRIGHT_TABLE_WAIT_MS: int = int(os.getenv("PLAYWRIGHT_TABLE_WAIT_MS", "15000"))
+# Selector waits (e.g., DataTable readiness, click targets).
+PLAYWRIGHT_SELECTOR_TIMEOUT_SECONDS: int = _parse_timeout_seconds(
+    "BAILIIKC_SELECTOR_TIMEOUT_SECONDS", 20
+)
+# Download timeout applied to Box/HTTP fetches.
+PLAYWRIGHT_DOWNLOAD_TIMEOUT_SECONDS: int = _parse_timeout_seconds(
+    "BAILIIKC_DOWNLOAD_TIMEOUT_SECONDS", 120
+)
+# Click-level timeout remains in milliseconds to match Playwright API expectations.
 PLAYWRIGHT_CLICK_TIMEOUT_MS: int = int(os.getenv("PLAYWRIGHT_CLICK_TIMEOUT_MS", "2000"))
 
 # Short sleeps (seconds) for click pacing and retry settle

@@ -40,24 +40,24 @@ def decide_retry(error_code: Optional[str], attempt: int) -> bool:
     if not code:
         _scraper_event(
             "state",
-            decision_phase="retry_decision",
+            phase="retry_decision",
+            kind="missing_error_code",
             error_code=None,
             attempt=attempt,
             max_attempts=None,
             will_retry=False,
-            reason="missing_error_code",
         )
         return False
 
     if code in NON_RETRYABLE_ERROR_CODES:
         _scraper_event(
             "state",
-            decision_phase="retry_decision",
+            phase="retry_decision",
+            kind="non_retryable",
             error_code=code,
             attempt=attempt,
             max_attempts=None,
             will_retry=False,
-            reason="non_retryable_error_code",
         )
         return False
 
@@ -65,12 +65,12 @@ def decide_retry(error_code: Optional[str], attempt: int) -> bool:
     if max_attempts is None:
         _scraper_event(
             "state",
-            decision_phase="retry_decision",
+            phase="retry_decision",
+            kind="no_retry_policy",
             error_code=code,
             attempt=attempt,
             max_attempts=None,
             will_retry=False,
-            reason="no_retry_policy_for_code",
         )
         return False
 
@@ -78,7 +78,8 @@ def decide_retry(error_code: Optional[str], attempt: int) -> bool:
 
     _scraper_event(
         "state",
-        decision_phase="retry_decision",
+        phase="retry_decision",
+        kind="retryable" if should_retry else "capped",
         error_code=code,
         attempt=attempt,
         max_attempts=max_attempts,

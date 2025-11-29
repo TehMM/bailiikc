@@ -431,7 +431,7 @@ def _load_all_results(page: Page, max_scrolls: int = 40) -> None:
     """Scroll a few times to trigger lazy-loading."""
     try:
         page.wait_for_load_state(
-            "networkidle", timeout=config.PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS
+            "networkidle", timeout=config.PLAYWRIGHT_NAV_TIMEOUT_SECONDS * 1000
         )
     except PWTimeout:
         log_line("Initial networkidle timeout; continuing.")
@@ -442,7 +442,7 @@ def _load_all_results(page: Page, max_scrolls: int = 40) -> None:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             wait_seconds(page, 0.5)
             page.wait_for_load_state(
-                "networkidle", timeout=config.PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS
+                "networkidle", timeout=config.PLAYWRIGHT_NAV_TIMEOUT_SECONDS * 1000
             )
             height = page.evaluate("document.body.scrollHeight")
         except PWError:
@@ -518,45 +518,129 @@ def _refresh_datatable_page(page: Page, page_index: int) -> None:
         pass
 
 
-def _safe_goto(page: Page, url: str) -> bool:
+def _safe_goto(page: Page, url: str, *, label: str, wait_until: str = "networkidle") -> bool:
     """Navigate to ``url`` with bounded timeouts and structured logging."""
 
     try:
-        page.goto(url, timeout=config.PLAYWRIGHT_NAV_TIMEOUT_MS)
+        _scraper_event("nav", step="goto", label=label, url=url)
+        page.goto(
+            url,
+            wait_until=wait_until,
+            timeout=config.PLAYWRIGHT_NAV_TIMEOUT_SECONDS * 1000,
+        )
         page.wait_for_load_state(
-            "networkidle", timeout=config.PLAYWRIGHT_NETWORK_IDLE_TIMEOUT_MS
+            "networkidle", timeout=config.PLAYWRIGHT_NAV_TIMEOUT_SECONDS * 1000
         )
         return True
     except PWTimeout as exc:
         log_line(f"[SCRAPER][ERROR][NAV] goto({url!r}) timed out: {exc}")
-        _scraper_event("error", context="nav", error="goto_timeout", url=url)
+        _scraper_event(
+            "error",
+            phase="nav",
+            step="goto_timeout",
+            label=label,
+            url=url,
+            error=str(exc),
+        )
+        return False
     except PWError as exc:
+        if _is_target_closed_error(exc):
+            log_line(f"[SCRAPER][ERROR][NAV] Target closed during navigation to {label}: {exc}")
+            _scraper_event(
+                "error",
+                phase="nav",
+                step="goto_target_closed",
+                label=label,
+                url=url,
+                error=str(exc),
+            )
+            return False
         log_line(f"[SCRAPER][ERROR][NAV] goto({url!r}) failed: {exc}")
-        _scraper_event("error", context="nav", error="goto_error", url=url)
+        _scraper_event(
+            "error",
+            phase="nav",
+            step="goto_error",
+            label=label,
+            url=url,
+            error=str(exc),
+        )
+        return False
     except Exception as exc:  # noqa: BLE001
         log_line(f"[SCRAPER][ERROR][NAV] goto({url!r}) raised: {exc}")
-        _scraper_event("error", context="nav", error="goto_exception", url=url)
-    return False
+        _scraper_event(
+            "error",
+            phase="nav",
+            step="goto_exception",
+            label=label,
+            url=url,
+            error=str(exc),
+        )
+        return False
 
 
-def _wait_for_datatable(page: Page) -> bool:
+def _wait_for_datatable_ready(page: Page, *, page_index: int, phase: str) -> bool:
     """Wait for the main DataTable to be present with a bounded timeout."""
 
+    selector = "table.dataTable"
     try:
+        _scraper_event(
+            "table",
+            phase=phase,
+            page_index=page_index,
+            step="wait_for_table",
+        )
         page.wait_for_selector(
-            "table.dataTable", timeout=config.PLAYWRIGHT_TABLE_WAIT_MS
+            selector, timeout=config.PLAYWRIGHT_SELECTOR_TIMEOUT_SECONDS * 1000
         )
         return True
     except PWTimeout as exc:
-        log_line(f"[SCRAPER][ERROR][TABLE] DataTable selector timeout: {exc}")
-        _scraper_event("error", context="table", error="datatable_timeout")
+        log_line(
+            f"[SCRAPER][ERROR][TABLE] DataTable selector timeout on page index {page_index}: {exc}"
+        )
+        _scraper_event(
+            "error",
+            phase="table",
+            step="wait_for_table_timeout",
+            page_index=page_index,
+            error=str(exc),
+        )
+        return False
     except PWError as exc:
-        log_line(f"[SCRAPER][ERROR][TABLE] DataTable selector error: {exc}")
-        _scraper_event("error", context="table", error="datatable_error")
+        if _is_target_closed_error(exc):
+            log_line(
+                f"[SCRAPER][ERROR][TABLE] Target closed while waiting for DataTable on page index {page_index}: {exc}"
+            )
+            _scraper_event(
+                "error",
+                phase="table",
+                step="wait_for_table_target_closed",
+                page_index=page_index,
+                error=str(exc),
+            )
+            return False
+        log_line(
+            f"[SCRAPER][ERROR][TABLE] DataTable selector error on page index {page_index}: {exc}"
+        )
+        _scraper_event(
+            "error",
+            phase="table",
+            step="wait_for_table_error",
+            page_index=page_index,
+            error=str(exc),
+        )
+        return False
     except Exception as exc:  # noqa: BLE001
-        log_line(f"[SCRAPER][ERROR][TABLE] DataTable wait failed: {exc}")
-        _scraper_event("error", context="table", error="datatable_exception")
-    return False
+        log_line(
+            f"[SCRAPER][ERROR][TABLE] DataTable wait failed on page index {page_index}: {exc}"
+        )
+        _scraper_event(
+            "error",
+            phase="table",
+            step="wait_for_table_exception",
+            page_index=page_index,
+            error=str(exc),
+        )
+        return False
 
 
 def _get_total_pages(page: Page) -> int:
@@ -619,7 +703,7 @@ def _goto_datatable_page(page: Page, page_index: int) -> bool:
         )
         page.wait_for_selector(
             f"li.dt-paging-button.active:has(button[data-dt-idx=\"{page_index}\"])",
-            timeout=config.PLAYWRIGHT_TABLE_WAIT_MS,
+            timeout=config.PLAYWRIGHT_SELECTOR_TIMEOUT_SECONDS * 1000,
         )
         return True
     except PWError as exc:
@@ -712,7 +796,7 @@ def queue_or_download_file(
     *,
     http_client: Optional[Any] = None,
     max_retries: int = 3,
-    timeout: int = 120,
+    timeout: int = config.PLAYWRIGHT_DOWNLOAD_TIMEOUT_SECONDS,
     token: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Download ``url`` to ``dest_path`` with retries and validation."""
@@ -1136,12 +1220,21 @@ def retry_failed_downloads(
         if run_id is not None and isinstance(case_id, int):
             try:
                 state = CaseDownloadState.load(run_id=run_id, case_id=case_id)
-                if state.attempt_count > 0:
-                    attempt = state.attempt_count
+                attempt = state.attempt_count
             except Exception as exc:  # noqa: BLE001
                 log_line(
                     f"[RETRY] Unable to load download state for run_id={run_id}, case_id={case_id}: {exc}"
                 )
+
+        _scraper_event(
+            "decision",
+            token=fname,
+            decision="consider_retry",
+            error_code=error_code,
+            attempt=attempt,
+            run_id=run_id,
+            case_id=case_id,
+        )
 
         if not decide_retry(error_code, attempt):
             _scraper_event(
@@ -1150,6 +1243,8 @@ def retry_failed_downloads(
                 decision="skip_retry",
                 reason=error_code,
                 attempt=attempt,
+                run_id=run_id,
+                case_id=case_id,
             )
             skipped += 1
             continue
@@ -1160,6 +1255,8 @@ def retry_failed_downloads(
             decision="retry_click",
             reason=error_code,
             attempt=attempt,
+            run_id=run_id,
+            case_id=case_id,
         )
         clicked += 1
 
@@ -1177,6 +1274,14 @@ def retry_failed_downloads(
                 log_line("[RETRY] Target closed while navigating for retry; aborting retries.")
                 break
             log_line(f"[RETRY] Error setting page for retry: {exc}")
+            continue
+
+        if not _wait_for_datatable_ready(
+            page, page_index=page_index, phase="retry_navigation"
+        ):
+            log_line(
+                f"[RETRY] DataTable not ready after navigation to page {page_index + 1} for {fname}; skipping."
+            )
             continue
 
         wait_seconds(page, config.PLAYWRIGHT_RETRY_PAGE_SETTLE_SECONDS)
@@ -1602,7 +1707,7 @@ def _run_scrape_attempt(
                                 return
 
                             http_fetcher = (
-                                lambda download_url, timeout=120: context.request.get(
+                                lambda download_url, timeout=config.PLAYWRIGHT_DOWNLOAD_TIMEOUT_SECONDS: context.request.get(
                                     download_url,
                                     timeout=timeout * 1000,
                                 )
@@ -1817,7 +1922,9 @@ def _run_scrape_attempt(
                     context.on("response", on_response)
 
                     log_line("Opening judgments page in Playwright...")
-                    if not _safe_goto(page, base_url):
+                    if not _safe_goto(
+                        page, base_url, label="unreported_judgments_root"
+                    ):
                         crash_stop = True
                         active = False
                     else:
@@ -1825,7 +1932,9 @@ def _run_scrape_attempt(
                             wait_seconds(page, float(page_wait))
 
                         _accept_cookies(page)
-                        if not _wait_for_datatable(page):
+                        if not _wait_for_datatable_ready(
+                            page, page_index=resume_page_index, phase="initial_nav"
+                        ):
                             crash_stop = True
                             active = False
                         else:
@@ -1842,7 +1951,7 @@ def _run_scrape_attempt(
                         try:
                             page.wait_for_selector(
                                 "button:has(i.icon-dl)",
-                                timeout=config.PLAYWRIGHT_TABLE_WAIT_MS,
+                                timeout=config.PLAYWRIGHT_SELECTOR_TIMEOUT_SECONDS * 1000,
                             )
                         except PWTimeout:
                             log_line("No download buttons detected within timeout; aborting run.")

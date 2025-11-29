@@ -846,6 +846,9 @@ complements the DB/worklist roadmap above.
       retryable but bounded. The current implementation performs a single
       retry sweep per run while enforcing the cap via the authoritative
       `CaseDownloadState.attempt_count` value.
+    - `decide_retry` emits a structured `[SCRAPER][STATE] phase="retry_decision"`
+      event with a `kind` field (`non_retryable`, `retryable`, `capped`, etc.) so
+      decisions remain reconstructable even for unknown error codes.
   - Integration points:
     - Extend the `failed_items` entries collected in `run.py` to include
       `case_id`, `error_code`, and `attempt` (derived from
@@ -864,7 +867,13 @@ complements the DB/worklist roadmap above.
 
 - **PR-S5 – Timeouts, page lifecycle, and Playwright robustness**
   - Add explicit, configurable timeouts for navigation, selectors, and
-    downloads (see `PLAYWRIGHT_*` knobs in `app/scraper/config.py`).
+    downloads (see `PLAYWRIGHT_*` knobs in `app/scraper/config.py`). New config
+    names derive from `BAILIIKC_*` env vars: `PLAYWRIGHT_NAV_TIMEOUT_SECONDS`
+    (`BAILIIKC_NAV_TIMEOUT_SECONDS`, default 25s),
+    `PLAYWRIGHT_SELECTOR_TIMEOUT_SECONDS` (`BAILIIKC_SELECTOR_TIMEOUT_SECONDS`,
+    default 20s), and `PLAYWRIGHT_DOWNLOAD_TIMEOUT_SECONDS`
+    (`BAILIIKC_DOWNLOAD_TIMEOUT_SECONDS`, default 120s). Click pacing
+    timeouts remain configurable via dedicated knobs.
   - Wrap Playwright usage in helpers that ensure proper cleanup and clear
     error reporting when pages/timeouts misbehave.
 

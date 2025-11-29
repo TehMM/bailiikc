@@ -1,11 +1,73 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import config, db, worklist
 from .date_utils import sortable_date
 from .utils import log_line
+
+
+@dataclass
+class RunDownloadSummary:
+    """Aggregate download outcomes and error codes for a single run."""
+
+    run_id: int
+    status_counts: Dict[str, int]
+    fail_reasons: Dict[str, int]
+    skip_reasons: Dict[str, int]
+
+
+def summarise_downloads_for_run(run_id: int) -> RunDownloadSummary:
+    """Compute aggregated download status counts and error-code breakdowns."""
+
+    conn = db.get_connection()
+
+    run_exists = conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if run_exists is None:
+        raise RunNotFoundError(f"Run {run_id} does not exist")
+
+    status_counts: Dict[str, int] = {}
+    status_cursor = conn.execute(
+        "SELECT status, COUNT(*) AS n FROM downloads WHERE run_id = ? GROUP BY status",
+        (run_id,),
+    )
+    for row in status_cursor.fetchall():
+        status = row["status"] or ""
+        status_counts[status] = int(row["n"])
+
+    fail_reasons: Dict[str, int] = {}
+    skip_reasons: Dict[str, int] = {}
+
+    error_cursor = conn.execute(
+        """
+        SELECT status,
+               COALESCE(error_code, '') AS error_code,
+               COUNT(*) AS n
+        FROM downloads
+        WHERE run_id = ?
+          AND status IN ('failed', 'skipped')
+        GROUP BY status, error_code
+        """,
+        (run_id,),
+    )
+
+    for row in error_cursor.fetchall():
+        status = row["status"]
+        code = (row["error_code"] or "").strip() or "unknown"
+        count = int(row["n"])
+        if status == "failed":
+            fail_reasons[code] = count
+        else:
+            skip_reasons[code] = count
+
+    return RunDownloadSummary(
+        run_id=run_id,
+        status_counts=status_counts,
+        fail_reasons=fail_reasons,
+        skip_reasons=skip_reasons,
+    )
 
 
 def get_latest_run_id() -> Optional[int]:
@@ -15,6 +77,12 @@ def get_latest_run_id() -> Optional[int]:
     cursor = conn.execute("SELECT id FROM runs ORDER BY started_at DESC LIMIT 1")
     row = cursor.fetchone()
     return int(row["id"]) if row else None
+
+
+def latest_run_id() -> Optional[int]:
+    """Return the most recent run_id, or None if no runs exist."""
+
+    return get_latest_run_id()
 
 
 class RunNotFoundError(Exception):

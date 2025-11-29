@@ -23,6 +23,7 @@ from flask import (
 from app.scraper import config, db, db_reporting
 from app.scraper.download_rows import build_download_rows, load_download_records
 from app.scraper.run import run_scrape
+from app.scraper.config_validation import validate_runtime_config
 from app.scraper.export_excel import export_latest_run_to_excel
 from app.scraper.utils import (
     build_zip,
@@ -36,6 +37,7 @@ from app.scraper.utils import (
     reset_state,
     save_base_url,
 )
+from app.scraper.logging_utils import _scraper_event
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
@@ -45,12 +47,8 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 ensure_dirs()
 db.initialize_schema()
 
-
-WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "true").strip().lower() == "true"
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
-WEBHOOK_COOLDOWN = int(os.environ.get("WEBHOOK_COOLDOWN_SEC", "300"))
-WEBHOOK_FIRST_PAGE_LIMIT = int(os.environ.get("WEBHOOK_FIRST_PAGE_LIMIT", "50"))
-_last_webhook_ts = 0.0
+WEBHOOK_LIMIT_MAX = max(1, config.WEBHOOK_NEW_LIMIT_MAX)
+WEBHOOK_DEFAULT_NEW_LIMIT = min(config.SCRAPE_NEW_LIMIT, WEBHOOK_LIMIT_MAX)
 
 
 def use_db_reporting() -> bool:
@@ -150,6 +148,25 @@ def _get_download_rows_for_ui() -> list[dict[str, object]]:
     return build_download_rows(records)
 
 
+def _get_webhook_token() -> str | None:
+    token = request.headers.get("X-Webhook-Token")
+    if not token:
+        token = request.args.get("token")
+    return token
+
+
+def _parse_webhook_payload() -> dict[str, object]:
+    payload: dict[str, object] = {}
+    payload.update(request.args or {})
+
+    if request.is_json:
+        payload.update(request.get_json(silent=True) or {})
+    else:
+        payload.update(request.form or {})
+
+    return payload
+
+
 @app.route("/debug/unreported_judgments.png")
 def debug_unreported_png() -> Response:
     return send_from_directory(
@@ -226,6 +243,12 @@ def start_scrape() -> Response:
         max_retries = config.SCRAPER_MAX_RETRIES
     max_retries = max(1, max_retries)
 
+    try:
+        validate_runtime_config("ui", mode=scrape_mode)
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("index")), 400
+
     if reset_before_run:
         reset_state(delete_pdfs=delete_pdfs_during_reset, delete_logs=False)
         scrape_mode = "full"
@@ -289,6 +312,12 @@ def resume_scrape() -> Response:
     base_url = request.form.get("base_url", config.DEFAULT_BASE_URL).strip()
     page_wait = int(request.form.get("page_wait", config.PAGE_WAIT_SECONDS))
     per_delay = float(request.form.get("per_download_delay", config.PER_DOWNLOAD_DELAY))
+
+    try:
+        validate_runtime_config("ui", mode="resume")
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("index")), 400
 
     def _run() -> None:
         with app.app_context():
@@ -397,46 +426,136 @@ def download_all_zip() -> Response:
 
     archive = build_zip()
     return send_file(archive, as_attachment=True, download_name=config.ZIP_NAME)
-
-
-def _run_new_only_background() -> None:
-    def _target() -> None:
-        try:
-            run_scrape(
-                scrape_mode="new",
-                new_limit=WEBHOOK_FIRST_PAGE_LIMIT,
-                max_retries=config.SCRAPER_MAX_RETRIES,
-                resume=False,
-                resume_mode="none",
-                limit_pages=[0],
-                row_limit=WEBHOOK_FIRST_PAGE_LIMIT,
-                start_message="[WEBHOOK] Triggered new-only scrape",
-                trigger="webhook",
-            )
-        except Exception as exc:  # noqa: BLE001
-            log_line(f"[WEBHOOK] new-only run failed: {exc}")
-
-    threading.Thread(target=_target, daemon=True).start()
-
-
 @app.post("/webhook/changedetection")
 def webhook_changedetection() -> Response:
-    global _last_webhook_ts
+    if not config.WEBHOOK_SHARED_SECRET:
+        return jsonify({"ok": False, "error": "webhook_disabled"}), 404
 
-    if not WEBHOOK_ENABLED:
-        return jsonify({"ok": False, "error": "webhook disabled"}), 403
+    token = _get_webhook_token()
+    if token != config.WEBHOOK_SHARED_SECRET:
+        _scraper_event(
+            "error",
+            phase="webhook",
+            context="changedetection",
+            error="invalid_token",
+            remote_addr=request.remote_addr,
+        )
+        return jsonify({"ok": False, "error": "invalid_token"}), 403
 
-    token = request.args.get("token") or request.headers.get("X-Webhook-Token")
-    if not token or not WEBHOOK_SECRET or token != WEBHOOK_SECRET:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    payload = _parse_webhook_payload()
+    target_source = str(payload.get("target_source") or "").strip()
+    mode = str(payload.get("mode") or "").strip().lower()
+    new_limit_raw = payload.get("new_limit")
 
-    now = time.time()
-    if now - _last_webhook_ts < WEBHOOK_COOLDOWN:
-        return jsonify({"ok": True, "debounced": True}), 200
+    errors = []
+    if target_source != "unreported_judgments":
+        errors.append("target_source must be 'unreported_judgments'")
+    if mode != "new":
+        errors.append("mode must be 'new'")
 
-    _last_webhook_ts = now
-    _run_new_only_background()
-    return jsonify({"ok": True, "triggered": "new-only"}), 202
+    new_limit: int
+    if new_limit_raw is None or new_limit_raw == "":
+        new_limit = WEBHOOK_DEFAULT_NEW_LIMIT
+    else:
+        try:
+            new_limit = int(new_limit_raw)
+        except (TypeError, ValueError):
+            errors.append("new_limit must be an integer")
+            new_limit = WEBHOOK_DEFAULT_NEW_LIMIT
+
+    if errors:
+        _scraper_event(
+            "error",
+            phase="webhook",
+            context="changedetection",
+            error="invalid_params",
+            details=errors,
+            remote_addr=request.remote_addr,
+        )
+        return jsonify({"ok": False, "error": "invalid_params", "details": errors}), 400
+
+    if new_limit < 1:
+        new_limit = 1
+    if new_limit > WEBHOOK_LIMIT_MAX:
+        _scraper_event(
+            "state",
+            phase="webhook",
+            context="changedetection",
+            kind="limit_clamped",
+            requested=new_limit_raw,
+            max_limit=WEBHOOK_LIMIT_MAX,
+        )
+        new_limit = WEBHOOK_LIMIT_MAX
+
+    try:
+        validate_runtime_config("webhook", mode="new")
+    except ValueError as exc:  # noqa: BLE001
+        _scraper_event(
+            "error",
+            phase="webhook",
+            context="changedetection",
+            error="config_invalid",
+            message=str(exc),
+        )
+        return jsonify({"ok": False, "error": "config_invalid", "details": str(exc)}), 500
+
+    _scraper_event(
+        "state",
+        phase="webhook",
+        context="changedetection",
+        mode="new",
+        new_limit=int(new_limit),
+        remote_addr=request.remote_addr,
+    )
+
+    try:
+        summary = run_scrape(
+            base_url=config.DEFAULT_BASE_URL,
+            page_wait=config.PAGE_WAIT_SECONDS,
+            per_delay=config.PER_DOWNLOAD_DELAY,
+            scrape_mode="new",
+            new_limit=new_limit,
+            max_retries=config.SCRAPER_MAX_RETRIES,
+            resume=False,
+            resume_mode="none",
+            resume_page=None,
+            resume_index=None,
+            limit_pages=[0],
+            row_limit=new_limit,
+            start_message="[WEBHOOK] Triggered new-only scrape",
+            trigger="webhook",
+        )
+    except Exception as exc:  # noqa: BLE001
+        _scraper_event(
+            "error",
+            phase="webhook",
+            context="changedetection",
+            error="scrape_failed",
+            message=str(exc),
+        )
+        return (
+            jsonify({"ok": False, "error": "scrape_error", "error_summary": str(exc)}),
+            500,
+        )
+
+    summary_counts = {
+        "processed": summary.get("processed"),
+        "downloaded": summary.get("downloaded"),
+        "skipped": summary.get("skipped"),
+        "failed": summary.get("failed"),
+    }
+
+    return jsonify(
+        {
+            "ok": True,
+            "entrypoint": "webhook",
+            "mode": "new",
+            "target_source": "unreported_judgments",
+            "run_id": summary.get("run_id"),
+            "csv_version_id": summary.get("csv_version_id"),
+            "summary": summary_counts,
+        }
+    )
 
 
 @app.get("/api/downloaded-cases")

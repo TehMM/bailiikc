@@ -99,6 +99,9 @@ RECORD_REPLAY_FIXTURES: bool = os.getenv("BAILIIKC_RECORD_REPLAY_FIXTURES", "0")
     "false",
 }
 
+WEBHOOK_SHARED_SECRET: str = os.getenv("BAILIIKC_WEBHOOK_SHARED_SECRET", "").strip()
+WEBHOOK_NEW_LIMIT_MAX: int = int(os.getenv("BAILIIKC_WEBHOOK_NEW_LIMIT_MAX", "50"))
+
 COMMON_HEADERS: dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "

@@ -16,6 +16,7 @@ import requests
 from . import config
 from . import cases_index
 from .logging_utils import _scraper_event
+from .config_validation import validate_runtime_config
 from .run import handle_dl_bfile_from_ajax
 from .utils import load_json_lines, log_line
 
@@ -43,6 +44,7 @@ def _prepare_output_root(config_obj: ReplayConfig) -> Path:
 
 
 def run_replay(config_obj: ReplayConfig) -> Dict[str, Any]:
+    validate_runtime_config("replay")
     fixtures = list(load_dl_bfile_fixtures(config_obj.fixtures_path))
     summary: Dict[str, Any] = {
         "fixtures": len(fixtures),

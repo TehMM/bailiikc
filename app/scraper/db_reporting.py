@@ -24,8 +24,8 @@ def summarise_downloads_for_run(run_id: int) -> RunDownloadSummary:
 
     conn = db.get_connection()
 
-    run_exists = conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone()
-    if run_exists is None:
+    run_row = conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if run_row is None:
         raise RunNotFoundError(f"Run {run_id} does not exist")
 
     status_counts: Dict[str, int] = {}

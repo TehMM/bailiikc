@@ -8,10 +8,9 @@ from .utils import log_line
 def _scraper_event(label: str = "", *, phase: str | None = None, **fields: Any) -> None:
     """Emit a structured scraper log line.
 
-    ``phase`` may be used as a keyword alias for the label for compatibility
-    with existing call sites. When both ``label`` and ``phase`` are provided,
-    ``phase`` is emitted as part of the payload so the caller still captures the
-    event stage.
+    ``label`` controls the bracketed tag (e.g. 'state', 'nav', 'error').
+    ``phase`` is an optional payload field to preserve the old 'phase=' semantics
+    at call sites without changing the log prefix.
     """
 
     try:

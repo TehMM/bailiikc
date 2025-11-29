@@ -1,6 +1,7 @@
 import threading
+from pathlib import Path
 
-from app.scraper import config, download_executor
+from app.scraper import config, download_executor, run
 from app.scraper.download_executor import DownloadExecutor
 
 
@@ -74,3 +75,45 @@ def test_queue_overflow_logs(monkeypatch):
     assert ok is True
     assert error is None
     assert any(event.get("kind") == "queue_overflow" for event in events)
+
+
+def test_queue_or_download_file_creates_stub_when_replay_skip_network(
+    monkeypatch, tmp_path: Path
+):
+    dest = tmp_path / "stub.pdf"
+    monkeypatch.setattr(config, "REPLAY_SKIP_NETWORK", True)
+
+    ok, error = run.queue_or_download_file(
+        "https://example.com/fake",
+        dest,
+        token="TESTTOKEN",
+        max_retries=1,
+        timeout=5,
+    )
+
+    assert ok is True
+    assert error is None
+    assert dest.is_file()
+    data = dest.read_bytes()
+    assert data.startswith(run.REPLAY_STUB_PDF_HEADER)
+
+
+def test_log_download_executor_summary(monkeypatch):
+    events: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(run, "_scraper_event", lambda *args, **kwargs: events.append((args, kwargs)))
+    monkeypatch.setattr(config, "MAX_PARALLEL_DOWNLOADS", 3)
+
+    executor = DownloadExecutor(1)
+    executor._peak_in_flight = 2  # type: ignore[attr-defined]
+
+    run._log_download_executor_summary(executor)
+
+    assert events
+    args, kwargs = events[-1]
+    assert args == ("state",)
+    assert kwargs == {
+        "phase": "download_executor",
+        "kind": "summary",
+        "peak_in_flight": 2,
+        "max_parallel": 3,
+    }

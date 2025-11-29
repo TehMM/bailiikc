@@ -44,14 +44,36 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 - **Downloaded cases per run (DB-backed)**: `db_reporting.get_downloaded_cases_for_run(run_id)` joins `downloads` and `cases` to return the successful rows for the given `run_id` as dictionaries. `GET /api/db/runs/<run_id>/downloaded-cases` returns `{ok: true, run_id, count, downloads}` (with `<run_id>` as the path parameter) and responds with 404 when the run does not exist.
 - **CSV version case diff (DB-backed)**: `db_reporting.get_case_diff_for_csv_version(version_id)` derives which cases are new at a version (`first_seen_version_id == version_id`) and which were removed at that version (`last_seen_version_id == version_id` and `is_active = 0`) for `source = 'unreported_judgments'`. `GET /api/db/csv_versions/<version_id>/case-diff` returns `{ok: true, csv_version_id, new_count, removed_count, new_cases, removed_cases}` (with `<version_id>` as the path parameter) and responds with 404 when the version does not exist or is invalid.
 - **Case index backend**: With `BAILIIKC_USE_DB_CASES=1` (default), `cases_index` builds the in-memory index from the SQLite `cases` table that mirrors the CSV feed. Setting the flag to `"0"` forces the legacy CSV-driven index. Behaviour should be identical in both modes; the DB path is now the primary backend.
-- **Download executor knobs**: `BAILIIKC_MAX_PARALLEL_DOWNLOADS` (default `1`) and `BAILIIKC_MAX_PENDING_DOWNLOADS` (default `100`) bound how many Box downloads may be in-flight. `BAILIIKC_ENABLE_DOWNLOAD_EXECUTOR=0` forces inline execution regardless of other limits. Peak in-flight totals are logged via `[SCRAPER][STATE][download_executor]` events for observability.
-- **Replay controls**: `BAILIIKC_RECORD_REPLAY_FIXTURES=1` captures `dl_bfile` JSONL fixtures during live runs. `BAILIIKC_REPLAY_SKIP_NETWORK=1` stubs Box downloads for offline replay; the replay harness also forces this in dry-run mode while writing to sandboxed output roots under `/app/data/replay_runs/`.
+- **Download executor knobs**: `BAILIIKC_MAX_PARALLEL_DOWNLOADS` (default `1`) and `BAILIIKC_MAX_PENDING_DOWNLOADS` (default `100`) bound how many Box downloads may be in-flight. `BAILIIKC_ENABLE_DOWNLOAD_EXECUTOR=0` forces inline execution regardless of other limits. Peak in-flight totals are logged via `[SCRAPER][STATE]` lines with `phase=download_executor` for observability.
+- **Replay controls**: `BAILIIKC_RECORD_REPLAY_FIXTURES=1` captures `dl_bfile` JSONL fixtures during live runs. `BAILIIKC_REPLAY_SKIP_NETWORK=1` stubs Box downloads for offline replay; the replay harness also forces this in dry-run mode while writing to sandboxed output roots under `/app/data/replay_runs/`. **Note:** Setting `BAILIIKC_REPLAY_SKIP_NETWORK=1` during a live scrape writes stub PDFs containing only a `%PDF-1.4` header and should be reserved for offline replay/testing.
 - **BAILIIKC_USE_DB_WORKLIST_FOR_NEW**: when set to `"1"` (default), `scrape_mode="new"` uses the DB-backed worklist from `app.scraper.worklist.build_new_worklist(csv_version_id, source)` derived from the SQLite `cases` table. Setting the flag to `"0"` forces the legacy CSV-driven planner.
 - **BAILIIKC_USE_DB_WORKLIST_FOR_FULL**: when set to `"1"` (default), `scrape_mode="full"` uses the DB-backed worklist from `build_full_worklist(...)`. Setting the flag to `"0"` keeps the legacy CSV-only path.
 - **BAILIIKC_USE_DB_WORKLIST_FOR_RESUME**: when set to `"1"` (default), resume mode draws planned retries from `build_resume_worklist(...)` inside `run.py` and filters pagination clicks accordingly. Setting the flag to `"0"` preserves legacy JSON/log-driven resume behaviour.
 - **DB worklist helpers**: `app.scraper.worklist.build_full_worklist(csv_version_id, source)`, `build_new_worklist(...)`, and `build_resume_worklist(...)` derive the set of cases to process for a given CSV version from the SQLite `cases` and `downloads` tables. A dispatcher `build_worklist(mode, csv_version_id, source)` chooses the appropriate helper for `"full"`, `"new"`, or `"resume"`. When DB worklist flags are enabled, `run.py` uses these helpers for planning, including `"resume"` when explicitly requested; setting flags to `"0"` preserves the legacy CSV-driven planner.
 - **Behaviour**: JSON files remain the source of truth for scraper control/resume. SQLite is read for reporting (/api/runs/latest, /api/db/ endpoints, and optional DB-backed /report or /api/downloaded-cases) while continuing to mirror run and download activity during a scrape.
 - **Consistency checker (JSON vs DB)**: `app.scraper.consistency.compare_latest_downloads_json_vs_db()` computes a diagnostic report comparing the JSON-based and DB-based views of downloaded cases for the latest run. This is exposed as a CLI via `python -m app.scraper.consistency` and is intended for internal validation while DB-backed reporting and control flow are adopted. Any errors or mismatches cause the CLI to exit non-zero.
+
+### Offline replay usage
+
+For local debugging and regression testing, the scraper can replay captured `dl_bfile` fixtures without talking to Playwright or the live judicial site.
+
+1. Enable fixture capture for a real run:
+
+   - Set `BAILIIKC_RECORD_REPLAY_FIXTURES=1`.
+   - Run the scraper as normal (via CLI or UI).
+   - This writes one JSONL file per run under `/app/data/replay_fixtures/run_<run_id>_dl_bfile.jsonl`.
+
+2. Run the offline harness against those fixtures:
+
+   ```bash
+   python -m app.scraper.replay_harness /app/data/replay_fixtures/run_<run_id>_dl_bfile.jsonl --dry-run
+   ```
+
+   `--dry-run` forces `BAILIIKC_REPLAY_SKIP_NETWORK=1` and writes stub PDFs under `/app/data/replay_runs/replay_<timestamp>/dry_run_pdfs`.
+
+   Omitting `--dry-run` replays the downloads against Box using `requests.Session` while keeping all output sandboxed under `/app/data/replay_runs/...`.
+
+The harness never mutates the main `/app/data/pdfs` directory or JSON logs; it temporarily overrides `config.PDF_DIR` and `config.DOWNLOADS_LOG` and restores them at the end of the replay.
 
 ## Scrape logs
 - Structured scraper logs follow a `[SCRAPER][PHASE] key=value, ...` pattern so they can be grepped or machine-parsed.

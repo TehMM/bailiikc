@@ -892,8 +892,8 @@ complements the DB/worklist roadmap above.
       queued items before falling back to synchronous execution).
     - `BAILIIKC_ENABLE_DOWNLOAD_EXECUTOR` gates the executor entirely; when off
       or when `MAX_PARALLEL_DOWNLOADS <= 1`, downloads execute inline.
-  - Telemetry for peak in-flight downloads is emitted via
-    `[SCRAPER][STATE][download_executor]` with `peak_in_flight` and
+  - Telemetry for peak in-flight downloads is emitted via `[SCRAPER][STATE]`
+    lines with `phase=download_executor` and fields `peak_in_flight` and
     `max_parallel` to keep observability aligned with the existing log format.
   - Queue saturation emits a `[SCRAPER][STATE]` `queue_overflow` event and
     forces synchronous execution rather than dropping work, preserving
@@ -908,7 +908,8 @@ complements the DB/worklist roadmap above.
     reusing `handle_dl_bfile_from_ajax` with sandboxed paths. A `ReplayConfig`
     selects dry-run vs. sandbox output roots; dry-run forces
     `REPLAY_SKIP_NETWORK` to avoid real HTTP. `[SCRAPER][REPLAY]` events mark
-    start/end and download stubs.
+    start/end and download stubs using `phase` fields like `start`, `end`, and
+    `download_stub`.
   - `BAILIIKC_REPLAY_SKIP_NETWORK` short-circuits Box downloads in replay mode
     (and can be set manually) while preserving the downstream state machine and
     logging flow.

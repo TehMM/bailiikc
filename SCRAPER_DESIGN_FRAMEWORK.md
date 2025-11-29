@@ -943,6 +943,21 @@ Config safety and guardrails:
 - `REPLAY_SKIP_NETWORK` is only allowed for `entrypoint in {"replay", "tests"}`; enabling it elsewhere raises a `ValueError` with a `[SCRAPER][ERROR] phase=config` log.
 - Download executor knobs (`ENABLE_DOWNLOAD_EXECUTOR`, `MAX_PARALLEL_DOWNLOADS`, `MAX_PENDING_DOWNLOADS`) are clamped to sane minimums rather than crashing. Invalid timeouts or negative `MIN_FREE_MB` values raise clear configuration errors.
 
+11. Run coverage & health
+
+- Extend the `runs` table with coverage counters (`cases_total`, `cases_planned`, `cases_attempted`, `cases_downloaded`, `cases_failed`, `cases_skipped`), `coverage_ratio`, and `run_health` (ok/partial/failed/suspicious).
+- At the end of each run, derive counts from the `cases` table (active `unreported_judgments` rows scoped to the run’s `csv_version_id`) and `downloads` rows for that run. When DB worklists are enabled, worklist sizes drive `cases_planned`; otherwise, fall back to distinct `downloads.case_id` counts.
+- Compute `coverage_ratio = cases_downloaded / max(cases_planned, 1)` and classify `run_health`:
+  - No planned cases: suspicious if `cases_total > 0` and `cases_downloaded == 0`, otherwise ok.
+  - Planned cases present: suspicious if `cases_attempted == 0`; ok when `coverage_ratio >= 0.95` and `cases_failed == 0`; partial when `coverage_ratio >= 0.6`; failed when `coverage_ratio < 0.1` with failures recorded; otherwise partial.
+- Persist coverage and `run_health` back to the `runs` row and expose them via reporting helpers and APIs (`/api/db/runs`, `/api/db/runs/<run_id>/health`).
+
+11.1 Health & diagnostics
+
+- Add `app.scraper.healthcheck.run_health_checks(entrypoint)` that validates configuration, ensures filesystem readiness (`ensure_dirs`, `disk_has_room`), checks SQLite connectivity/schema, and optionally includes JSON-vs-DB consistency diagnostics. Logging via `_scraper_event` with `phase="health"` must be best-effort.
+- Provide a CLI entrypoint (`python -m app.scraper.healthcheck`) that prints check results and exits non-zero when mandatory checks fail.
+- Expose `GET /api/health` returning `{ok, checks}` with HTTP 200 when healthy or 503 on failure. Treat the consistency check as non-fatal for the HTTP entrypoint.
+
 12. Extension Points (AI / Jina / Firecrawl / AgentQL / Multion)
 
 For future RAG/AI processing:

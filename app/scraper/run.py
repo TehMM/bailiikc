@@ -58,6 +58,9 @@ from .retry_policy import decide_retry
 from .logging_utils import _scraper_event
 from .state import clear_checkpoint, derive_checkpoint_from_logs, load_checkpoint, save_checkpoint
 from .telemetry import RunTelemetry
+
+# Minimal header for stub PDFs created when REPLAY_SKIP_NETWORK is enabled.
+REPLAY_STUB_PDF_HEADER = b"%PDF-1.4\n"
 from .utils import (
     append_json_line,
     build_pdf_path,
@@ -811,7 +814,7 @@ def queue_or_download_file(
             token=token or url,
         )
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        dest_path.write_bytes(b"%PDF-1.4\n")
+        dest_path.write_bytes(REPLAY_STUB_PDF_HEADER)
         return True, None
 
     result = box_client.download_pdf(
@@ -825,6 +828,20 @@ def queue_or_download_file(
     if result.ok:
         return True, None
     return False, result.error_message
+
+
+def _log_download_executor_summary(executor: Optional[DownloadExecutor]) -> None:
+    """Emit a summary event for the download executor, if present."""
+    if executor is None:
+        return
+
+    _scraper_event(
+        "state",
+        phase="download_executor",
+        kind="summary",
+        peak_in_flight=executor.peak_in_flight,
+        max_parallel=config.MAX_PARALLEL_DOWNLOADS,
+    )
 
 
 def _label_for_entry(
@@ -1097,14 +1114,15 @@ def handle_dl_bfile_from_ajax(
             token=norm_fname,
         )
 
-    try:
-        if download_executor is not None:
-            success, error = download_executor.submit(norm_fname, _download)
-        else:
-            success, error = _download()
-    except OSError as exc:
-        error = str(exc)
-        success = False
+    def _execute_download() -> Tuple[bool, Optional[str]]:
+        try:
+            if download_executor is not None:
+                return download_executor.submit(norm_fname, _download)
+            return _download()
+        except OSError as exc:  # noqa: PERF203
+            return False, str(exc)
+
+    success, error = _execute_download()
 
     if not success and error:
         lowered = error.lower()
@@ -1116,14 +1134,7 @@ def handle_dl_bfile_from_ajax(
                 )
                 final_path = fallback_path
                 download_path = fallback_path
-                try:
-                    if download_executor is not None:
-                        success, error = download_executor.submit(norm_fname, _download)
-                    else:
-                        success, error = _download()
-                except OSError as exc:
-                    error = str(exc)
-                    success = False
+                success, error = _execute_download()
 
     if not success:
         log_line(
@@ -1213,6 +1224,7 @@ def retry_failed_downloads(
     processed_this_run: Set[str],
     checkpoint: Optional[Checkpoint],
     run_id: Optional[int] = None,
+    download_executor: Optional[DownloadExecutor] = None,
 ) -> None:
     """Retry download clicks for items that previously failed."""
 
@@ -2565,6 +2577,7 @@ def _run_scrape_attempt(
                                 processed_this_run=processed_this_run,
                                 checkpoint=checkpoint if is_new_mode(scrape_mode) else None,
                                 run_id=run_id,
+                                download_executor=download_executor,
                             )
     
                         time.sleep(config.PLAYWRIGHT_RETRY_AFTER_SWEEP_SECONDS)
@@ -2619,13 +2632,7 @@ def _run_scrape_attempt(
             else:
                 break
 
-        _scraper_event(
-            "state",
-            phase="download_executor",
-            kind="summary",
-            peak_in_flight=download_executor.peak_in_flight,
-            max_parallel=config.MAX_PARALLEL_DOWNLOADS,
-        )
+        _log_download_executor_summary(download_executor)
 
         log_line("Completed run (response-capture strategy).")
         if checkpoint is not None:

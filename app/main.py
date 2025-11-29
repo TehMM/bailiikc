@@ -610,6 +610,56 @@ def api_db_runs_latest() -> Response:
     return jsonify({"ok": True, "run": summary})
 
 
+@app.get("/api/db/runs/<int:run_id>/download-summary")
+def api_db_run_download_summary(run_id: int) -> Response:
+    """Return aggregated download outcomes and error codes for a run."""
+
+    if not use_db_reporting():
+        return jsonify({"ok": False, "error": "db_reporting_disabled"}), 404
+
+    try:
+        summary = db_reporting.summarise_downloads_for_run(run_id)
+    except db_reporting.RunNotFoundError:
+        return jsonify({"ok": False, "error": "run_not_found", "run_id": run_id}), 404
+
+    return jsonify(
+        {
+            "ok": True,
+            "run_id": summary.run_id,
+            "status_counts": summary.status_counts,
+            "fail_reasons": summary.fail_reasons,
+            "skip_reasons": summary.skip_reasons,
+        }
+    )
+
+
+@app.get("/api/db/runs/latest/download-summary")
+def api_db_latest_run_download_summary() -> Response:
+    """Return download summary for the most recent run."""
+
+    if not use_db_reporting():
+        return jsonify({"ok": False, "error": "db_reporting_disabled"}), 404
+
+    run_id = db_reporting.latest_run_id()
+    if run_id is None:
+        return jsonify({"ok": False, "error": "no_runs"}), 404
+
+    try:
+        summary = db_reporting.summarise_downloads_for_run(run_id)
+    except db_reporting.RunNotFoundError:
+        return jsonify({"ok": False, "error": "run_not_found", "run_id": run_id}), 404
+
+    return jsonify(
+        {
+            "ok": True,
+            "run_id": summary.run_id,
+            "status_counts": summary.status_counts,
+            "fail_reasons": summary.fail_reasons,
+            "skip_reasons": summary.skip_reasons,
+        }
+    )
+
+
 @app.get("/api/db/downloaded-cases")
 def api_db_downloaded_cases() -> Response:
     """Return downloaded cases using DB-backed reporting helpers."""

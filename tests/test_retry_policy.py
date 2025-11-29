@@ -1,7 +1,6 @@
-from __future__ import annotations
-
 import pytest
 
+from app.scraper.error_codes import ErrorCode
 from app.scraper import retry_policy
 
 
@@ -16,62 +15,62 @@ def event_recorder(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict]]:
     return events
 
 
-@pytest.mark.parametrize(
-    "attempt, expected, kind",
-    [
-        (1, True, "retryable"),
-        (2, True, "retryable"),
-        (3, False, "capped"),
-        (5, False, "capped"),
-    ],
-)
-def test_download_other_retry_limits(
-    attempt: int, expected: bool, kind: str, event_recorder: list[tuple[str, dict]]
-) -> None:
-    result = retry_policy.decide_retry("download_other", attempt)
-    assert result is expected
-    assert len(event_recorder) == 1
-    phase, fields = event_recorder[0]
-    assert phase == "state"
-    assert fields["phase"] == "retry_decision"
-    assert fields["error_code"] == "download_other"
-    assert fields["attempt"] == attempt
-    assert fields["max_attempts"] == 3
-    assert fields["will_retry"] is expected
-    assert fields["kind"] == kind
+def test_http_500_retryable(event_recorder: list[tuple[str, dict]]) -> None:
+    assert retry_policy.decide_retry(
+        attempt_index=1,
+        max_attempts=3,
+        error=None,
+        error_code=ErrorCode.HTTP_5XX,
+        http_status=500,
+    )
+    assert event_recorder[-1][1]["will_retry"] is True
 
 
-@pytest.mark.parametrize(
-    "error_code",
-    ["disk_full", "invalid_token", "click_timeout", "exists_ok"],
-)
-def test_non_retryable_error_codes(error_code: str, event_recorder: list[tuple[str, dict]]) -> None:
-    assert error_code in retry_policy.NON_RETRYABLE_ERROR_CODES
-    result = retry_policy.decide_retry(error_code, 1)
-    assert result is False
-    assert len(event_recorder) == 1
-    _, fields = event_recorder[0]
-    assert fields["kind"] == "non_retryable"
-    assert fields["phase"] == "retry_decision"
-    assert fields["will_retry"] is False
-    assert fields["error_code"] == error_code
+def test_http_404_not_retryable(event_recorder: list[tuple[str, dict]]) -> None:
+    assert (
+        retry_policy.decide_retry(
+            attempt_index=1,
+            max_attempts=3,
+            error=None,
+            error_code=ErrorCode.HTTP_404,
+            http_status=404,
+        )
+        is False
+    )
+    assert event_recorder[-1][1]["kind"] == "non_retryable"
 
 
-@pytest.mark.parametrize(
-    "error_code, expected_kind",
-    [
-        ("", "missing_error_code"),
-        (None, "missing_error_code"),
-        ("unexpected_code", "no_retry_policy"),
-        ("box_404", "no_retry_policy"),
-    ],
-)
-def test_missing_or_unknown_error_codes(
-    error_code: str | None, expected_kind: str, event_recorder: list[tuple[str, dict]]
-) -> None:
-    assert retry_policy.decide_retry(error_code, 1) is False
-    assert len(event_recorder) == 1
-    _, fields = event_recorder[0]
-    assert fields["will_retry"] is False
-    assert fields["kind"] == expected_kind
-    assert fields["phase"] == "retry_decision"
+def test_network_retryable(event_recorder: list[tuple[str, dict]]) -> None:
+    assert retry_policy.decide_retry(
+        attempt_index=1,
+        max_attempts=2,
+        error=None,
+        error_code=ErrorCode.NETWORK,
+    )
+    assert event_recorder[-1][1]["will_retry"] is True
+
+
+def test_malformed_pdf_not_retryable(event_recorder: list[tuple[str, dict]]) -> None:
+    assert (
+        retry_policy.decide_retry(
+            attempt_index=1,
+            max_attempts=2,
+            error=None,
+            error_code=ErrorCode.MALFORMED_PDF,
+        )
+        is False
+    )
+
+
+def test_missing_context_allows_single_retry(event_recorder: list[tuple[str, dict]]) -> None:
+    # No error_code/http_status -> allow only one retry window
+    assert retry_policy.decide_retry(attempt_index=1, max_attempts=3) is True
+    assert retry_policy.decide_retry(attempt_index=3, max_attempts=3) is False
+    assert event_recorder[-1][1]["kind"] == "capped"
+
+
+def test_compute_backoff_seconds() -> None:
+    assert retry_policy.compute_backoff_seconds(1) == 1.0
+    assert retry_policy.compute_backoff_seconds(2) == 2.0
+    assert retry_policy.compute_backoff_seconds(3) == 4.0
+    assert retry_policy.compute_backoff_seconds(10) == 30.0

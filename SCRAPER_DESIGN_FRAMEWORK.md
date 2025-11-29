@@ -993,3 +993,9 @@ When debugging:
 Before patching code, update or annotate this document with what’s broken and what will change.
 
 After patching, confirm the new behaviour matches this spec (or update the spec accordingly).
+
+## Error taxonomy, retries, and PDF validation
+
+- Download failures use a small internal taxonomy defined in `app.scraper.error_codes.ErrorCode`; codes are persisted to `downloads.error_code` and emitted via `_scraper_event`.
+- Box/PDF downloads validate `%PDF` magic bytes and a minimum byte length to avoid storing truncated artefacts. Replay stub PDFs are padded to satisfy the same check.
+- Retry decisions are centralised in `retry_policy.decide_retry`, which considers `error_code` and HTTP status. Retryable cases (network issues, Box rate limits, HTTP 5xx) use capped exponential backoff from `compute_backoff_seconds`.

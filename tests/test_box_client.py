@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from app.scraper import box_client
+from app.scraper.error_codes import ErrorCode
 
 
 class _FakeResponseBase:
@@ -13,7 +14,11 @@ class _FakeResponseBase:
         return False
 
 
-def test_download_pdf_with_http_client(monkeypatch, tmp_path: Path):
+def _valid_pdf_bytes() -> bytes:
+    return b"%PDF-1.4\n" + b"0" * box_client.MIN_PDF_BYTES
+
+
+def test_download_pdf_with_http_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     messages = []
     monkeypatch.setattr(box_client, "log_line", lambda msg: messages.append(str(msg)))
 
@@ -22,7 +27,7 @@ def test_download_pdf_with_http_client(monkeypatch, tmp_path: Path):
             status = 200
 
             def body(self):
-                return b"%PDF-1.4 test"
+                return _valid_pdf_bytes()
 
         return Resp()
 
@@ -36,13 +41,13 @@ def test_download_pdf_with_http_client(monkeypatch, tmp_path: Path):
 
     assert result.ok is True
     assert result.status_code == 200
-    assert result.bytes_written == len(b"%PDF-1.4 test")
-    assert dest.read_bytes() == b"%PDF-1.4 test"
+    assert result.bytes_written == dest.stat().st_size
+    assert dest.read_bytes().startswith(b"%PDF-")
     assert any("[SCRAPER][BOX]" in msg for msg in messages)
     assert all("token=secret" not in msg for msg in messages)
 
 
-def test_download_pdf_with_requests(monkeypatch, tmp_path: Path):
+def test_download_pdf_with_requests(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     messages = []
     monkeypatch.setattr(box_client, "log_line", lambda msg: messages.append(str(msg)))
 
@@ -53,8 +58,7 @@ def test_download_pdf_with_requests(monkeypatch, tmp_path: Path):
             return None
 
         def iter_content(self, chunk_size=8192):  # noqa: ANN001
-            yield b"%PDF-"
-            yield b"content"
+            yield _valid_pdf_bytes()
 
     monkeypatch.setattr(box_client.requests, "get", lambda *_, **__: Resp())
 
@@ -64,11 +68,11 @@ def test_download_pdf_with_requests(monkeypatch, tmp_path: Path):
     assert result.ok is True
     assert result.status_code == 200
     assert result.bytes_written == dest.stat().st_size
-    assert dest.read_bytes() == b"%PDF-content"
+    assert dest.read_bytes().startswith(b"%PDF-")
     assert any("[SCRAPER][BOX]" in msg for msg in messages)
 
 
-def test_download_pdf_http_error(monkeypatch, tmp_path: Path):
+def test_download_pdf_http_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     messages = []
     monkeypatch.setattr(box_client, "log_line", lambda msg: messages.append(str(msg)))
 
@@ -81,25 +85,27 @@ def test_download_pdf_http_error(monkeypatch, tmp_path: Path):
             raise requests.HTTPError("500")
 
         def iter_content(self, chunk_size=8192):  # noqa: ANN001
-            yield b"%PDF-"
+            yield _valid_pdf_bytes()
 
     monkeypatch.setattr(box_client.requests, "get", lambda *_, **__: Resp())
 
     dest = tmp_path / "file.pdf"
-    result = box_client.download_pdf("https://example.com/file.pdf", dest, max_retries=1)
+    with pytest.raises(box_client.DownloadError) as excinfo:
+        box_client.download_pdf("https://example.com/file.pdf", dest, max_retries=1)
 
-    assert result.ok is False
-    assert result.status_code is None
-    assert result.bytes_written == 0
-    assert dest.exists() is False
+    assert excinfo.value.error_code == ErrorCode.HTTP_5XX
     assert any("[AJAX]" in msg for msg in messages)
+    assert dest.exists() is False
 
 
 @pytest.mark.parametrize(
-    "chunks, expected_error",
-    [([b"HTML"], "Response is not a PDF"), ([], "Empty download")],
+    "chunks, expected_error_code",
+    [([b"HTML"], ErrorCode.MALFORMED_PDF), ([b"%PDF"], ErrorCode.MALFORMED_PDF)],
 )
-def test_download_pdf_invalid_content(monkeypatch, tmp_path: Path, chunks, expected_error):
+
+def test_download_pdf_invalid_content(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, chunks, expected_error_code: str
+) -> None:
     messages = []
     monkeypatch.setattr(box_client, "log_line", lambda msg: messages.append(str(msg)))
 
@@ -115,10 +121,9 @@ def test_download_pdf_invalid_content(monkeypatch, tmp_path: Path, chunks, expec
     monkeypatch.setattr(box_client.requests, "get", lambda *_, **__: Resp())
 
     dest = tmp_path / "file.pdf"
-    result = box_client.download_pdf("https://example.com/file.pdf", dest, max_retries=1)
+    with pytest.raises(box_client.DownloadError) as excinfo:
+        box_client.download_pdf("https://example.com/file.pdf", dest, max_retries=1)
 
-    assert result.ok is False
-    assert result.error_message == expected_error
-    assert result.bytes_written == 0
+    assert excinfo.value.error_code == expected_error_code
     assert dest.exists() is False
-    assert any(expected_error in msg for msg in messages)
+    assert any("failed" in msg.lower() for msg in messages)

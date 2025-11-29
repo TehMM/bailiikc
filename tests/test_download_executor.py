@@ -83,7 +83,7 @@ def test_queue_or_download_file_creates_stub_when_replay_skip_network(
     dest = tmp_path / "stub.pdf"
     monkeypatch.setattr(config, "REPLAY_SKIP_NETWORK", True)
 
-    ok, error = run.queue_or_download_file(
+    ok, info = run.queue_or_download_file(
         "https://example.com/fake",
         dest,
         token="TESTTOKEN",
@@ -92,10 +92,11 @@ def test_queue_or_download_file_creates_stub_when_replay_skip_network(
     )
 
     assert ok is True
-    assert error is None
+    assert isinstance(info, dict)
     assert dest.is_file()
     data = dest.read_bytes()
     assert data.startswith(run.REPLAY_STUB_PDF_HEADER)
+    assert dest.stat().st_size >= run.box_client.MIN_PDF_BYTES
 
 
 def test_log_download_executor_summary(monkeypatch):

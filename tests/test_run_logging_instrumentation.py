@@ -12,12 +12,12 @@ def test_box_logging(monkeypatch, tmp_path: Path):
             status = 200
 
             def body(self):
-                return b"%PDF-1.4 test"
+                return b"%PDF-1.4\n" + b"0" * run.box_client.MIN_PDF_BYTES
 
         return Resp()
 
     dest = tmp_path / "file.pdf"
-    success, error = run.queue_or_download_file(
+    success, info = run.queue_or_download_file(
         "https://example.com/file.pdf?token=secret",
         dest,
         http_client=fake_http_client,
@@ -25,6 +25,6 @@ def test_box_logging(monkeypatch, tmp_path: Path):
     )
 
     assert success is True
-    assert error is None
+    assert isinstance(info, dict)
     assert any("[SCRAPER][BOX]" in msg for msg in messages)
     assert all("token=secret" not in msg for msg in messages)

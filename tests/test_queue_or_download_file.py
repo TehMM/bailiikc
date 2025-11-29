@@ -11,11 +11,12 @@ def test_replay_skip_network_stubs_pdf(tmp_path, monkeypatch):
 
     monkeypatch.setattr(run.box_client, "download_pdf", fail_download)
 
-    ok, error = run.queue_or_download_file(
+    ok, info = run.queue_or_download_file(
         "https://example.com/file.pdf", destination, token="token-123"
     )
 
     assert ok is True
-    assert error is None
+    assert isinstance(info, dict)
     assert destination.exists()
     assert destination.read_bytes().startswith(b"%PDF-1.4")
+    assert destination.stat().st_size >= run.box_client.MIN_PDF_BYTES

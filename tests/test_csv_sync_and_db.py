@@ -54,6 +54,7 @@ def test_csv_sync_populates_cases_and_versions(
     assert result.csv_path
     assert Path(result.csv_path).is_file()
     assert result.row_count > 0
+    assert result.source == "unreported_judgments"
 
     conn = db.get_connection()
     cursor = conn.execute("SELECT COUNT(*) AS cnt FROM csv_versions WHERE valid = 1")

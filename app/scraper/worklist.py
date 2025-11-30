@@ -4,10 +4,10 @@ import json
 from dataclasses import dataclass
 from typing import List, Optional
 
-from . import config, db
+from . import config, db, sources
 from .utils import log_line
 
-DEFAULT_SOURCE = "unreported_judgments"
+DEFAULT_SOURCE = sources.DEFAULT_SOURCE
 
 
 @dataclass(frozen=True)

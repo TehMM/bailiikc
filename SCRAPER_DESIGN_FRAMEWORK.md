@@ -201,6 +201,19 @@ CREATE INDEX IF NOT EXISTS idx_cases_token_norm
 CREATE INDEX IF NOT EXISTS idx_cases_source
     ON cases(source);
 
+**Sources**
+
+The scraper can target multiple logical sources of case data. These are
+represented by stable string identifiers stored in ``cases.source`` and in
+``runs.params_json.target_source``. At present, the only active source is:
+
+* ``unreported_judgments`` – the Cayman "Unreported Judgments" list.
+
+A future source (``public_registers``) is reserved but not yet wired into the
+live scraper. For each run, ``runs.params_json.target_source`` determines which
+subset of ``cases`` is considered when computing coverage and building
+DB-backed worklists.
+
 
 Table: runs
 

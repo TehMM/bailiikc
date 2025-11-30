@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import config, db, worklist
+from . import config, db, sources, worklist
 from .date_utils import sortable_date
 from .utils import log_line
 
@@ -204,31 +205,56 @@ def list_recent_runs(limit: int = 20) -> List[Dict[str, Any]]:
     ]
 
 
-def _count_cases_total(csv_version_id: int) -> int:
+def _infer_run_source(params_json: str) -> str:
+    """Return the logical source for a run based on its params_json.
+
+    Falls back to sources.DEFAULT_SOURCE if the field is missing, invalid,
+    or unrecognised.
+    """
+
+    if not params_json:
+        return sources.DEFAULT_SOURCE
+
+    try:
+        params = json.loads(params_json)
+    except Exception:  # noqa: BLE001
+        return sources.DEFAULT_SOURCE
+
+    value = (params.get("target_source") or "").strip()
+    if not value:
+        return sources.DEFAULT_SOURCE
+    if value not in sources.ALL_SOURCES:
+        return sources.DEFAULT_SOURCE
+    return value
+
+
+def _count_cases_total(csv_version_id: int, source: str) -> int:
     conn = db.get_connection()
     cursor = conn.execute(
         """
         SELECT COUNT(*) AS count
         FROM cases
-        WHERE source = 'unreported_judgments'
+        WHERE source = ?
           AND is_active = 1
           AND first_seen_version_id <= ?
           AND last_seen_version_id >= ?
         """,
-        (csv_version_id, csv_version_id),
+        (source, csv_version_id, csv_version_id),
     )
     row = cursor.fetchone()
     return int(row["count"]) if row else 0
 
 
-def _count_planned_cases(run_id: int, mode: str, csv_version_id: int) -> Optional[int]:
+def _count_planned_cases(
+    run_id: int, mode: str, csv_version_id: int, source: str
+) -> Optional[int]:
     normalized_mode = (mode or "").strip().lower()
     if normalized_mode == "new" and config.use_db_worklist_for_new():
-        return len(worklist.build_new_worklist(csv_version_id))
+        return len(worklist.build_new_worklist(csv_version_id, source=source))
     if normalized_mode == "full" and config.use_db_worklist_for_full():
-        return len(worklist.build_full_worklist(csv_version_id))
+        return len(worklist.build_full_worklist(csv_version_id, source=source))
     if normalized_mode == "resume" and config.use_db_worklist_for_resume():
-        return len(worklist.build_resume_worklist_for_run(run_id))
+        return len(worklist.build_resume_worklist_for_run(run_id, source=source))
     return None
 
 
@@ -237,21 +263,24 @@ def get_run_coverage(run_id: int) -> Dict[str, Any]:
 
     conn = db.get_connection()
     cursor = conn.execute(
-        "SELECT id, mode, csv_version_id FROM runs WHERE id = ? LIMIT 1", (run_id,)
+        "SELECT id, mode, csv_version_id, params_json FROM runs WHERE id = ? LIMIT 1",
+        (run_id,),
     )
     run_row = cursor.fetchone()
     if not run_row:
         raise RunNotFoundError(f"Run {run_id} not found")
 
     mode = (run_row["mode"] or "").strip().lower()
+    params_json = run_row["params_json"] or ""
+    source = _infer_run_source(params_json)
     csv_version_value = run_row["csv_version_id"]
     csv_version_id: Optional[int]
     cases_total = 0
     planned: Optional[int] = None
     if csv_version_value is not None:
         csv_version_id = int(csv_version_value)
-        cases_total = _count_cases_total(csv_version_id)
-        planned = _count_planned_cases(run_id, mode, csv_version_id)
+        cases_total = _count_cases_total(csv_version_id, source)
+        planned = _count_planned_cases(run_id, mode, csv_version_id, source)
 
     download_cursor = conn.execute(
         """

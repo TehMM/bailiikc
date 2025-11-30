@@ -42,7 +42,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-from . import box_client, config, csv_sync, db, db_reporting
+from . import box_client, config, csv_sync, db, db_reporting, sources
 from .download_executor import DownloadExecutor
 from .config import is_full_mode, is_new_mode
 from .cases_index import (
@@ -1486,6 +1486,7 @@ def _run_scrape_attempt(
     run_id: Optional[int] = None,
     csv_source: Optional[str] = None,
     sync_result: Optional[csv_sync.CsvSyncResult] = None,
+    target_source: str = sources.DEFAULT_SOURCE,
 ) -> Dict[str, Any]:
     """Execute a scraping run with automatic restart/resume support."""
 
@@ -1544,7 +1545,7 @@ def _run_scrape_attempt(
     planned_cases_by_token, planned_case_ids = _prepare_planned_cases(
         scrape_mode,
         sync_result,
-        source=worklist.DEFAULT_SOURCE,
+        source=target_source,
     )
     _scraper_event(
         "plan",
@@ -1576,7 +1577,7 @@ def _run_scrape_attempt(
         if token_norm in planned_case_ids:
             return planned_case_ids[token_norm]
         try:
-            return db.get_case_id_by_token_norm("unreported_judgments", token_norm)
+            return db.get_case_id_by_token_norm(target_source, token_norm)
         except Exception as exc:  # noqa: BLE001
             log_line(f"[DB][WARN] Failed to resolve case id for token={token_norm}: {exc}")
             return None
@@ -2730,6 +2731,8 @@ def run_scrape(
     raw_mode = (scrape_mode or config.SCRAPE_MODE_DEFAULT).strip().lower()
     mode = _normalize_scrape_mode(raw_mode)
 
+    target_source = sources.UNREPORTED_JUDGMENTS
+
     row_limit = new_limit if new_limit is not None else config.SCRAPE_NEW_LIMIT
     retry_limit = max_retries if max_retries is not None else config.SCRAPER_MAX_RETRIES
 
@@ -2817,6 +2820,7 @@ def run_scrape(
             "resume_index": resume_index,
             "limit_pages": limit_pages,
             "row_limit": row_limit,
+            "target_source": target_source,
         },
         sort_keys=True,
     )
@@ -2850,6 +2854,7 @@ def run_scrape(
             run_id=run_id,
             csv_source=csv_source,
             sync_result=sync_result,
+            target_source=target_source,
         )
         next_start_message = None
         return result

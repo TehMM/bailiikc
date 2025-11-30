@@ -5,12 +5,12 @@ from __future__ import annotations
 import sqlite3
 from typing import Any, Dict
 
-from . import db
+from . import db, sources
 from .utils import log_line
 
 
 def load_case_index_from_db(
-    *, source: str = "unreported_judgments", only_active: bool = True
+    *, source: str = sources.DEFAULT_SOURCE, only_active: bool = True
 ) -> Dict[str, Dict[str, Any]]:
     """Return a mapping of action_token_norm to case metadata from SQLite."""
 

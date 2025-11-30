@@ -21,7 +21,7 @@ from typing import List, Optional
 
 import requests
 
-from . import config, db
+from . import config, db, sources
 from .cases_index import normalize_action_token as normalize_action_token_cases
 from .utils import log_line
 
@@ -32,7 +32,8 @@ class CsvSyncResult:
 
     ``csv_path`` and ``row_count`` describe the concrete CSV file that was
     fetched and used to drive this version, so scraper runs can build their
-    case index from the exact payload recorded in ``csv_versions``.
+    case index from the exact payload recorded in ``csv_versions``. ``source``
+    records the logical source string persisted into ``cases.source``.
     """
 
     version_id: int
@@ -42,6 +43,7 @@ class CsvSyncResult:
     removed_case_ids: List[int]
     csv_path: str = ""
     row_count: int = 0
+    source: str = sources.DEFAULT_SOURCE
 
 
 def normalize_action_token(token: str) -> str:
@@ -162,7 +164,12 @@ def infer_is_criminal(metadata: dict[str, str]) -> int:
     return 0
 
 
-def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> CsvSyncResult:
+def sync_csv(
+    source_url: str,
+    session: Optional[requests.Session] = None,
+    *,
+    source: str = sources.UNREPORTED_JUDGMENTS,
+) -> CsvSyncResult:
     """Fetch, validate, and persist the remote judgments CSV.
 
     The function records a csv_versions row regardless of whether the payload is
@@ -233,10 +240,10 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
                 cursor = conn.execute(
                     """
                     SELECT * FROM cases
-                    WHERE action_token_norm = ? AND source = 'unreported_judgments'
+                    WHERE action_token_norm = ? AND source = ?
                     LIMIT 1
                     """,
-                    (norm,),
+                    (norm, source),
                 )
                 existing = cursor.fetchone()
 
@@ -287,7 +294,7 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
                             action_token_raw, action_token_norm, title, cause_number,
                             court, category, judgment_date, is_criminal, is_active,
                             source, first_seen_version_id, last_seen_version_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'unreported_judgments', ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                         """,
                         (
                             metadata.get("action_token_raw"),
@@ -298,6 +305,7 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
                             metadata.get("category"),
                             metadata.get("judgment_date"),
                             is_criminal,
+                            source,
                             version_id,
                             version_id,
                         ),
@@ -307,9 +315,9 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
         cursor = conn.execute(
             """
             SELECT id FROM cases
-            WHERE source = 'unreported_judgments' AND last_seen_version_id < ? AND is_active = 1
+            WHERE source = ? AND last_seen_version_id < ? AND is_active = 1
             """,
-            (version_id,),
+            (source, version_id),
         )
         removed_case_ids = [int(row["id"]) for row in cursor.fetchall()]
         if removed_case_ids:
@@ -345,4 +353,5 @@ def sync_csv(source_url: str, session: Optional[requests.Session] = None) -> Csv
         removed_case_ids=removed_case_ids,
         csv_path=str(csv_path),
         row_count=row_count,
+        source=source,
     )

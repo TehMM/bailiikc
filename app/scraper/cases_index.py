@@ -51,7 +51,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-from . import config, db_case_index
+from . import config, db_case_index, sources
 from .utils import log_line
 
 
@@ -240,7 +240,7 @@ def load_cases_from_csv(csv_path: str) -> None:
 
 
 def load_cases_index_from_db(
-    *, source: str = "unreported_judgments", only_active: bool = True
+    *, source: str = sources.DEFAULT_SOURCE, only_active: bool = True
 ) -> Dict[str, "CaseRow"]:
     """Populate the global case index using the SQLite ``cases`` table.
 

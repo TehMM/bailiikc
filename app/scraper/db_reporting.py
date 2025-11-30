@@ -220,6 +220,9 @@ def _infer_run_source(params_json: str) -> str:
     except Exception:  # noqa: BLE001
         return sources.DEFAULT_SOURCE
 
+    if not isinstance(params, dict):
+        return sources.DEFAULT_SOURCE
+
     value = (params.get("target_source") or "").strip()
     if not value:
         return sources.DEFAULT_SOURCE

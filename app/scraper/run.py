@@ -2736,6 +2736,8 @@ def run_scrape(
         target_source if target_source is not None else config.DEFAULT_SOURCE
     )
 
+    runtime = config.get_source_runtime(effective_source)
+
     row_limit = new_limit if new_limit is not None else config.SCRAPE_NEW_LIMIT
     retry_limit = max_retries if max_retries is not None else config.SCRAPER_MAX_RETRIES
 
@@ -2796,12 +2798,13 @@ def run_scrape(
     next_start_message = start_message
     run_id: Optional[int] = None
 
+    base_url = (base_url or runtime.base_url).strip()
+
     http_session = csv_sync.build_http_session()
-    sync_result = csv_sync.sync_csv(
-        config.CSV_URL, session=http_session, source=effective_source
-    )
+    csv_url = runtime.csv_url
+    sync_result = csv_sync.sync_csv(csv_url, session=http_session, source=effective_source)
     csv_version_id = sync_result.version_id
-    csv_source = sync_result.csv_path or config.CSV_URL
+    csv_source = sync_result.csv_path or csv_url
 
     _scraper_event(
         "plan",
@@ -2916,7 +2919,7 @@ def run_scrape(
 
 def _cli_entrypoint(argv: Optional[List[str]] = None) -> None:  # pragma: no cover
     parser = argparse.ArgumentParser(description="Run the Playwright scraper")
-    parser.add_argument("--base-url", default=config.DEFAULT_BASE_URL)
+    parser.add_argument("--base-url", default=None)
     parser.add_argument("--page-wait", type=int, default=config.PAGE_WAIT_SECONDS)
     parser.add_argument("--per-download-delay", type=float, default=config.PER_DOWNLOAD_DELAY)
     parser.add_argument(
@@ -2940,9 +2943,12 @@ def _cli_entrypoint(argv: Optional[List[str]] = None) -> None:  # pragma: no cov
     parser.add_argument(
         "--source",
         dest="target_source",
-        help="Logical source to scrape (currently only 'unreported_judgments' is supported).",
+        help=(
+            "Logical source to scrape. Currently supported: "
+            "'unreported_judgments' (stable) and 'public_registers' (experimental)."
+        ),
         default=sources.UNREPORTED_JUDGMENTS,
-        choices=[sources.UNREPORTED_JUDGMENTS],
+        choices=list(sources.ALL_SOURCES),
     )
 
     args = parser.parse_args(argv)

@@ -1,7 +1,9 @@
 """Configuration constants for the judicial scraper application."""
 from __future__ import annotations
 
+import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import sources
@@ -47,6 +49,50 @@ DOWNLOAD_RETRIES: int = int(os.getenv("DOWNLOAD_RETRIES", "3"))
 _DEFAULT_SOURCE_ENV = os.getenv("BAILIIKC_DEFAULT_SOURCE")
 # Logical source default; currently only unreported_judgments is supported.
 DEFAULT_SOURCE: str = sources.normalize_source(_DEFAULT_SOURCE_ENV)
+
+
+@dataclass(frozen=True)
+class SourceRuntime:
+    """Runtime configuration for a logical source.
+
+    The values here are resolved from environment variables, falling back to
+    the existing global defaults. This keeps source-specific overrides
+    centralised while preserving current behaviour for unreported_judgments.
+    """
+
+    base_url: str
+    csv_url: str
+
+
+def get_source_runtime(source: str | None) -> SourceRuntime:
+    """Return the runtime configuration for the given logical source.
+
+    ``source`` is normalised via ``sources.normalize_source``. Unknown or empty
+    values safely fall back to the default logical source.
+    """
+
+    normalized = sources.normalize_source(source)
+
+    if normalized == sources.PUBLIC_REGISTERS:
+        # Phase 2: URLs are still placeholders; override via env once the live
+        # public-registers endpoints are known.
+        pr_base_url = os.getenv("BAILIIKC_PR_BASE_URL")
+        pr_csv_url = os.getenv("BAILIIKC_PR_CSV_URL")
+
+        if pr_base_url is None or pr_csv_url is None:
+            logging.getLogger("bailiikc").warning(
+                "[SCRAPER][WARN] public_registers runtime falling back to default URLs; "
+                "set BAILIIKC_PR_BASE_URL and BAILIIKC_PR_CSV_URL for live runs."
+            )
+
+        base_url = pr_base_url or DEFAULT_BASE_URL
+        csv_url = pr_csv_url or CSV_URL
+        return SourceRuntime(base_url=base_url, csv_url=csv_url)
+
+    # Default / fallback: unreported_judgments
+    base_url = os.getenv("BAILIIKC_UJ_BASE_URL", DEFAULT_BASE_URL)
+    csv_url = os.getenv("BAILIIKC_UJ_CSV_URL", CSV_URL)
+    return SourceRuntime(base_url=base_url, csv_url=csv_url)
 
 def _parse_timeout_seconds(env_var: str, default: int, *, minimum: int = 1) -> int:
     """Parse a timeout value in seconds from the environment with bounds."""

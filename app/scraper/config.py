@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from . import sources
+
 DATA_DIR: Path = Path("/app/data")
 PDF_DIR: Path = DATA_DIR / "pdfs"
 LOG_DIR: Path = DATA_DIR / "logs"
@@ -41,6 +43,10 @@ RESUME_ON_CRASH: bool = os.getenv("RESUME_ON_CRASH", "true").strip().lower() != 
 NEW_ONLY_PAGES: int = int(os.getenv("NEW_ONLY_PAGES", "2"))
 DOWNLOAD_TIMEOUT_S: int = int(os.getenv("DOWNLOAD_TIMEOUT_S", "120"))
 DOWNLOAD_RETRIES: int = int(os.getenv("DOWNLOAD_RETRIES", "3"))
+
+_DEFAULT_SOURCE_ENV = os.getenv("BAILIIKC_DEFAULT_SOURCE")
+# Logical source default; currently only unreported_judgments is supported.
+DEFAULT_SOURCE: str = sources.normalize_source(_DEFAULT_SOURCE_ENV)
 
 def _parse_timeout_seconds(env_var: str, default: int, *, minimum: int = 1) -> int:
     """Parse a timeout value in seconds from the environment with bounds."""

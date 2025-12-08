@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from app.scraper import config, db
+from app.scraper import config, db, sources
 
 
 def _configure_temp_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -122,6 +122,7 @@ def test_webhook_runs_scrape(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     assert kwargs["new_limit"] == 3
     assert kwargs["row_limit"] == 3
     assert kwargs["limit_pages"] == [0]
+    assert kwargs["target_source"] == sources.UNREPORTED_JUDGMENTS
 
 
 def test_webhook_clamps_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -153,3 +154,4 @@ def test_webhook_clamps_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     assert resp.status_code == 200
     assert calls["kwargs"]["new_limit"] == main.WEBHOOK_LIMIT_MAX
     assert calls["kwargs"]["row_limit"] == main.WEBHOOK_LIMIT_MAX
+    assert calls["kwargs"]["target_source"] == sources.UNREPORTED_JUDGMENTS

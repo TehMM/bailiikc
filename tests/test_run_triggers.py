@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 import pytest
 
-from app.scraper import config, db
+from app.scraper import config, db, sources
 
 
 def _configure_temp_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -75,6 +75,7 @@ def test_ui_scrape_uses_ui_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     assert "kwargs" in calls
     assert calls["kwargs"]["trigger"] == "ui"
+    assert calls["kwargs"].get("target_source") == config.DEFAULT_SOURCE
 
 
 def test_webhook_uses_webhook_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,3 +114,4 @@ def test_webhook_uses_webhook_trigger(tmp_path: Path, monkeypatch: pytest.Monkey
     assert kwargs["new_limit"] == 5
     assert kwargs["row_limit"] == 5
     assert kwargs["limit_pages"] == [0]
+    assert kwargs["target_source"] == sources.UNREPORTED_JUDGMENTS

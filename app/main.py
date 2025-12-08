@@ -20,7 +20,7 @@ from flask import (
     url_for,
 )
 
-from app.scraper import config, db, db_reporting
+from app.scraper import config, db, db_reporting, sources
 from app.scraper.download_rows import build_download_rows, load_download_records
 from app.scraper.run import run_scrape
 from app.scraper.config_validation import validate_runtime_config
@@ -284,6 +284,7 @@ def start_scrape() -> Response:
                     resume_mode=resume_mode,
                     resume_page=resume_page,
                     resume_index=resume_index,
+                    target_source=config.DEFAULT_SOURCE,
                     trigger="ui",
                 )
                 app.config["LAST_SUMMARY"] = summary
@@ -335,6 +336,7 @@ def resume_scrape() -> Response:
                     resume_mode=resume_mode,
                     resume_page=resume_page,
                     resume_index=resume_index,
+                    target_source=config.DEFAULT_SOURCE,
                     trigger="ui",
                 )
                 app.config["LAST_SUMMARY"] = summary
@@ -444,12 +446,13 @@ def webhook_changedetection() -> Response:
         return jsonify({"ok": False, "error": "invalid_token"}), 403
 
     payload = _parse_webhook_payload()
-    target_source = str(payload.get("target_source") or "").strip()
+    raw_target_source = str(payload.get("target_source") or "").strip()
+    target_source = sources.normalize_source(raw_target_source)
     mode = str(payload.get("mode") or "").strip().lower()
     new_limit_raw = payload.get("new_limit")
 
     errors = []
-    if target_source != "unreported_judgments":
+    if target_source != sources.UNREPORTED_JUDGMENTS:
         errors.append("target_source must be 'unreported_judgments'")
     if mode != "new":
         errors.append("mode must be 'new'")
@@ -524,6 +527,7 @@ def webhook_changedetection() -> Response:
             limit_pages=[0],
             row_limit=new_limit,
             start_message="[WEBHOOK] Triggered new-only scrape",
+            target_source=target_source,
             trigger="webhook",
         )
     except Exception as exc:  # noqa: BLE001
@@ -551,7 +555,7 @@ def webhook_changedetection() -> Response:
             "ok": True,
             "entrypoint": "webhook",
             "mode": "new",
-            "target_source": "unreported_judgments",
+            "target_source": target_source,
             "run_id": summary.get("run_id"),
             "csv_version_id": summary.get("csv_version_id"),
             "summary": summary_counts,

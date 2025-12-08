@@ -89,6 +89,7 @@ class CaseRow:
     court: str = ""
     category: str = ""
     judgment_date: str = ""
+    sort_judgment_date: str = ""
     cause_number: str = ""
     extra: Dict[str, str] = field(default_factory=dict)
 
@@ -96,6 +97,14 @@ class CaseRow:
 CASES_BY_ACTION: Dict[str, CaseRow] = {}
 AJAX_FNAME_INDEX: Dict[str, CaseRow] = {}
 CASES_ALL: List[CaseRow] = []
+CASES_BY_SOURCE: Dict[str, List[CaseRow]] = {}
+
+
+def _reset_indexes() -> None:
+    CASES_BY_ACTION.clear()
+    AJAX_FNAME_INDEX.clear()
+    CASES_ALL.clear()
+    CASES_BY_SOURCE.clear()
 
 
 def _resolve_csv_stream(csv_path: str) -> Tuple[Optional[Iterable[str]], Optional[str]]:
@@ -135,7 +144,12 @@ def _resolve_csv_stream(csv_path: str) -> Tuple[Optional[Iterable[str]], Optiona
     return None, None
 
 
-def load_cases_from_csv(csv_path: str) -> None:
+def load_cases_from_csv(
+    csv_path: str,
+    *,
+    source: str = sources.DEFAULT_SOURCE,
+    csv_version_id: Optional[int] = None,
+) -> None:
     """Populate the global case index from the provided CSV path.
 
     The legacy CSV parsing path remains the default. If
@@ -144,23 +158,28 @@ def load_cases_from_csv(csv_path: str) -> None:
     """
 
     if should_use_db_index():
-        load_cases_index_from_db()
+        load_cases_index_from_db(source=source, csv_version_id=csv_version_id)
         return
 
+    source_norm = sources.normalize_source(source)
     stream, description = _resolve_csv_stream(csv_path)
-    if not stream and csv_path != config.CSV_URL:
-        log_line("[CSV] Primary CSV path %r unavailable; attempting %s" % (csv_path, config.CSV_URL))
-        stream, description = _resolve_csv_stream(config.CSV_URL)
-    CASES_BY_ACTION.clear()
-    AJAX_FNAME_INDEX.clear()
-    CASES_ALL.clear()
-
     if not stream:
-        log_line(
-            f"[CSV] Unable to load cases; no CSV found at {csv_path!r}. "
-            "Callers should ensure the judgments CSV is available."
-        )
-        return
+        if source_norm == sources.UNREPORTED_JUDGMENTS and csv_path != config.CSV_URL:
+            log_line(
+                "[CSV] Primary CSV path %r unavailable for source=%r; attempting %s"
+                % (csv_path, source_norm, config.CSV_URL)
+            )
+            stream, description = _resolve_csv_stream(config.CSV_URL)
+
+        if not stream:
+            log_line(
+                f"[CSV] Unable to load cases; no CSV found at {csv_path!r} for source={source_norm!r}. "
+                "Callers should ensure the source-specific CSV is available."
+            )
+            return
+
+    _reset_indexes()
+    CASES_BY_SOURCE[source_norm] = []
 
     log_line(f"[CSV] Loading cases from {description}")
 
@@ -229,8 +248,10 @@ def load_cases_from_csv(csv_path: str) -> None:
                 continue
 
             CASES_BY_ACTION[normalized] = case
-            AJAX_FNAME_INDEX[normalized] = case
+            if source_norm == sources.UNREPORTED_JUDGMENTS:
+                AJAX_FNAME_INDEX[normalized] = case
             CASES_ALL.append(case)
+            CASES_BY_SOURCE[source_norm].append(case)
             loaded += 1
 
     log_line(
@@ -240,22 +261,26 @@ def load_cases_from_csv(csv_path: str) -> None:
 
 
 def load_cases_index_from_db(
-    *, source: str = sources.DEFAULT_SOURCE, only_active: bool = True
+    *,
+    source: str = sources.DEFAULT_SOURCE,
+    only_active: bool = True,
+    csv_version_id: Optional[int] = None,
 ) -> Dict[str, "CaseRow"]:
     """Populate the global case index using the SQLite ``cases`` table.
 
     Returns the populated ``CASES_BY_ACTION`` mapping for convenience.
     """
 
-    CASES_BY_ACTION.clear()
-    AJAX_FNAME_INDEX.clear()
-    CASES_ALL.clear()
+    _reset_indexes()
+
+    source_norm = sources.normalize_source(source)
 
     records = db_case_index.load_case_index_from_db(
-        source=source, only_active=only_active
+        source=source_norm, only_active=only_active, csv_version_id=csv_version_id
     )
 
     loaded = 0
+    CASES_BY_SOURCE[source_norm] = []
     for token, record in records.items():
         normalized = normalize_action_token(token)
         if not normalized:
@@ -278,6 +303,7 @@ def load_cases_index_from_db(
             court=(record.get("court") or "").strip(),
             category=(record.get("category") or "").strip(),
             judgment_date=(record.get("judgment_date") or "").strip(),
+            sort_judgment_date=(record.get("sort_judgment_date") or "").strip(),
             cause_number=(record.get("cause_number") or "").strip(),
             extra={
                 "_source": record.get("source", ""),
@@ -293,12 +319,15 @@ def load_cases_index_from_db(
             continue
 
         CASES_BY_ACTION[normalized] = case
-        AJAX_FNAME_INDEX[normalized] = case
+        if source_norm == sources.UNREPORTED_JUDGMENTS:
+            AJAX_FNAME_INDEX[normalized] = case
         CASES_ALL.append(case)
+        CASES_BY_SOURCE[source_norm].append(case)
         loaded += 1
 
     log_line(
-        f"[DB] Loaded {loaded} case token(s) from DB for source={source}; only_active={only_active}"
+        f"[DB] Loaded {loaded} case token(s) from DB for source={source_norm}; "
+        f"only_active={only_active} csv_version_id={csv_version_id}"
     )
     return CASES_BY_ACTION
 

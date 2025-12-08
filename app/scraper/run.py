@@ -26,7 +26,7 @@ import json
 import re
 import time
 import urllib.parse
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -119,6 +119,20 @@ UA = (
 
 
 RESTART_BACKOFF_SECONDS = [5, 15, 45]
+
+
+@dataclass(frozen=True)
+class SourceSelectors:
+    """Source-specific selectors for Playwright interactions."""
+
+    table_selector: str
+
+
+def _selectors_for_source(source: str) -> SourceSelectors:
+    normalized = sources.normalize_source(source)
+    if normalized == sources.PUBLIC_REGISTERS:
+        return SourceSelectors(table_selector="#public-registers")
+    return SourceSelectors(table_selector="#judgment-registers")
 
 
 def _now_iso() -> str:
@@ -465,7 +479,7 @@ def _load_all_results(page: Page, max_scrolls: int = 40) -> None:
         log_line(f"Scroll {i+1}: document height now {last_height}")
 
 
-def _set_datatable_page(page: Page, page_index: int) -> bool:
+def _set_datatable_page(page: Page, page_index: int, *, selectors: SourceSelectors) -> bool:
     """Attempt to switch the DataTable to *page_index* (0-based)."""
 
     if page_index <= 0:
@@ -473,23 +487,23 @@ def _set_datatable_page(page: Page, page_index: int) -> bool:
 
     try:
         switched = page.evaluate(
-            """
-            (idx) => {
+            f"""
+            (idx) => {{
                 const $ = window.jQuery;
-                if (!$ || !$.fn || !$.fn.dataTable) {
+                if (!$ || !$.fn || !$.fn.dataTable) {{
                     return false;
-                }
-                const table = $('#judgment-registers').DataTable();
-                if (!table) {
+                }}
+                const table = $('{selectors.table_selector}').DataTable();
+                if (!table) {{
                     return false;
-                }
+                }}
                 const info = table.page.info();
-                if (!info || idx < 0 || idx >= info.pages) {
+                if (!info || idx < 0 || idx >= info.pages) {{
                     return false;
-                }
+                }}
                 table.page(idx).draw('page');
                 return true;
-            }
+            }}
             """,
             page_index,
         )
@@ -499,24 +513,24 @@ def _set_datatable_page(page: Page, page_index: int) -> bool:
         return False
 
 
-def _refresh_datatable_page(page: Page, page_index: int) -> None:
+def _refresh_datatable_page(page: Page, page_index: int, *, selectors: SourceSelectors) -> None:
     """Force the current DataTable page to redraw."""
 
     try:
         page.evaluate(
-            """
-            (idx) => {
+            f"""
+            (idx) => {{
                 const $ = window.jQuery;
-                if (!$ || !$.fn || !$.fn.dataTable) {
+                if (!$ || !$.fn || !$.fn.dataTable) {{
                     return false;
-                }
-                const table = $('#judgment-registers').DataTable();
-                if (!table) {
+                }}
+                const table = $('{selectors.table_selector}').DataTable();
+                if (!table) {{
                     return false;
-                }
+                }}
                 table.page(idx).draw(false);
                 return true;
-            }
+            }}
             """,
             page_index,
         )
@@ -585,10 +599,12 @@ def _safe_goto(page: Page, url: str, *, label: str, wait_until: str = "networkid
         return False
 
 
-def _wait_for_datatable_ready(page: Page, *, page_index: int, phase: str) -> bool:
+def _wait_for_datatable_ready(
+    page: Page, *, page_index: int, phase: str, selectors: SourceSelectors
+) -> bool:
     """Wait for the main DataTable to be present with a bounded timeout."""
 
-    selector = "table.dataTable"
+    selector = selectors.table_selector or "table.dataTable"
     try:
         _scraper_event(
             "table",
@@ -691,7 +707,9 @@ def _get_total_pages(page: Page) -> int:
     return max_index + 1 if max_index >= 0 else 1
 
 
-def _goto_datatable_page(page: Page, page_index: int) -> bool:
+def _goto_datatable_page(
+    page: Page, page_index: int, *, selectors: SourceSelectors
+) -> bool:
     """Click the DataTable pagination button for ``page_index``."""
 
     if page_index <= 0:
@@ -699,12 +717,12 @@ def _goto_datatable_page(page: Page, page_index: int) -> bool:
 
     try:
         page.evaluate(
-            """
-            (idx) => {
+            f"""
+            (idx) => {{
               const dt = window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable ?
-                         window.jQuery('#judgment-registers').DataTable() : null;
-              if (dt) { dt.page(idx).draw('page'); }
-            }
+                         window.jQuery('{selectors.table_selector}').DataTable() : null;
+              if (dt) {{ dt.page(idx).draw('page'); }}
+            }}
             """,
             page_index,
         )
@@ -1339,7 +1357,7 @@ def retry_failed_downloads(
         button_index = int(item.get("button_index", 0))
 
         try:
-            if not _set_datatable_page(page, page_index):
+            if not _set_datatable_page(page, page_index, selectors=selectors):
                 log_line(
                     f"[RETRY] Unable to navigate to DataTable page {page_index + 1} for {fname}; skipping."
                 )
@@ -1352,7 +1370,7 @@ def retry_failed_downloads(
             continue
 
         if not _wait_for_datatable_ready(
-            page, page_index=page_index, phase="retry_navigation"
+            page, page_index=page_index, phase="retry_navigation", selectors=selectors
         ):
             log_line(
                 f"[RETRY] DataTable not ready after navigation to page {page_index + 1} for {fname}; skipping."
@@ -1487,8 +1505,11 @@ def _run_scrape_attempt(
     csv_source: Optional[str] = None,
     sync_result: Optional[csv_sync.CsvSyncResult] = None,
     target_source: str = sources.DEFAULT_SOURCE,
+    selectors: Optional[SourceSelectors] = None,
 ) -> Dict[str, Any]:
     """Execute a scraping run with automatic restart/resume support."""
+
+    selectors = selectors or _selectors_for_source(target_source)
 
     if start_message:
         log_line(start_message)
@@ -1525,7 +1546,11 @@ def _run_scrape_attempt(
         f"[CASES_INDEX] using {'db' if cases_index.should_use_db_index() else 'csv'} backend"
     )
     effective_csv_source = csv_source or config.CSV_URL
-    load_cases_index(effective_csv_source)
+    load_cases_index(
+        effective_csv_source,
+        source=target_source,
+        csv_version_id=(sync_result.version_id if sync_result else None),
+    )
     _scraper_event(
         "plan",
         index_backend="db" if cases_index.should_use_db_index() else "csv",
@@ -2056,7 +2081,7 @@ def _run_scrape_attempt(
     
                         log_line("Opening judgments page in Playwright...")
                         if not _safe_goto(
-                            page, base_url, label="unreported_judgments_root"
+                            page, base_url, label=f"{target_source}_root"
                         ):
                             crash_stop = True
                             active = False
@@ -2066,7 +2091,10 @@ def _run_scrape_attempt(
     
                             _accept_cookies(page)
                             if not _wait_for_datatable_ready(
-                                page, page_index=resume_page_index, phase="initial_nav"
+                                page,
+                                page_index=resume_page_index,
+                                phase="initial_nav",
+                                selectors=selectors,
                             ):
                                 crash_stop = True
                                 active = False
@@ -2128,7 +2156,9 @@ def _run_scrape_attempt(
                                         break
     
                                     page_number = page_index_zero + 1
-                                    if not _goto_datatable_page(page, page_index_zero):
+                                    if not _goto_datatable_page(
+                                        page, page_index_zero, selectors=selectors
+                                    ):
                                         log_line(
                                             f"[RUN] Unable to navigate to DataTable page {page_number}; stopping pagination loop."
                                         )
@@ -2138,6 +2168,7 @@ def _run_scrape_attempt(
                                         page,
                                         page_index=page_index_zero,
                                         phase="pagination_nav",
+                                        selectors=selectors,
                                     ):
                                         log_line(
                                             f"[RUN] DataTable not ready after navigating to page {page_number}; stopping pagination loop."
@@ -2552,7 +2583,9 @@ def _run_scrape_attempt(
                                         if crash_stop:
                                             break
                                         if not click_success and attempt_idx < 2:
-                                            _refresh_datatable_page(page, page_index_zero)
+                                            _refresh_datatable_page(
+                                                page, page_index_zero, selectors=selectors
+                                            )
                                             wait_seconds(page, config.PLAYWRIGHT_RETRY_PAGE_SETTLE_SECONDS)
     
                                     if crash_stop:
@@ -2737,6 +2770,7 @@ def run_scrape(
     )
 
     runtime = config.get_source_runtime(effective_source)
+    selectors = _selectors_for_source(effective_source)
 
     row_limit = new_limit if new_limit is not None else config.SCRAPE_NEW_LIMIT
     retry_limit = max_retries if max_retries is not None else config.SCRAPER_MAX_RETRIES
@@ -2863,6 +2897,7 @@ def run_scrape(
             csv_source=csv_source,
             sync_result=sync_result,
             target_source=effective_source,
+            selectors=selectors,
         )
         next_start_message = None
         return result

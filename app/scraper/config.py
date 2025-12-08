@@ -1,7 +1,6 @@
 """Configuration constants for the judicial scraper application."""
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,19 +73,14 @@ def get_source_runtime(source: str | None) -> SourceRuntime:
     normalized = sources.normalize_source(source)
 
     if normalized == sources.PUBLIC_REGISTERS:
-        # Phase 2: URLs are still placeholders; override via env once the live
-        # public-registers endpoints are known.
-        pr_base_url = os.getenv("BAILIIKC_PR_BASE_URL")
-        pr_csv_url = os.getenv("BAILIIKC_PR_CSV_URL")
-
-        if pr_base_url is None or pr_csv_url is None:
-            logging.getLogger("bailiikc").warning(
-                "[SCRAPER][WARN] public_registers runtime falling back to default URLs; "
-                "set BAILIIKC_PR_BASE_URL and BAILIIKC_PR_CSV_URL for live runs."
-            )
-
-        base_url = pr_base_url or DEFAULT_BASE_URL
-        csv_url = pr_csv_url or CSV_URL
+        base_url = os.getenv(
+            "BAILIIKC_PR_BASE_URL",
+            "https://judicial.ky/public-registers/",
+        )
+        csv_url = os.getenv(
+            "BAILIIKC_PR_CSV_URL",
+            "https://judicial.ky/wp-content/uploads/box_files/public-registers.csv",
+        )
         return SourceRuntime(base_url=base_url, csv_url=csv_url)
 
     # Default / fallback: unreported_judgments

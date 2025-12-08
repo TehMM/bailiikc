@@ -219,6 +219,28 @@ Entrypoints (CLI, webhook, UI) normalise requested sources via
 ``unreported_judgments`` to avoid polluting the database while only a single
 live source is supported.
 
+### Source-aware runtime configuration (Phase 2)
+
+`app.scraper.config.get_source_runtime(source)` returns a per-source runtime
+configuration (`base_url`, `csv_url`) derived from environment-backed defaults.
+The scraper uses this helper in `run_scrape` to decide which CSV to sync and
+which base URL to navigate to for a given logical source.
+
+For Phase 2, `unreported_judgments` remains the only live source used by the UI
+and webhook entrypoints. A second source (`public_registers`) is wired through
+the CLI and test suite but is considered experimental until the corresponding
+feed and page semantics are finalised.
+
+Environment overrides for runtime configuration:
+
+- `BAILIIKC_UJ_BASE_URL`, `BAILIIKC_UJ_CSV_URL` – optional overrides for the
+  live unreported judgments feed.
+- `BAILIIKC_PR_BASE_URL`, `BAILIIKC_PR_CSV_URL` – optional overrides for the
+  experimental public registers feed; otherwise fall back to the default
+  unreported judgments URLs with a scraper warning.
+- `BAILIIKC_DEFAULT_SOURCE` – sets the default logical source (normalised via
+  `sources.normalize_source`).
+
 
 Table: runs
 
@@ -722,6 +744,19 @@ GET /api/db/runs/latest, /api/db/downloaded-cases – SQLite-backed reporting en
 This section tracks the planned incremental steps from the current state
 towards a fully DB-first, worklist-driven scraper with RAG-friendly outputs.
 It MUST be kept up to date when plans change.
+
+- **Phase 0 – Single-source baseline (implemented)**: unreported_judgments only
+  with global defaults.
+- **Phase 1 – Source plumbing (implemented)**: persist `target_source` in
+  `runs.params_json`, normalise inputs via `sources.normalize_source`, and scope
+  DB worklists/reporting by source.
+- **Phase 2 – Source-aware runtime configuration (in progress)**: runtime URL
+  resolution via `config.get_source_runtime`, CLI support for
+  `public_registers`, UI/webhook remain locked to `unreported_judgments`.
+- **Phase 3 – Live public_registers integration**: wire CSV sync, case index,
+  and scraper flow to the live public_registers feed once stable.
+- **Phase 4 – Multi-source parity**: feature parity (resume, reporting, RAG
+  exports) across sources with clear guardrails and migrations as needed.
 
 - **PR13 – Run list API and csv_sync tidy-ups**
   - Add `_parse_judgment_date` logging for unparsed date formats.

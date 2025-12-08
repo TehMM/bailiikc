@@ -88,5 +88,59 @@ def test_cli_entrypoint_passes_target_source(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(run, "validate_runtime_config", lambda entrypoint, mode=None: None)  # noqa: ARG005
 
     run._cli_entrypoint(["--source", sources.UNREPORTED_JUDGMENTS])
-
     assert calls["target_source"] == sources.UNREPORTED_JUDGMENTS
+
+    calls.clear()
+
+    run._cli_entrypoint(["--source", sources.PUBLIC_REGISTERS])
+
+    assert calls["target_source"] == sources.PUBLIC_REGISTERS
+
+
+def test_run_scrape_uses_source_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, temp_config: None) -> None:
+    db.initialize_schema()
+
+    pr_base = "https://example.com/public-registers/"
+    pr_csv = "https://example.com/public-registers.csv"
+
+    monkeypatch.setenv("BAILIIKC_PR_BASE_URL", pr_base)
+    monkeypatch.setenv("BAILIIKC_PR_CSV_URL", pr_csv)
+
+    csv_path = tmp_path / "pr_judgments.csv"
+    csv_path.write_text("header1\n", encoding="utf-8")
+    version_id = db.record_csv_version(
+        fetched_at="2024-03-01T00:00:00Z",
+        source_url="http://example.com/csv",
+        sha256="abc123",
+        row_count=1,
+        file_path=str(csv_path),
+    )
+
+    sync_calls: dict[str, Any] = {}
+    attempt_calls: dict[str, Any] = {}
+
+    def fake_sync_csv(source_url: str, session: Any, *, source: str) -> CsvSyncResult:  # noqa: ARG001
+        sync_calls["source_url"] = source_url
+        sync_calls["source"] = source
+        return _StubSyncResult(version_id=version_id, source=source)
+
+    monkeypatch.setattr(csv_sync, "sync_csv", fake_sync_csv)
+    monkeypatch.setattr(csv_sync, "build_http_session", lambda: SimpleNamespace())
+
+    def fake_run_with_retries(func, max_retries: int):  # noqa: ANN001, D417
+        return func()
+
+    def fake_run_attempt(**kwargs: Any) -> dict[str, Any]:  # noqa: ANN401
+        attempt_calls.update(kwargs)
+        return {"log_file": "dummy"}
+
+    monkeypatch.setattr(run, "run_with_retries", fake_run_with_retries)
+    monkeypatch.setattr(run, "_run_scrape_attempt", fake_run_attempt)
+
+    summary = run.run_scrape(target_source=sources.PUBLIC_REGISTERS)
+    assert summary
+
+    assert sync_calls["source_url"] == pr_csv
+    assert sync_calls["source"] == sources.PUBLIC_REGISTERS
+    assert attempt_calls.get("base_url") == pr_base.strip()
+    assert attempt_calls.get("csv_source") == pr_csv

@@ -22,6 +22,26 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 - **app/scraper/healthcheck.py**: Lightweight health diagnostics for config/filesystem/DB connectivity. Exposes `run_health_checks` for CLI and backs `/api/health`.
 - **app/scraper/worklist.py**: DB-backed helpers for assembling per-run worklists (lists of cases to process) from the SQLite ``cases`` table for a given ``csv_version_id``. Supports ``build_full_worklist``, ``build_new_worklist``, and ``build_resume_worklist`` (derived from prior runs/downloads) plus a dispatcher ``build_worklist(...)``. The scraper uses these helpers for ``mode="new"`` and ``mode="full"`` when the corresponding flags are enabled; resume wiring is now active for `scrape_mode="resume"` when the DB resume worklist flag is on.
 
+### Source-aware runtime configuration (Phase 2)
+
+`app.scraper.config.get_source_runtime(source)` returns a per-source runtime
+configuration (`base_url`, `csv_url`) derived from environment-backed defaults.
+`run_scrape` uses this helper to determine which CSV to sync and which base URL
+to drive the scraper toward a specific logical source. For Phase 2,
+`unreported_judgments` remains the only live source used by the UI and webhook
+entrypoints; `public_registers` is wired through the CLI and tests as an
+experimental path pending stable feeds.
+
+Environment overrides for runtime configuration:
+
+- `BAILIIKC_UJ_BASE_URL`, `BAILIIKC_UJ_CSV_URL` – optional overrides for the
+  live unreported judgments feed.
+- `BAILIIKC_PR_BASE_URL`, `BAILIIKC_PR_CSV_URL` – optional overrides for the
+  experimental public registers feed; otherwise fall back to the default
+  unreported judgments URLs with a scraper warning.
+- `BAILIIKC_DEFAULT_SOURCE` – sets the default logical source (normalised via
+  `sources.normalize_source`).
+
 ## Current Scrape Workflow
 1. **UI submission**: `app/main.py` renders forms and reads user input (base URL, waits, limits, resume options). On submit, it saves defaults, optionally resets state, calls `validate_runtime_config("ui", mode=...)`, and starts a background thread that calls `run_scrape` with the collected parameters.
 2. **CSV load and case index**: `run.py` syncs `judgments.csv` via `csv_sync.sync_csv`, recording a `csv_versions` row plus a concrete CSV file path and row count. That path is then passed into `load_cases_index` so the in-memory indices (`CASES_BY_ACTION`, etc.) are built from the exact payload tied to the run. With `BAILIIKC_USE_DB_CASES=1` (default), the CSV path is still recorded for observability while the index is built from SQLite instead; setting the flag to `0` forces the legacy CSV-driven index.

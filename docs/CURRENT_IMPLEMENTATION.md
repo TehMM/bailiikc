@@ -3,6 +3,22 @@
 ## Overview
 The existing scraper targets the Cayman Islands Judicial website’s unreported judgments page. It pulls the published judgments CSV on each run, interprets the `Actions` column tokens, and drives a Playwright-based flow (with legacy Selenium helpers unused in the current path) that issues the official `dl_bfile` AJAX requests to Box.com. Downloads, metadata, and resume information remain stored on disk using JSON/CSV files; SQLite now tracks CSV versions, runs, cases, and per-case download attempts and is the default backend for reporting and worklists. Environment flags can force legacy JSON/CSV paths when needed. Scraper control flow still uses JSON/state for checkpoints and resume, but DB-backed resume worklists now exist for targeting retries from prior runs. DB-backed reporting helpers power the `/api/db/...` endpoints and, when DB reporting is enabled (default), also feed `/report` and `/api/downloaded-cases` with only downloaded cases while keeping the JSON row shape intact. Legacy JSON files remain available as an explicit fallback when the flag is set to `0`.
 
+A second CLI-only source, `public_registers`, syncs its CSV via `config.get_source_runtime(sources.PUBLIC_REGISTERS)` (with `BAILIIKC_PR_BASE_URL`/`BAILIIKC_PR_CSV_URL` overrides), stores rows in SQLite with `source='public_registers'`, and rides the same Playwright interception path as `unreported_judgments` to capture `dl_bfile` responses and download PDFs. The flow is reachable with `python -m app.scraper.run --source public_registers --scrape-mode new`.
+
+For `public_registers`, CSV resolution is strictly source-specific: if the
+public registers CSV cannot be opened or downloaded, the case index load logs
+an error and returns without falling back to the unreported judgments CSV.
+This prevents accidental cross-pollution of `cases` rows between feeds while
+keeping the historical fallback behaviour only for `unreported_judgments`.
+
+In the current implementation, `AJAX_FNAME_INDEX` remains constrained to the
+unreported judgments source. Public registers runs share the interception and
+download pipeline but do not yet populate fname-based mappings; downloads are
+recorded without a stable join back to individual `cases` rows for this
+source. Coverage and health metrics for `public_registers` are therefore
+coarser than for `unreported_judgments` until a future phase wires in
+source-aware fname or Box URL mapping for this feed.
+
 ## Key Modules
 - **app/main.py**: Flask web UI with forms for scrape/resume/reset actions, webhook endpoint, and routes for reports, exports, and file serving. Launches background scrape threads that call `run_scrape`. `/report` and `/api/downloaded-cases` read JSON logs by default but switch to SQLite (still only downloaded rows) when `BAILIIKC_USE_DB_REPORTING=1`. `/api/runs/latest` is DB-backed via `db_reporting` for run metadata and download aggregates. The app also exposes `/api/db/runs/latest`, `/api/db/downloaded-cases`, and `/api/db/runs/<run_id>/downloaded-cases` endpoints backed by SQLite.
 - **main.py (repo root)**: Thin entrypoint that imports `app.main` (which initialises directories and schema) and starts the Flask app; suitable for local development or generic hosting environments.
@@ -27,18 +43,18 @@ The existing scraper targets the Cayman Islands Judicial website’s unreported 
 `app.scraper.config.get_source_runtime(source)` returns a per-source runtime
 configuration (`base_url`, `csv_url`) derived from environment-backed defaults.
 `run_scrape` uses this helper to determine which CSV to sync and which base URL
-to drive the scraper toward a specific logical source. For Phase 2,
-`unreported_judgments` remains the only live source used by the UI and webhook
-entrypoints; `public_registers` is wired through the CLI and tests as an
-experimental path pending stable feeds.
+to drive the scraper toward a specific logical source. `unreported_judgments`
+remains the only live source used by the UI and webhook entrypoints;
+`public_registers` is reachable via CLI and uses the same helper to resolve its
+CSV feed before running the Playwright scraper path.
 
 Environment overrides for runtime configuration:
 
 - `BAILIIKC_UJ_BASE_URL`, `BAILIIKC_UJ_CSV_URL` – optional overrides for the
   live unreported judgments feed.
 - `BAILIIKC_PR_BASE_URL`, `BAILIIKC_PR_CSV_URL` – optional overrides for the
-  experimental public registers feed; otherwise fall back to the default
-  unreported judgments URLs with a scraper warning.
+  public registers feed; otherwise fall back to the default
+  public register URLs bundled in the runtime helper.
 - `BAILIIKC_DEFAULT_SOURCE` – sets the default logical source (normalised via
   `sources.normalize_source`).
 

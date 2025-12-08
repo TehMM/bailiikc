@@ -179,18 +179,20 @@ CREATE TABLE IF NOT EXISTS csv_versions (
 
 Table: cases
 
-CREATE TABLE IF NOT EXISTS cases (
-    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-    action_token_raw      TEXT NOT NULL,
-    action_token_norm     TEXT NOT NULL,
-    title                 TEXT,
-    cause_number          TEXT,
-    court                 TEXT,
-    category              TEXT,
-    judgment_date         TEXT,           -- "YYYY-MM-DD"
-    is_criminal           INTEGER NOT NULL DEFAULT 0,
-    is_active             INTEGER NOT NULL DEFAULT 1,
-    source                TEXT NOT NULL,  -- 'unreported_judgments', 'public_registers', ...
+    CREATE TABLE IF NOT EXISTS cases (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        action_token_raw      TEXT NOT NULL,
+        action_token_norm     TEXT NOT NULL,
+        title                 TEXT,
+        subject               TEXT,
+        cause_number          TEXT,
+        court                 TEXT,
+        category              TEXT,
+        judgment_date         TEXT,           -- "YYYY-MM-DD"
+        sort_judgment_date    TEXT,
+        is_criminal           INTEGER NOT NULL DEFAULT 0,
+        is_active             INTEGER NOT NULL DEFAULT 1,
+        source                TEXT NOT NULL,  -- 'unreported_judgments', 'public_registers', ...
     first_seen_version_id INTEGER NOT NULL,
     last_seen_version_id  INTEGER NOT NULL,
     FOREIGN KEY(first_seen_version_id) REFERENCES csv_versions(id),
@@ -205,19 +207,60 @@ CREATE INDEX IF NOT EXISTS idx_cases_source
 
 The scraper can target multiple logical sources of case data. These are
 represented by stable string identifiers stored in ``cases.source`` and in
-``runs.params_json.target_source``. At present, the only active source is:
+``runs.params_json.target_source``. Active sources:
 
-* ``unreported_judgments`` – the Cayman "Unreported Judgments" list.
+* ``unreported_judgments`` – the Cayman "Unreported Judgments" list (UI,
+  webhook, CLI).
+* ``public_registers`` – the Cayman public registers feed (CLI-only). CSVs are
+  fetched via ``config.get_source_runtime(sources.PUBLIC_REGISTERS)`` with
+  `BAILIIKC_PR_BASE_URL`/`BAILIIKC_PR_CSV_URL` overrides. Rows are stored in
+  ``cases`` with ``source='public_registers'``.
 
-A future source (``public_registers``) is reserved but not yet wired into the
-live scraper. For each run, ``runs.params_json.target_source`` determines which
-subset of ``cases`` is considered when computing coverage and building
-DB-backed worklists.
+Public registers CSV mapping (live feed fetches are blocked by the current
+proxy, so the mapping is derived from the observed header schema and validated
+against fixtures):
+
+| CSV column (examples) | Case field(s) |
+| --- | --- |
+| Register Type / Register | ``category``; contributes to ``action_token_raw`` and subject prefix; ``court`` set to "Public Register" |
+| Name | ``title``; contributes to ``action_token_norm`` |
+| Reference / Licence / Number | ``cause_number``; contributes to ``action_token_norm`` and ``subject`` |
+| Date / Effective Date | ``judgment_date`` and ``sort_judgment_date`` |
+
+For each run, ``runs.params_json.target_source`` determines which subset of
+``cases`` is considered when computing coverage and building DB-backed
+worklists. The public_registers flow is reachable via:
+
+CSV fallback semantics are source-aware:
+
+* For ``unreported_judgments`` we preserve the historical behaviour of
+  falling back to the default judgments CSV (``config.CSV_URL``) when the
+  requested CSV path is unavailable. This keeps existing UI/webhook flows
+  resilient to minor configuration issues.
+* For ``public_registers`` there is **no** cross-source fallback: if the
+  public registers CSV cannot be resolved, the index load logs an error and
+  returns early. This avoids ever populating ``cases`` for
+  ``source='public_registers'`` from the wrong feed.
+
+```bash
+python -m app.scraper.run --source public_registers --scrape-mode new
+```
 
 Entrypoints (CLI, webhook, UI) normalise requested sources via
 ``sources.normalize_source``; unknown or empty values fall back to the default
 ``unreported_judgments`` to avoid polluting the database while only a single
 live source is supported.
+
+Limitations for ``public_registers`` in Phase 3:
+
+* The Playwright interception path is shared with ``unreported_judgments`` and
+  downloads are attempted for matching ``dl_bfile`` events, but
+  ``AJAX_FNAME_INDEX`` remains scoped to ``unreported_judgments`` only.
+* As a result, ``public_registers`` downloads are not yet joined back to
+  per-case rows via ``action_token_norm``; coverage metrics for this source
+  are therefore coarse and do not reflect per-case download success. A future
+  phase will introduce source-aware fname mapping or an equivalent join
+  strategy to restore per-case coverage for public registers.
 
 ### Source-aware runtime configuration (Phase 2)
 
@@ -226,18 +269,18 @@ configuration (`base_url`, `csv_url`) derived from environment-backed defaults.
 The scraper uses this helper in `run_scrape` to decide which CSV to sync and
 which base URL to navigate to for a given logical source.
 
-For Phase 2, `unreported_judgments` remains the only live source used by the UI
-and webhook entrypoints. A second source (`public_registers`) is wired through
-the CLI and test suite but is considered experimental until the corresponding
-feed and page semantics are finalised.
+`unreported_judgments` remains the only live source used by the UI and webhook
+entrypoints. `public_registers` is reachable via the CLI and uses
+`config.get_source_runtime` (with `BAILIIKC_PR_BASE_URL`/`BAILIIKC_PR_CSV_URL`
+overrides) to sync its CSV feed before running the simplified scraper flow.
 
 Environment overrides for runtime configuration:
 
 - `BAILIIKC_UJ_BASE_URL`, `BAILIIKC_UJ_CSV_URL` – optional overrides for the
   live unreported judgments feed.
 - `BAILIIKC_PR_BASE_URL`, `BAILIIKC_PR_CSV_URL` – optional overrides for the
-  experimental public registers feed; otherwise fall back to the default
-  unreported judgments URLs with a scraper warning.
+  experimental public registers feed; otherwise fall back to the public
+  registers defaults with a scraper warning.
 - `BAILIIKC_DEFAULT_SOURCE` – sets the default logical source (normalised via
   `sources.normalize_source`).
 
@@ -750,12 +793,14 @@ It MUST be kept up to date when plans change.
 - **Phase 1 – Source plumbing (implemented)**: persist `target_source` in
   `runs.params_json`, normalise inputs via `sources.normalize_source`, and scope
   DB worklists/reporting by source.
-- **Phase 2 – Source-aware runtime configuration (in progress)**: runtime URL
+- **Phase 2 – Source-aware runtime configuration (implemented)**: runtime URL
   resolution via `config.get_source_runtime`, CLI support for
   `public_registers`, UI/webhook remain locked to `unreported_judgments`.
-- **Phase 3 – Live public_registers integration**: wire CSV sync, case index,
-  and scraper flow to the live public_registers feed once stable.
-- **Phase 4 – Multi-source parity**: feature parity (resume, reporting, RAG
+- **Phase 3 – Live `public_registers` integration (this PR)**: hook the real
+  `public_registers` CSV(s) into `csv_sync`, populate `cases` and worklists
+  for `source='public_registers'`, and implement a scraper flow (CLI-only)
+  that produces runs, coverage, and basic download attempts for that source.
+- **Phase 4 – Multi-source parity (future)**: feature parity (resume, reporting, RAG
   exports) across sources with clear guardrails and migrations as needed.
 
 - **PR13 – Run list API and csv_sync tidy-ups**

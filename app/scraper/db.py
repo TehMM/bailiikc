@@ -142,7 +142,29 @@ def initialize_schema() -> None:
     with conn:
         for statement in statements:
             conn.execute(statement)
+        _ensure_case_columns(conn)
         _ensure_run_columns(conn)
+
+
+def _ensure_case_columns(conn: sqlite3.Connection) -> None:
+    """Add optional case columns that may be missing in existing databases."""
+
+    cursor = conn.execute("PRAGMA table_info(cases)")
+    existing = {row[1] for row in cursor.fetchall()}
+
+    columns: dict[str, str] = {
+        "subject": "TEXT",
+        "sort_judgment_date": "TEXT",
+    }
+
+    for name, ddl_type in columns.items():
+        if name in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE cases ADD COLUMN {name} {ddl_type}")
+        except sqlite3.OperationalError as exc:  # pragma: no cover - defensive
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def _ensure_run_columns(conn: sqlite3.Connection) -> None:

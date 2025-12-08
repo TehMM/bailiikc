@@ -46,6 +46,23 @@ class CsvSyncResult:
     source: str = sources.DEFAULT_SOURCE
 
 
+@dataclass(frozen=True)
+class CasePayload:
+    """Normalised case metadata extracted from a CSV row."""
+
+    action_token_raw: str
+    action_token_norm: str
+    title: str
+    subject: str
+    court: str
+    category: str
+    judgment_date: str
+    sort_judgment_date: str
+    cause_number: str
+    is_criminal: int
+    source: str
+
+
 def normalize_action_token(token: str) -> str:
     """Normalise a raw 'Actions' token from the judgments CSV.
 
@@ -102,48 +119,63 @@ def build_http_session() -> requests.Session:
     return session
 
 
-def _save_csv_copy(content: bytes, sha256: str) -> Path:
+def _save_csv_copy(content: bytes, sha256: str, *, source: str) -> Path:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     short_sha = sha256[:8]
     csv_dir = config.DATA_DIR / "csv"
     csv_dir.mkdir(parents=True, exist_ok=True)
-    path = csv_dir / f"judgments_{timestamp}_{short_sha}.csv"
+    path = csv_dir / f"{source}_{timestamp}_{short_sha}.csv"
     path.write_bytes(content)
     return path
 
 
-def _validate_fieldnames(fieldnames: Optional[list[str]]) -> None:
-    """Ensure required columns are present in the CSV headers."""
+def _validate_fieldnames(fieldnames: Optional[list[str]], *, source: str) -> None:
+    """Ensure required columns are present in the CSV headers for the source."""
 
     if not fieldnames:
         raise ValueError("CSV is missing header row")
-    if "Actions" not in fieldnames and "Action" not in fieldnames:
+
+    normalized_source = sources.normalize_source(source)
+    header_lower = {str(field).strip().lower() for field in fieldnames if field}
+
+    if normalized_source == sources.PUBLIC_REGISTERS:
+        if not {"name", "register", "register type"} & header_lower:
+            raise ValueError("CSV missing required public_registers identifying columns")
+        return
+
+    if "actions" not in header_lower and "action" not in header_lower:
         raise ValueError("CSV missing required Actions column")
 
 
-def _parse_row(row: dict[str, str]) -> tuple[list[str], dict[str, str]]:
-    actions_raw = (row.get("Actions") or row.get("Action") or "").strip()
-    if not actions_raw:
-        return [], {}
+def _clean(value: Optional[str]) -> str:
+    return (value or "").strip()
 
-    title = (row.get("Title") or row.get("Case Title") or row.get("Subject") or "").strip()
-    subject = (row.get("Subject") or title or "").strip()
-    court = (row.get("Court") or row.get("Court file") or "").strip()
-    category = (row.get("Category") or "").strip()
+
+def _payloads_from_unreported_row(row: dict[str, str]) -> list[CasePayload]:
+    actions_raw = _clean(row.get("Actions") or row.get("Action"))
+    if not actions_raw:
+        return []
+
+    title = _clean(row.get("Title") or row.get("Case Title") or row.get("Subject"))
+    subject = _clean(row.get("Subject") or title)
+    court = _clean(row.get("Court") or row.get("Court file"))
+    category = _clean(row.get("Category"))
     judgment_date = parse_judgment_date(row.get("Judgment Date") or row.get("Date") or "")
-    cause_number = (
+    cause_number = _clean(
         row.get("Cause Number")
         or row.get("Cause number")
         or row.get("Cause No.")
         or row.get("Cause")
-        or ""
-    ).strip()
+    )
 
     tokens: list[str] = []
     for piece in re.split(r"[|,;/\\\s]+", actions_raw):
         norm = normalize_action_token(piece)
         if norm:
             tokens.append(norm)
+
+    if not tokens:
+        return []
 
     metadata = {
         "action_token_raw": actions_raw,
@@ -154,7 +186,116 @@ def _parse_row(row: dict[str, str]) -> tuple[list[str], dict[str, str]]:
         "judgment_date": judgment_date,
         "cause_number": cause_number,
     }
-    return tokens, metadata
+    is_criminal = infer_is_criminal(metadata)
+
+    payloads: list[CasePayload] = []
+    for token in tokens:
+        payloads.append(
+            CasePayload(
+                action_token_raw=actions_raw,
+                action_token_norm=token,
+                title=title,
+                subject=subject,
+                court=court,
+                category=category,
+                judgment_date=judgment_date,
+                sort_judgment_date=judgment_date,
+                cause_number=cause_number,
+                is_criminal=is_criminal,
+                source=sources.UNREPORTED_JUDGMENTS,
+            )
+        )
+    return payloads
+
+
+def _first_present(row: dict[str, str], keys: list[str]) -> str:
+    for key in keys:
+        candidate = row.get(key)
+        cleaned = _clean(candidate)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _payloads_from_public_registers_row(row: dict[str, str]) -> list[CasePayload]:
+    register_type = _first_present(row, ["RegisterType", "Register Type", "Register", "Type"])
+    name = _first_present(row, ["Name", "Full Name", "Person", "Entity", "Appointee"])
+    reference = _first_present(
+        row,
+        [
+            "Reference",
+            "Ref",
+            "Number",
+            "Licence",
+            "License",
+            "Licence Number",
+            "Registration",
+            "Reg No",
+            "Record",
+        ],
+    )
+    date_raw = _first_present(
+        row,
+        [
+            "Date",
+            "Appointment Date",
+            "Effective Date",
+            "Start Date",
+            "Registered Date",
+        ],
+    )
+
+    if not (name or reference):
+        log_line(
+            "[CSV][WARN] public_registers row missing both name and reference; "
+            "skipping entry."
+        )
+        return []
+
+    if not reference:
+        log_line(
+            "[CSV][WARN] public_registers row missing reference/number; "
+            "falling back to name-only token for action_token_norm."
+        )
+    if not date_raw:
+        log_line(
+            "[CSV][WARN] public_registers row missing date; "
+            "judgment_date/sort_judgment_date will be empty for this entry."
+        )
+
+    token_raw_parts = [register_type, reference or name]
+    token_raw = " ".join(part for part in token_raw_parts if part)
+    token_norm = normalize_action_token(token_raw)
+    if not token_norm:
+        return []
+
+    judgment_date = parse_judgment_date(date_raw)
+    subject_parts = [register_type, reference, date_raw]
+    subject = " - ".join(part for part in subject_parts if part)
+    category = register_type or "Public Register"
+    title = name or reference or register_type or token_norm
+
+    payload = CasePayload(
+        action_token_raw=token_raw,
+        action_token_norm=token_norm,
+        title=title,
+        subject=subject or title,
+        court="Public Register",
+        category=category,
+        judgment_date=judgment_date,
+        sort_judgment_date=judgment_date,
+        cause_number=reference,
+        is_criminal=0,
+        source=sources.PUBLIC_REGISTERS,
+    )
+    return [payload]
+
+
+def _payloads_for_source(row: dict[str, str], source: str) -> list[CasePayload]:
+    source_norm = sources.normalize_source(source)
+    if source_norm == sources.PUBLIC_REGISTERS:
+        return _payloads_from_public_registers_row(row)
+    return _payloads_from_unreported_row(row)
 
 
 def infer_is_criminal(metadata: dict[str, str]) -> int:
@@ -177,6 +318,7 @@ def sync_csv(
     scraping workflow yet.
     """
 
+    source_norm = sources.normalize_source(source)
     http_session = session or build_http_session()
     response = http_session.get(source_url, timeout=(10, 60))
     response.raise_for_status()
@@ -190,13 +332,13 @@ def sync_csv(
     # rows for now. Future optimisation may short-circuit when the hash is
     # unchanged.
 
-    csv_path = _save_csv_copy(content, sha256)
+    csv_path = _save_csv_copy(content, sha256, source=source_norm)
     rows: list[dict[str, str]] = []
     row_count = 0
     try:
         decoded = content.decode("utf-8-sig")
         reader = csv.DictReader(io.StringIO(decoded))
-        _validate_fieldnames(reader.fieldnames)
+        _validate_fieldnames(reader.fieldnames, source=source_norm)
         rows = list(reader)
         row_count = len(rows)
     except Exception as exc:  # noqa: BLE001
@@ -230,12 +372,14 @@ def sync_csv(
     conn = db.get_connection()
     with conn:
         for row in rows:
-            tokens, metadata = _parse_row(row)
-            if not tokens:
+            payloads = _payloads_for_source(row, source_norm)
+            if not payloads:
                 continue
 
-            for token in tokens:
-                norm = token
+            for payload in payloads:
+                norm = payload.action_token_norm
+                if not norm:
+                    continue
 
                 cursor = conn.execute(
                     """
@@ -243,39 +387,49 @@ def sync_csv(
                     WHERE action_token_norm = ? AND source = ?
                     LIMIT 1
                     """,
-                    (norm, source),
+                    (norm, source_norm),
                 )
                 existing = cursor.fetchone()
 
                 fields = (
-                    metadata.get("title"),
-                    metadata.get("cause_number"),
-                    metadata.get("court"),
-                    metadata.get("category"),
-                    metadata.get("judgment_date"),
+                    payload.title,
+                    payload.subject,
+                    payload.cause_number,
+                    payload.court,
+                    payload.category,
+                    payload.judgment_date,
+                    payload.sort_judgment_date,
+                    payload.is_criminal,
                 )
 
                 if existing:
                     if (
                         existing["title"],
+                        existing["subject"],
                         existing["cause_number"],
                         existing["court"],
                         existing["category"],
                         existing["judgment_date"],
+                        existing["sort_judgment_date"],
+                        existing["is_criminal"],
                     ) != fields:
                         conn.execute(
                             """
                             UPDATE cases
-                            SET title = ?, cause_number = ?, court = ?, category = ?,
-                                judgment_date = ?, last_seen_version_id = ?, is_active = 1
+                            SET title = ?, subject = ?, cause_number = ?, court = ?, category = ?,
+                                judgment_date = ?, sort_judgment_date = ?, is_criminal = ?,
+                                last_seen_version_id = ?, is_active = 1
                             WHERE id = ?
                             """,
                             (
-                                metadata.get("title"),
-                                metadata.get("cause_number"),
-                                metadata.get("court"),
-                                metadata.get("category"),
-                                metadata.get("judgment_date"),
+                                payload.title,
+                                payload.subject,
+                                payload.cause_number,
+                                payload.court,
+                                payload.category,
+                                payload.judgment_date,
+                                payload.sort_judgment_date,
+                                payload.is_criminal,
                                 version_id,
                                 existing["id"],
                             ),
@@ -287,25 +441,26 @@ def sync_csv(
                             (version_id, existing["id"]),
                         )
                 else:
-                    is_criminal = infer_is_criminal(metadata)
                     cursor = conn.execute(
                         """
                         INSERT INTO cases (
-                            action_token_raw, action_token_norm, title, cause_number,
-                            court, category, judgment_date, is_criminal, is_active,
+                            action_token_raw, action_token_norm, title, subject, cause_number,
+                            court, category, judgment_date, sort_judgment_date, is_criminal, is_active,
                             source, first_seen_version_id, last_seen_version_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                         """,
                         (
-                            metadata.get("action_token_raw"),
+                            payload.action_token_raw,
                             norm,
-                            metadata.get("title"),
-                            metadata.get("cause_number"),
-                            metadata.get("court"),
-                            metadata.get("category"),
-                            metadata.get("judgment_date"),
-                            is_criminal,
-                            source,
+                            payload.title,
+                            payload.subject,
+                            payload.cause_number,
+                            payload.court,
+                            payload.category,
+                            payload.judgment_date,
+                            payload.sort_judgment_date,
+                            payload.is_criminal,
+                            source_norm,
                             version_id,
                             version_id,
                         ),
@@ -317,7 +472,7 @@ def sync_csv(
             SELECT id FROM cases
             WHERE source = ? AND last_seen_version_id < ? AND is_active = 1
             """,
-            (source, version_id),
+            (source_norm, version_id),
         )
         removed_case_ids = [int(row["id"]) for row in cursor.fetchall()]
         if removed_case_ids:
@@ -353,5 +508,5 @@ def sync_csv(
         removed_case_ids=removed_case_ids,
         csv_path=str(csv_path),
         row_count=row_count,
-        source=source,
+        source=source_norm,
     )

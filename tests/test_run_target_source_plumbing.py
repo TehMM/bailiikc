@@ -144,3 +144,6 @@ def test_run_scrape_uses_source_runtime(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert sync_calls["source"] == sources.PUBLIC_REGISTERS
     assert attempt_calls.get("base_url") == pr_base.strip()
     assert attempt_calls.get("csv_source") == pr_csv
+    selectors = attempt_calls.get("selectors")
+    assert selectors is not None
+    assert getattr(selectors, "table_selector") == "#public-registers"

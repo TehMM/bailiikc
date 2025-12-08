@@ -2721,6 +2721,7 @@ def run_scrape(
     limit_pages: Optional[List[int]] = None,
     row_limit: Optional[int] = None,
     trigger: str = "cli",
+    target_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Public entrypoint that wraps the core scraper with retry support."""
 
@@ -2731,7 +2732,9 @@ def run_scrape(
     raw_mode = (scrape_mode or config.SCRAPE_MODE_DEFAULT).strip().lower()
     mode = _normalize_scrape_mode(raw_mode)
 
-    target_source = sources.UNREPORTED_JUDGMENTS
+    effective_source = sources.normalize_source(
+        target_source if target_source is not None else config.DEFAULT_SOURCE
+    )
 
     row_limit = new_limit if new_limit is not None else config.SCRAPE_NEW_LIMIT
     retry_limit = max_retries if max_retries is not None else config.SCRAPER_MAX_RETRIES
@@ -2794,7 +2797,9 @@ def run_scrape(
     run_id: Optional[int] = None
 
     http_session = csv_sync.build_http_session()
-    sync_result = csv_sync.sync_csv(config.CSV_URL, session=http_session)
+    sync_result = csv_sync.sync_csv(
+        config.CSV_URL, session=http_session, source=effective_source
+    )
     csv_version_id = sync_result.version_id
     csv_source = sync_result.csv_path or config.CSV_URL
 
@@ -2820,7 +2825,7 @@ def run_scrape(
             "resume_index": resume_index,
             "limit_pages": limit_pages,
             "row_limit": row_limit,
-            "target_source": target_source,
+            "target_source": effective_source,
         },
         sort_keys=True,
     )
@@ -2854,7 +2859,7 @@ def run_scrape(
             run_id=run_id,
             csv_source=csv_source,
             sync_result=sync_result,
-            target_source=target_source,
+            target_source=effective_source,
         )
         next_start_message = None
         return result
@@ -2909,7 +2914,7 @@ def run_scrape(
         raise
 
 
-if __name__ == "__main__":  # pragma: no cover
+def _cli_entrypoint(argv: Optional[List[str]] = None) -> None:  # pragma: no cover
     parser = argparse.ArgumentParser(description="Run the Playwright scraper")
     parser.add_argument("--base-url", default=config.DEFAULT_BASE_URL)
     parser.add_argument("--page-wait", type=int, default=config.PAGE_WAIT_SECONDS)
@@ -2932,7 +2937,15 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument("--limit-pages", type=int, nargs="*", default=None)
     parser.add_argument("--row-limit", type=int, default=None)
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--source",
+        dest="target_source",
+        help="Logical source to scrape (currently only 'unreported_judgments' is supported).",
+        default=sources.UNREPORTED_JUDGMENTS,
+        choices=[sources.UNREPORTED_JUDGMENTS],
+    )
+
+    args = parser.parse_args(argv)
 
     ensure_dirs()
     validate_runtime_config("cli", mode=args.scrape_mode)
@@ -2949,7 +2962,12 @@ if __name__ == "__main__":  # pragma: no cover
         resume_index=args.resume_index,
         limit_pages=args.limit_pages,
         row_limit=args.row_limit,
+        target_source=args.target_source,
     )
 
-__all__ = ["run_scrape"]
+
+if __name__ == "__main__":  # pragma: no cover
+    _cli_entrypoint()
+
+__all__ = ["run_scrape", "_cli_entrypoint"]
 

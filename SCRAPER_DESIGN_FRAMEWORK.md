@@ -214,6 +214,11 @@ live scraper. For each run, ``runs.params_json.target_source`` determines which
 subset of ``cases`` is considered when computing coverage and building
 DB-backed worklists.
 
+Entrypoints (CLI, webhook, UI) normalise requested sources via
+``sources.normalize_source``; unknown or empty values fall back to the default
+``unreported_judgments`` to avoid polluting the database while only a single
+live source is supported.
+
 
 Table: runs
 

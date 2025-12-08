@@ -223,12 +223,7 @@ def _infer_run_source(params_json: str) -> str:
     if not isinstance(params, dict):
         return sources.DEFAULT_SOURCE
 
-    value = (params.get("target_source") or "").strip()
-    if not value:
-        return sources.DEFAULT_SOURCE
-    if value not in sources.ALL_SOURCES:
-        return sources.DEFAULT_SOURCE
-    return value
+    return sources.normalize_source(params.get("target_source"))
 
 
 def _count_cases_total(csv_version_id: int, source: str) -> int:

@@ -338,8 +338,19 @@ def should_use_db_index() -> bool:
     return config.use_db_cases()
 
 
-def find_case_by_fname(fname: str, *, strict: bool = False) -> Optional[CaseRow]:
-    """Locate the CaseRow that best matches the AJAX fname token."""
+def find_case_by_fname(
+    fname: str,
+    *,
+    strict: bool = False,
+    source: Optional[str] = None,
+) -> Optional[CaseRow]:
+    """Locate the CaseRow that best matches a fname token.
+
+    When ``source`` is ``None``, this uses the legacy AJAX fname index loaded
+    from the CSV path (unreported_judgments behaviour). When ``source`` is
+    provided, lookup is restricted to that logical source using the DB-backed
+    index populated via ``load_cases_index_from_db``.
+    """
 
     if not fname:
         return None
@@ -348,43 +359,75 @@ def find_case_by_fname(fname: str, *, strict: bool = False) -> Optional[CaseRow]
     if not candidate:
         return None
 
-    if not AJAX_FNAME_INDEX:
-        log_line("[CSV] Case index is empty; call load_cases_from_csv() first.")
-        return None
+    if source is None:
+        if not AJAX_FNAME_INDEX:
+            log_line(
+                "[INDEX] Case index is empty; load cases from CSV or DB before resolving fname tokens."
+            )
+            return None
 
-    direct = AJAX_FNAME_INDEX.get(candidate)
-    if direct or strict:
-        return direct
+        direct = AJAX_FNAME_INDEX.get(candidate)
+        if direct or strict:
+            return direct
 
-    matches: List[Tuple[int, int, str, CaseRow]] = []
-    for action, case in AJAX_FNAME_INDEX.items():
-        if candidate in action:
-            start = action.find(candidate)
-            overlap = len(candidate)
-            matches.append((overlap, start, action, case))
-            continue
-        if action in candidate:
-            start = candidate.find(action)
-            overlap = len(action)
-            matches.append((overlap, start, action, case))
+        matches: List[Tuple[int, int, str, CaseRow]] = []
+        for action, case in AJAX_FNAME_INDEX.items():
+            if candidate in action:
+                start = action.find(candidate)
+                overlap = len(candidate)
+                matches.append((overlap, start, action, case))
+                continue
+            if action in candidate:
+                start = candidate.find(action)
+                overlap = len(action)
+                matches.append((overlap, start, action, case))
 
-    if not matches:
-        return None
+        if not matches:
+            return None
 
-    matches.sort(key=lambda item: (-item[0], item[1], item[2]))
-    best_overlap, best_start, best_action, best_case = matches[0]
+        matches.sort(key=lambda item: (-item[0], item[1], item[2]))
+        best_overlap, best_start, best_action, best_case = matches[0]
 
-    other_actions = [m[2] for m in matches[1:5]]
-    if other_actions:
+        other_actions = [m[2] for m in matches[1:5]]
+        if other_actions:
+            log_line(
+                f"[AJAX] fname {candidate} partial match candidates: {([best_action] + other_actions)}"
+            )
+
         log_line(
-            f"[AJAX] fname {candidate} partial match candidates: {([best_action] + other_actions)}"
+            f"[AJAX] fname {candidate} resolved via partial match to Actions={best_action}; "
+            f"overlap={best_overlap} start={best_start}"
         )
+        return best_case
+
+    source_norm = sources.normalize_source(source)
+    if source_norm == sources.UNREPORTED_JUDGMENTS:
+        return find_case_by_fname(candidate, strict=strict, source=None)
+
+    cases_for_source = CASES_BY_SOURCE.get(source_norm) or []
+    if not cases_for_source:
+        log_line(
+            f"[MAPPING][WARN] Case index empty for source={source_norm}; call load_cases_index_from_db() first."
+        )
+        return None
+
+    for case in cases_for_source:
+        action_value = getattr(case, "action", "") or ""
+        if action_value == candidate or getattr(case, "code", None) == candidate:
+            return case
+
+    if strict:
+        return None
+
+    for case in cases_for_source:
+        action_value = getattr(case, "action", "") or ""
+        if candidate and action_value.startswith(candidate):
+            return case
 
     log_line(
-        f"[AJAX] fname {candidate} resolved via partial match to Actions={best_action}; "
-        f"overlap={best_overlap} start={best_start}"
+        f"[MAPPING][WARN] No case found for fname={candidate!r} source={source_norm!r}"
     )
-    return best_case
+    return None
 
 
 if __name__ == "__main__":  # pragma: no cover - manual verification aid

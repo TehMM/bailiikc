@@ -79,3 +79,56 @@ def test_load_cases_index_for_public_registers(
     assert cases_index.CASES_BY_SOURCE[sources.PUBLIC_REGISTERS]
     assert cases_index.AJAX_FNAME_INDEX == {}
     assert {case.title for case in cases_index.CASES_ALL} == {"Jane Doe", "John Smith"}
+
+
+def test_find_case_by_fname_public_registers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_temp_paths(tmp_path, monkeypatch)
+    db.initialize_schema()
+
+    csv_version_id = db.record_csv_version(
+        fetched_at="2024-01-01T00:00:00Z",
+        source_url="http://example.com/public_registers.csv",
+        sha256="deadbeef",
+        row_count=1,
+        file_path=str(tmp_path / "public_registers.csv"),
+    )
+
+    conn = db.get_connection()
+    conn.execute(
+        """
+        INSERT INTO cases (
+            action_token_raw, action_token_norm, title, subject, cause_number,
+            court, category, judgment_date, sort_judgment_date, is_criminal,
+            is_active, source, first_seen_version_id, last_seen_version_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+        """,
+        (
+            "Notaries Public NP-1",
+            "NOTARIESPUBLICNP1",
+            "Jane Doe",
+            "Notaries Public - NP-1",
+            "NP-1",
+            "Public Register",
+            "Notaries Public",
+            "2024-01-01",
+            "2024-01-01",
+            0,
+            sources.PUBLIC_REGISTERS,
+            csv_version_id,
+            csv_version_id,
+        ),
+    )
+    conn.commit()
+
+    cases_index.load_cases_index_from_db(
+        source=sources.PUBLIC_REGISTERS, csv_version_id=csv_version_id
+    )
+
+    found = cases_index.find_case_by_fname("NOTARIESPUBLICNP1", source=sources.PUBLIC_REGISTERS)
+    assert found is not None
+    assert found.title == "Jane Doe"
+
+    legacy = cases_index.find_case_by_fname("NOTARIESPUBLICNP1")
+    assert legacy is None

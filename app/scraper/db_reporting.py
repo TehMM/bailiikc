@@ -117,7 +117,8 @@ def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
             cases_failed,
             cases_skipped,
             coverage_ratio,
-            run_health
+            run_health,
+            params_json
         FROM runs WHERE id = ?
         """,
         (run_id,),
@@ -143,6 +144,7 @@ def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
         "cases_skipped": row["cases_skipped"],
         "coverage_ratio": row["coverage_ratio"],
         "run_health": row["run_health"],
+        "target_source": _infer_run_source(row["params_json"] or ""),
     }
 
 
@@ -173,7 +175,8 @@ def list_recent_runs(limit: int = 20) -> List[Dict[str, Any]]:
             cases_failed,
             cases_skipped,
             coverage_ratio,
-            run_health
+            run_health,
+            params_json
         FROM runs
         ORDER BY started_at DESC, id DESC
         LIMIT ?
@@ -200,6 +203,7 @@ def list_recent_runs(limit: int = 20) -> List[Dict[str, Any]]:
             "cases_skipped": row["cases_skipped"],
             "coverage_ratio": row["coverage_ratio"],
             "run_health": row["run_health"],
+            "target_source": _infer_run_source(row["params_json"] or ""),
         }
         for row in rows
     ]
@@ -223,7 +227,11 @@ def _infer_run_source(params_json: str) -> str:
     if not isinstance(params, dict):
         return sources.DEFAULT_SOURCE
 
-    return sources.normalize_source(params.get("target_source"))
+    raw_source = params.get("target_source") or params.get("source")
+    if not raw_source:
+        return sources.DEFAULT_SOURCE
+
+    return sources.normalize_source(raw_source)
 
 
 def _count_cases_total(csv_version_id: int, source: str) -> int:
@@ -272,23 +280,35 @@ def get_run_coverage(run_id: int) -> Dict[str, Any]:
     params_json = run_row["params_json"] or ""
     source = _infer_run_source(params_json)
     csv_version_value = run_row["csv_version_id"]
-    csv_version_id: Optional[int]
+    csv_version_id: Optional[int] = (
+        int(csv_version_value) if csv_version_value is not None else None
+    )
     cases_total = 0
     planned: Optional[int] = None
-    if csv_version_value is not None:
-        csv_version_id = int(csv_version_value)
+    if csv_version_id is not None:
         cases_total = _count_cases_total(csv_version_id, source)
         planned = _count_planned_cases(run_id, mode, csv_version_id, source)
 
-    download_cursor = conn.execute(
-        """
-        SELECT status, COUNT(DISTINCT case_id) AS count
-        FROM downloads
-        WHERE run_id = ?
-        GROUP BY status
-        """,
-        (run_id,),
-    )
+    download_params: List[Any] = []
+    download_query: List[str] = [
+        "SELECT d.status, COUNT(DISTINCT d.case_id) AS count",
+        "FROM downloads d",
+    ]
+
+    if csv_version_id is not None:
+        download_query.append(
+            "JOIN cases c ON c.id = d.case_id AND c.source = ? AND c.first_seen_version_id <= ? AND c.last_seen_version_id >= ?"
+        )
+        download_params.extend([source, csv_version_id, csv_version_id])
+    else:
+        download_query.append("JOIN cases c ON c.id = d.case_id AND c.source = ?")
+        download_params.append(source)
+
+    download_query.append("WHERE d.run_id = ?")
+    download_params.append(run_id)
+    download_query.append("GROUP BY d.status")
+
+    download_cursor = conn.execute("\n".join(download_query), download_params)
 
     attempted = 0
     downloaded = 0
@@ -306,10 +326,23 @@ def get_run_coverage(run_id: int) -> Dict[str, Any]:
             skipped += count
 
     if planned is None:
-        planned_cursor = conn.execute(
-            "SELECT COUNT(DISTINCT case_id) AS count FROM downloads WHERE run_id = ?",
-            (run_id,),
-        )
+        planned_query: List[str] = [
+            "SELECT COUNT(DISTINCT d.case_id) AS count",
+            "FROM downloads d",
+        ]
+        if csv_version_id is not None:
+            planned_query.append(
+                "JOIN cases c ON c.id = d.case_id AND c.source = ? AND c.first_seen_version_id <= ? AND c.last_seen_version_id >= ?"
+            )
+        else:
+            planned_query.append("JOIN cases c ON c.id = d.case_id AND c.source = ?")
+        planned_query.append("WHERE d.run_id = ?")
+        planned_query_str = "\n".join(planned_query)
+        if csv_version_id is not None:
+            planned_params: List[Any] = [source, csv_version_id, csv_version_id, run_id]
+        else:
+            planned_params = [source, run_id]
+        planned_cursor = conn.execute(planned_query_str, planned_params)
         planned_row = planned_cursor.fetchone()
         planned = int(planned_row["count"]) if planned_row else 0
 

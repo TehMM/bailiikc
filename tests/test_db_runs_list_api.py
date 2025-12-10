@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from app.scraper import db, db_reporting
+from app.scraper import sources
 from tests.test_runs_api_db import _configure_temp_paths, _reload_main_module
 
 
@@ -65,6 +66,7 @@ def test_api_db_runs_list_returns_json(tmp_path: Path, monkeypatch: pytest.Monke
         assert "started_at" in run
         assert "ended_at" in run
         assert "error_summary" in run
+        assert run["target_source"] == sources.DEFAULT_SOURCE
 
 
 def test_api_db_runs_list_respects_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

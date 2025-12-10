@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import pytest
+import json
 from pathlib import Path
 
-from app.scraper import db, db_reporting
+import pytest
+
+from app.scraper import db, db_reporting, sources
 from tests.test_runs_api_db import _configure_temp_paths, _reload_main_module
 
 
@@ -32,6 +34,30 @@ def _insert_unreported_case(conn, csv_version_id: int, token_suffix: str) -> int
             f"Cause {token_suffix}",
             "Court",
             "Category",
+            "2024-01-01",
+            csv_version_id,
+            csv_version_id,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def _insert_public_registers_case(conn, csv_version_id: int, token_suffix: str) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO cases (
+            action_token_raw, action_token_norm, title, cause_number, court, category,
+            judgment_date, is_criminal, is_active, source, first_seen_version_id,
+            last_seen_version_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, 'public_registers', ?, ?)
+        """,
+        (
+            f"PR-RAW-{token_suffix}",
+            f"PRNORM-{token_suffix}",
+            f"PR Title {token_suffix}",
+            f"PR Cause {token_suffix}",
+            "Public Court",
+            "Public Category",
             "2024-01-01",
             csv_version_id,
             csv_version_id,
@@ -111,6 +137,76 @@ def test_get_run_coverage_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert coverage["cases_skipped"] == 3
     assert coverage["coverage_ratio"] == pytest.approx(0.6)
     assert coverage["run_health"] == "partial"
+
+
+def test_get_run_coverage_scopes_by_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_temp_paths(tmp_path, monkeypatch)
+    db.initialize_schema()
+
+    version_id = _record_version()
+    uj_run = db.create_run(
+        trigger="test",
+        mode="new",
+        csv_version_id=version_id,
+        params_json=json.dumps({"target_source": sources.UNREPORTED_JUDGMENTS}),
+    )
+    pr_run = db.create_run(
+        trigger="test",
+        mode="new",
+        csv_version_id=version_id,
+        params_json=json.dumps({"target_source": sources.PUBLIC_REGISTERS}),
+    )
+
+    conn = db.get_connection()
+    with conn:
+        uj_one = _insert_unreported_case(conn, version_id, "UJ-ONE")
+        _insert_unreported_case(conn, version_id, "UJ-TWO")
+        pr_one = _insert_public_registers_case(conn, version_id, "PR-ONE")
+        _insert_public_registers_case(conn, version_id, "PR-TWO")
+
+        _insert_download(conn, run_id=uj_run, case_id=uj_one, status="downloaded")
+        _insert_download(conn, run_id=pr_run, case_id=pr_one, status="downloaded")
+
+    uj_coverage = db_reporting.get_run_coverage(uj_run)
+    assert uj_coverage["cases_total"] == 2
+    assert uj_coverage["cases_downloaded"] == 1
+    assert uj_coverage["cases_planned"] == 2
+    assert uj_coverage["coverage_ratio"] == pytest.approx(0.5)
+
+    pr_coverage = db_reporting.get_run_coverage(pr_run)
+    assert pr_coverage["cases_total"] == 2
+    assert pr_coverage["cases_downloaded"] == 1
+    assert pr_coverage["cases_planned"] == 2
+    assert pr_coverage["coverage_ratio"] == pytest.approx(0.5)
+
+
+def test_get_run_coverage_honours_legacy_source_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_temp_paths(tmp_path, monkeypatch)
+    db.initialize_schema()
+
+    version_id = _record_version()
+    run_id = db.create_run(
+        trigger="test",
+        mode="new",
+        csv_version_id=version_id,
+        params_json=json.dumps({"source": sources.PUBLIC_REGISTERS}),
+    )
+
+    conn = db.get_connection()
+    with conn:
+        pr_case = _insert_public_registers_case(conn, version_id, "LEGACY-PR")
+        uj_case = _insert_unreported_case(conn, version_id, "LEGACY-UJ")
+        _insert_download(conn, run_id=run_id, case_id=pr_case, status="downloaded")
+        _insert_download(conn, run_id=run_id, case_id=uj_case, status="downloaded")
+
+    coverage = db_reporting.get_run_coverage(run_id)
+    assert coverage["cases_total"] == 1
+    assert coverage["cases_downloaded"] == 1
+    assert coverage["cases_planned"] == 1
 
 
 def test_get_run_coverage_suspicious_when_no_attempts(

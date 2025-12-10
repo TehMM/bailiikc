@@ -49,6 +49,7 @@ from .cases_index import (
     CASES_BY_ACTION,
     CASES_ALL,
     CaseRow,
+    find_case_by_fname,
     load_cases_from_csv as load_cases_index,
     normalize_action_token,
 )
@@ -107,6 +108,42 @@ def _normalize_scrape_mode(raw: str) -> str:
         return "resume"
     log_line(f"[RUN] Unknown scrape_mode={raw!r}; defaulting to 'new'.")
     return "new"
+
+
+def resolve_ajax_case_context(
+    fname_param: Optional[str],
+    fid_param: Optional[str],
+    pending_by_fname: Dict[str, Any],
+    target_source: str,
+) -> tuple[Optional[Dict[str, Any]], str, str, str]:
+    """Resolve case context and tokens for an AJAX download callback."""
+
+    source_norm = sources.normalize_source(target_source)
+    norm_fname = normalize_action_token(fname_param or "")
+    case_context = pending_by_fname.get(norm_fname) if norm_fname else None
+    if case_context is not None:
+        case_context = dict(case_context)
+        if fid_param:
+            case_context.setdefault("fid", fid_param)
+    elif norm_fname:
+        fallback_case = find_case_by_fname(
+            fname_param or norm_fname, source=source_norm
+        )
+        if fallback_case is not None:
+            case_context = {
+                "case": fallback_case,
+                "slug": fallback_case.action,
+                "raw": fname_param or norm_fname,
+            }
+
+    canonical_token = canon_fname(fname_param or norm_fname or "")
+    db_token_norm = normalize_action_token_db(
+        (case_context or {}).get("slug")
+        or fname_param
+        or norm_fname
+        or ""
+    )
+    return case_context, canonical_token, db_token_norm, norm_fname
 
 ADMIN_AJAX = "https://judicial.ky/wp-admin/admin-ajax.php"
 
@@ -907,6 +944,7 @@ def handle_dl_bfile_from_ajax(
     fid: Optional[str] = None,
     run_id: Optional[int] = None,
     download_executor: Optional[DownloadExecutor] = None,
+    source: Optional[str] = None,
 ) -> tuple[str, Dict[str, Any]]:
     """Process a dl_bfile AJAX response using explicit mode and dedupe semantics.
 
@@ -959,7 +997,9 @@ def handle_dl_bfile_from_ajax(
 
     case_row = case_context.get("case") if case_context else None
     if case_row is None:
-        case_row = cases_by_action.get(norm_fname)
+        case_row = find_case_by_fname(fname, source=source) or cases_by_action.get(
+            norm_fname
+        )
 
     slug = norm_fname
     if case_row is not None and getattr(case_row, "action", None):
@@ -1819,17 +1859,16 @@ def _run_scrape_attempt(
                                     )
                                 )
     
-                                norm_fname = normalize_action_token(fname_param or "")
-                                case_context = (
-                                    pending_by_fname.get(norm_fname) if norm_fname else None
-                                )
-                                if case_context is not None:
-                                    case_context = dict(case_context)
-                                    if fid_param:
-                                        case_context.setdefault("fid", fid_param)
-                                canonical_token = canon_fname(fname_param or norm_fname or "")
-                                db_token_norm = normalize_action_token_db(
-                                    fname_param or norm_fname or ""
+                                (
+                                    case_context,
+                                    canonical_token,
+                                    db_token_norm,
+                                    norm_fname,
+                                ) = resolve_ajax_case_context(
+                                    fname_param,
+                                    fid_param,
+                                    pending_by_fname,
+                                    target_source,
                                 )
                                 case_id = _lookup_case_id(db_token_norm)
                                 state: Optional[CaseDownloadState] = None
@@ -1844,6 +1883,10 @@ def _run_scrape_attempt(
                                         log_line(
                                             f"[DB][WARN] Unable to start download attempt for case_id={case_id}: {exc}"
                                         )
+                                elif run_id is not None:
+                                    log_line(
+                                        f"[MAPPING][WARN] No case_id resolved for fname={db_token_norm!r} source={target_source}"
+                                    )
     
                                 serialized_case_context: Optional[Dict[str, Any]] = None
                                 if case_context:
@@ -1903,6 +1946,7 @@ def _run_scrape_attempt(
                                     fid=fid_param,
                                     run_id=run_id,
                                     download_executor=download_executor,
+                                    source=target_source,
                                 )
     
                                 if norm_fname:
@@ -2406,7 +2450,9 @@ def _run_scrape_attempt(
                                         _log_skip_status(case_id_for_logging, "worklist_filtered")
                                         continue
     
-                                    case_for_fname = planned_cases_by_token.get(fname_key) or CASES_BY_ACTION.get(fname_key)
+                                    case_for_fname = planned_cases_by_token.get(fname_key) or find_case_by_fname(
+                                        fname_key, strict=True, source=target_source
+                                    )
                                     if case_for_fname is None:
                                         log_line(
                                             f"[SKIP][csv_miss] No CSV entry for fname={fname_token}; skipping."

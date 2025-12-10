@@ -412,16 +412,16 @@ def find_case_by_fname(
         return None
 
     for case in cases_for_source:
-        action_value = getattr(case, "action", "") or ""
-        if action_value == candidate or getattr(case, "code", None) == candidate:
+        action = getattr(case, "action", "") or ""
+        if action == candidate or getattr(case, "code", None) == candidate:
             return case
 
     if strict:
         return None
 
     for case in cases_for_source:
-        action_value = getattr(case, "action", "") or ""
-        if candidate and action_value.startswith(candidate):
+        action = getattr(case, "action", "") or ""
+        if candidate and action.startswith(candidate):
             return case
 
     log_line(

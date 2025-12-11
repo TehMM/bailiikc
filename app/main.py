@@ -388,6 +388,7 @@ def report() -> str:
         "courts": courts,
         "categories": categories,
         "current_log_name": current_log_path.name,
+        "available_sources": sources.ALL_SOURCES,
     }
     return render_template("report.html", **context)
 

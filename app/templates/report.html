@@ -45,6 +45,42 @@
 </section>
 
 <section class="card">
+    <h3>Run History</h3>
+    <div class="table-actions">
+        <label for="runs-source-filter">
+            Source
+            <select id="runs-source-filter">
+                <option value="">All</option>
+                {% for source in available_sources %}
+                <option value="{{ source }}">{{ source }}</option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
+    <div class="table-scroll">
+        <table id="run-history" class="display compact" style="width:100%">
+            <thead>
+                <tr>
+                    <th>Run ID</th>
+                    <th>Source</th>
+                    <th>Trigger</th>
+                    <th>Mode</th>
+                    <th>Status</th>
+                    <th>Started At</th>
+                    <th>Ended At</th>
+                    <th>CSV Version</th>
+                    <th>Downloaded</th>
+                    <th>Failed</th>
+                    <th>Skipped</th>
+                    <th>Health</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+</section>
+
+<section class="card">
     <h3>Downloaded Cases</h3>
     {% if last_summary %}
     <div class="summary-badges">
@@ -85,6 +121,7 @@
                     <th>Subject</th>
                     <th>Court</th>
                     <th>Category</th>
+                    <th>Source</th>
                     <th>Cause Number</th>
                     <th>Saved File</th>
                     <th>Size (KB)</th>
@@ -118,6 +155,48 @@ if (window.EventSource) {
 }
 
 $(function() {
+    const runsTableEl = $('#run-history');
+    const runsSourceFilter = $('#runs-source-filter');
+    if (runsTableEl.length) {
+        const runsApiBase = '{{ url_for('api_db_runs_list') }}';
+        const runsUrl = () => {
+            const source = runsSourceFilter.val();
+            if (source) {
+                return `${runsApiBase}?source=${encodeURIComponent(source)}`;
+            }
+            return runsApiBase;
+        };
+
+        const runsTable = runsTableEl.DataTable({
+            ajax: {
+                url: runsUrl(),
+                dataSrc: function(json) { return (json && json.runs) || []; }
+            },
+            deferRender: true,
+            scrollY: '40vh',
+            scroller: true,
+            order: [[5, 'desc']],
+            columns: [
+                { data: 'id', title: 'Run ID' },
+                { data: 'target_source', title: 'Source' },
+                { data: 'trigger', title: 'Trigger' },
+                { data: 'mode', title: 'Mode' },
+                { data: 'status', title: 'Status' },
+                { data: 'started_at', title: 'Started At' },
+                { data: 'ended_at', title: 'Ended At' },
+                { data: 'csv_version_id', title: 'CSV Version' },
+                { data: 'cases_downloaded', title: 'Downloaded' },
+                { data: 'cases_failed', title: 'Failed' },
+                { data: 'cases_skipped', title: 'Skipped' },
+                { data: 'run_health', title: 'Health' }
+            ]
+        });
+
+        runsSourceFilter.on('change', function() {
+            runsTable.ajax.url(runsUrl()).load();
+        });
+    }
+
     $('#downloaded-cases').DataTable({
         ajax: '{{ url_for('api_downloaded_cases') }}',
         deferRender: true,
@@ -136,6 +215,7 @@ $(function() {
             { data: 'subject', title: 'Subject' },
             { data: 'court', title: 'Court' },
             { data: 'category', title: 'Category' },
+            { data: 'source', title: 'Source' },
             { data: 'cause_number', title: 'Cause Number' },
             { data: 'filename', title: 'Saved File' },
             { data: 'size_kb', title: 'Size (KB)' },

@@ -3024,7 +3024,9 @@ def _cli_entrypoint(argv: Optional[List[str]] = None) -> None:  # pragma: no cov
         "--source",
         dest="target_source",
         help=(
-            "Logical source to scrape (e.g. 'unreported_judgments', 'public_registers', 'default')."
+            "Logical source to scrape (e.g. 'unreported_judgments', 'public_registers'). "
+            "Unknown values fall back to the default source with a warning; if omitted, "
+            "the default is used silently."
         ),
         default=None,
     )

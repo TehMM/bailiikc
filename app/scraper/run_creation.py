@@ -18,6 +18,8 @@ def create_run_with_source(
 
     ``extra_params`` are merged into ``params_json`` and may include legacy
     keys; ``target_source`` wins over any existing value in ``extra_params``.
+    The persisted ``target_source`` is always the result of
+    ``sources.coerce_source(...)``.
     """
 
     params: dict[str, Any] = {}

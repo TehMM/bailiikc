@@ -540,7 +540,7 @@ def get_download_rows_for_run(
             c.category,
             c.judgment_date,
             c.is_criminal,
-            c.source
+            c.source AS source
         FROM downloads d
         JOIN cases c ON d.case_id = c.id
         WHERE d.run_id = ?
@@ -586,6 +586,7 @@ def get_download_rows_for_run(
                 "saved_path": saved_path,
                 "filename": filename,
                 "size_kb": size_kb,
+                "source": sources.coerce_source(row["source"]),
             }
         )
 

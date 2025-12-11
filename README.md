@@ -56,6 +56,23 @@ README.md
   pytest
   ```
 
+### CLI usage
+
+- Run the scraper directly with `python -m app.scraper.run --source <source>`. Valid
+  logical sources include `unreported_judgments` (default) and `public_registers`.
+  Common aliases such as `uj`, `unreported`, `default`, `public-registers`,
+  `public_registers`, and `pr` are also accepted. Unknown values are coerced back
+  to the default source with a warning; if `--source` is omitted, the default is
+  used silently.
+
+Example CLI invocation:
+
+```bash
+python -m app.scraper.run \
+  --base-url https://judicial.ky/judgments/unreported-judgments/ \
+  --source unreported_judgments
+```
+
 ## Docker Usage
 Build and run the containerised app (Chromium included for Playwright):
 ```bash

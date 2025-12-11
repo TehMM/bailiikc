@@ -23,6 +23,10 @@ ALL_SOURCES = (UNREPORTED_JUDGMENTS, PUBLIC_REGISTERS)
 _DEFAULT_ALIASES = {"default", "unreported_judgments", "unreported-judgments", "uj", "unreported"}
 _PUBLIC_REGISTERS_ALIASES = {"public-registers", "public_registers", "pr"}
 
+# ``normalize_source`` is a pure mapper with no side effects. Prefer ``coerce_source``
+# when handling user-supplied or untrusted inputs so unknown values are logged and
+# safely coerced back to ``DEFAULT_SOURCE``.
+
 
 def normalize_source(value: str | None) -> str:
     """Return a canonical logical source identifier.

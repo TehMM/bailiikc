@@ -18,6 +18,7 @@ def _configure_temp_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(config, "DOWNLOADS_LOG", data_dir / "downloads.jsonl")
     monkeypatch.setattr(config, "SUMMARY_FILE", data_dir / "last_summary.json")
     monkeypatch.setattr(config, "LOG_FILE", data_dir / "logs" / "latest.log")
+    monkeypatch.setattr(config, "METADATA_FILE", data_dir / "metadata.json")
     monkeypatch.setattr(config, "DB_PATH", db_path)
     monkeypatch.setattr(db, "DB_PATH", db_path)
 

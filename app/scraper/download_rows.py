@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List
 
-from app.scraper import config
+from app.scraper import config, sources
 from app.scraper.utils import ensure_dirs, load_json_lines
 from app.scraper.date_utils import sortable_date
 
@@ -48,6 +48,7 @@ def build_download_rows(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "size_kb": round((entry.get("bytes") or 0) / 1024, 1)
                 if entry.get("bytes")
                 else 0,
+                "source": sources.coerce_source(entry.get("source")),
             }
         )
     return rows

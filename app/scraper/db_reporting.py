@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from . import config, db, sources, worklist
 from .date_utils import sortable_date
-from .utils import log_line
+from .logging_utils import log_line
 
 
 @dataclass
@@ -148,13 +148,15 @@ def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
     }
 
 
-def list_recent_runs(limit: int = 20) -> List[Dict[str, Any]]:
+def list_recent_runs(limit: int = 20, *, source: str | None = None) -> List[Dict[str, Any]]:
     """Return up to ``limit`` most recent runs ordered by ``started_at`` DESC."""
 
     if limit <= 0:
         return []
 
     limit = min(limit, 200)
+    normalized_source = sources.coerce_source(source) if source else None
+    query_limit = 200 if normalized_source else limit
 
     conn = db.get_connection()
     cursor = conn.execute(
@@ -181,32 +183,42 @@ def list_recent_runs(limit: int = 20) -> List[Dict[str, Any]]:
         ORDER BY started_at DESC, id DESC
         LIMIT ?
         """,
-        (limit,),
+        (query_limit,),
     )
 
     rows = cursor.fetchall()
-    return [
-        {
-            "id": row["id"],
-            "trigger": row["trigger"],
-            "mode": row["mode"],
-            "csv_version_id": row["csv_version_id"],
-            "status": row["status"],
-            "started_at": row["started_at"],
-            "ended_at": row["ended_at"],
-            "error_summary": row["error_summary"],
-            "cases_total": row["cases_total"],
-            "cases_planned": row["cases_planned"],
-            "cases_attempted": row["cases_attempted"],
-            "cases_downloaded": row["cases_downloaded"],
-            "cases_failed": row["cases_failed"],
-            "cases_skipped": row["cases_skipped"],
-            "coverage_ratio": row["coverage_ratio"],
-            "run_health": row["run_health"],
-            "target_source": _infer_run_source(row["params_json"] or ""),
-        }
-        for row in rows
-    ]
+    runs: list[Dict[str, Any]] = []
+    for row in rows:
+        inferred_source = _infer_run_source(row["params_json"] or "")
+        if normalized_source and inferred_source != normalized_source:
+            continue
+
+        runs.append(
+            {
+                "id": row["id"],
+                "trigger": row["trigger"],
+                "mode": row["mode"],
+                "csv_version_id": row["csv_version_id"],
+                "status": row["status"],
+                "started_at": row["started_at"],
+                "ended_at": row["ended_at"],
+                "error_summary": row["error_summary"],
+                "cases_total": row["cases_total"],
+                "cases_planned": row["cases_planned"],
+                "cases_attempted": row["cases_attempted"],
+                "cases_downloaded": row["cases_downloaded"],
+                "cases_failed": row["cases_failed"],
+                "cases_skipped": row["cases_skipped"],
+                "coverage_ratio": row["coverage_ratio"],
+                "run_health": row["run_health"],
+                "target_source": inferred_source,
+            }
+        )
+
+        if normalized_source and len(runs) >= limit:
+            break
+
+    return runs[:limit]
 
 
 def _infer_run_source(params_json: str) -> str:
@@ -217,21 +229,25 @@ def _infer_run_source(params_json: str) -> str:
     """
 
     if not params_json:
+        log_line("[RUN][INFO] params_json missing; using default source.")
         return sources.DEFAULT_SOURCE
 
     try:
         params = json.loads(params_json)
     except Exception:  # noqa: BLE001
+        log_line("[RUN][WARN] Could not decode params_json; using default source.")
         return sources.DEFAULT_SOURCE
 
     if not isinstance(params, dict):
+        log_line("[RUN][WARN] params_json is not a mapping; using default source.")
         return sources.DEFAULT_SOURCE
 
     raw_source = params.get("target_source") or params.get("source")
     if not raw_source:
+        log_line("[RUN][INFO] params_json missing source; using default.")
         return sources.DEFAULT_SOURCE
 
-    return sources.normalize_source(raw_source)
+    return sources.coerce_source(str(raw_source))
 
 
 def _count_cases_total(csv_version_id: int, source: str) -> int:

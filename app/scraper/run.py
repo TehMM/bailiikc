@@ -43,6 +43,7 @@ from playwright.sync_api import (
 )
 
 from . import box_client, config, csv_sync, db, db_reporting, sources
+from .run_creation import create_run_with_source
 from .download_executor import DownloadExecutor
 from .config import is_full_mode, is_new_mode
 from .cases_index import (
@@ -2811,7 +2812,7 @@ def run_scrape(
     raw_mode = (scrape_mode or config.SCRAPE_MODE_DEFAULT).strip().lower()
     mode = _normalize_scrape_mode(raw_mode)
 
-    effective_source = sources.normalize_source(
+    effective_source = sources.coerce_source(
         target_source if target_source is not None else config.DEFAULT_SOURCE
     )
 
@@ -2895,30 +2896,27 @@ def run_scrape(
         removed_case_ids=len(sync_result.removed_case_ids),
     )
 
-    params_json = json.dumps(
-        {
-            "base_url": base_url,
-            "page_wait": page_wait,
-            "per_delay": per_delay,
-            "scrape_mode": mode,
-            "max_retries": retry_limit,
-            "resume": resume_enabled,
-            "resume_mode": resume_mode,
-            "resume_page": resume_page,
-            "resume_index": resume_index,
-            "limit_pages": limit_pages,
-            "row_limit": row_limit,
-            "target_source": effective_source,
-        },
-        sort_keys=True,
-    )
+    run_params = {
+        "base_url": base_url,
+        "page_wait": page_wait,
+        "per_delay": per_delay,
+        "scrape_mode": mode,
+        "max_retries": retry_limit,
+        "resume": resume_enabled,
+        "resume_mode": resume_mode,
+        "resume_page": resume_page,
+        "resume_index": resume_index,
+        "limit_pages": limit_pages,
+        "row_limit": row_limit,
+    }
 
     try:
-        run_id = db.create_run(
+        run_id = create_run_with_source(
             trigger=trigger or "cli",
             mode=mode,
             csv_version_id=csv_version_id,
-            params_json=params_json,
+            target_source=effective_source,
+            extra_params=run_params,
         )
     except Exception as exc:  # noqa: BLE001
         log_line(f"[DB][WARN] Unable to create run record: {exc}")
@@ -2950,6 +2948,7 @@ def run_scrape(
 
     try:
         result = run_with_retries(_attempt, max_retries=max(1, retry_limit))
+        result.setdefault("target_source", effective_source)
         coverage: Dict[str, Any] = {}
         if run_id is not None:
             result.setdefault("run_id", run_id)
@@ -3025,17 +3024,17 @@ def _cli_entrypoint(argv: Optional[List[str]] = None) -> None:  # pragma: no cov
         "--source",
         dest="target_source",
         help=(
-            "Logical source to scrape. Currently supported: "
-            "'unreported_judgments' (stable) and 'public_registers' (experimental)."
+            "Logical source to scrape (e.g. 'unreported_judgments', 'public_registers', 'default')."
         ),
-        default=sources.UNREPORTED_JUDGMENTS,
-        choices=list(sources.ALL_SOURCES),
+        default=None,
     )
 
     args = parser.parse_args(argv)
 
     ensure_dirs()
     validate_runtime_config("cli", mode=args.scrape_mode)
+    target_source = sources.coerce_source(args.target_source)
+
     run_scrape(
         base_url=args.base_url,
         page_wait=args.page_wait,
@@ -3049,7 +3048,7 @@ def _cli_entrypoint(argv: Optional[List[str]] = None) -> None:  # pragma: no cov
         resume_index=args.resume_index,
         limit_pages=args.limit_pages,
         row_limit=args.row_limit,
-        target_source=args.target_source,
+        target_source=target_source,
     )
 
 

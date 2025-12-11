@@ -206,6 +206,8 @@ def index() -> str:
         "default_resume_index": last_params.get("resume_index"),
         "default_reset_before_run": last_params.get("reset_before_run", False),
         "default_reset_delete_pdfs": last_params.get("reset_delete_pdfs", False),
+        "default_target_source": last_params.get("target_source", config.DEFAULT_SOURCE),
+        "available_sources": sources.ALL_SOURCES,
         "last_summary": last_summary,
     }
     return render_template("index.html", **context)
@@ -243,6 +245,7 @@ def start_scrape() -> Response:
     except (TypeError, ValueError):
         max_retries = config.SCRAPER_MAX_RETRIES
     max_retries = max(1, max_retries)
+    target_source = sources.coerce_source(request.form.get("target_source"))
 
     try:
         validate_runtime_config("ui", mode=scrape_mode)
@@ -267,6 +270,7 @@ def start_scrape() -> Response:
         "resume_mode": resume_mode,
         "resume_page": resume_page,
         "resume_index": resume_index,
+        "target_source": target_source,
     }
 
     def _run() -> None:
@@ -284,7 +288,7 @@ def start_scrape() -> Response:
                     resume_mode=resume_mode,
                     resume_page=resume_page,
                     resume_index=resume_index,
-                    target_source=config.DEFAULT_SOURCE,
+                    target_source=target_source,
                     trigger="ui",
                 )
                 app.config["LAST_SUMMARY"] = summary
@@ -314,6 +318,7 @@ def resume_scrape() -> Response:
     base_url = request.form.get("base_url", config.DEFAULT_BASE_URL).strip()
     page_wait = int(request.form.get("page_wait", config.PAGE_WAIT_SECONDS))
     per_delay = float(request.form.get("per_download_delay", config.PER_DOWNLOAD_DELAY))
+    target_source = sources.coerce_source(request.form.get("target_source"))
 
     try:
         validate_runtime_config("ui", mode="resume")
@@ -336,7 +341,7 @@ def resume_scrape() -> Response:
                     resume_mode=resume_mode,
                     resume_page=resume_page,
                     resume_index=resume_index,
-                    target_source=config.DEFAULT_SOURCE,
+                    target_source=target_source,
                     trigger="ui",
                 )
                 app.config["LAST_SUMMARY"] = summary
@@ -447,13 +452,11 @@ def webhook_changedetection() -> Response:
 
     payload = _parse_webhook_payload()
     raw_target_source = str(payload.get("target_source") or "").strip()
-    target_source = sources.normalize_source(raw_target_source)
+    target_source = sources.coerce_source(raw_target_source)
     mode = str(payload.get("mode") or "").strip().lower()
     new_limit_raw = payload.get("new_limit")
 
     errors = []
-    if target_source != sources.UNREPORTED_JUDGMENTS:
-        errors.append("target_source must be 'unreported_judgments'")
     if mode != "new":
         errors.append("mode must be 'new'")
 
@@ -581,7 +584,10 @@ def api_db_runs_list() -> Response:
     else:
         limit = max(1, min(raw_limit, 200))
 
-    runs = db_reporting.list_recent_runs(limit)
+    raw_source = request.args.get("source")
+    source = raw_source if raw_source else None
+
+    runs = db_reporting.list_recent_runs(limit, source=source)
 
     return jsonify({"ok": True, "count": len(runs), "runs": runs})
 

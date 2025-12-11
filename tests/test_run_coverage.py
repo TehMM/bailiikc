@@ -229,6 +229,19 @@ def test_get_run_coverage_suspicious_when_no_attempts(
     assert coverage["run_health"] == "suspicious"
 
 
+def test_infer_run_source_handles_malformed_params(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BAILIIKC_USE_DB_REPORTING", "1")
+
+    assert db_reporting._infer_run_source("not-json") == sources.DEFAULT_SOURCE
+    assert db_reporting._infer_run_source(json.dumps(["not", "a", "dict"])) == sources.DEFAULT_SOURCE
+    assert (
+        db_reporting._infer_run_source(
+            json.dumps({"target_source": "unknown-source-value"})
+        )
+        == sources.DEFAULT_SOURCE
+    )
+
+
 def test_run_health_api_returns_coverage_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_temp_paths(tmp_path, monkeypatch)
     monkeypatch.setenv("BAILIIKC_USE_DB_REPORTING", "1")

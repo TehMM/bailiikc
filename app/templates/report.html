@@ -40,6 +40,7 @@
         <input type="hidden" name="new_limit" value="{{ last_params.new_limit | default(config.SCRAPE_NEW_LIMIT) }}">
         <input type="hidden" name="max_retries" value="{{ last_params.max_retries | default(config.SCRAPER_MAX_RETRIES) }}">
         <input type="hidden" name="per_download_delay" value="{{ last_params.per_download_delay | default(config.PER_DOWNLOAD_DELAY) }}">
+        <input type="hidden" name="target_source" value="{{ last_params.target_source | default(config.DEFAULT_SOURCE) }}">
     </form>
 </section>
 

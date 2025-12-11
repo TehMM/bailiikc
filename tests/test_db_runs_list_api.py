@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -88,3 +89,74 @@ def test_api_db_runs_list_respects_limit(tmp_path: Path, monkeypatch: pytest.Mon
     assert payload["ok"] is True
     assert payload["count"] == 1
     assert len(payload["runs"]) == 1
+
+
+def test_list_recent_runs_filters_by_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_temp_paths(tmp_path, monkeypatch)
+    db.initialize_schema()
+
+    conn = db.get_connection()
+    with conn:
+        version_id = _record_version("2024-01-01T00:00:00Z", "http://example.com/csv", "sha1")
+        db.create_run(
+            trigger="ui",
+            mode="full",
+            csv_version_id=version_id,
+            params_json=json.dumps({"target_source": sources.PUBLIC_REGISTERS}),
+        )
+        db.create_run(
+            trigger="webhook",
+            mode="new",
+            csv_version_id=version_id,
+            params_json=json.dumps({"target_source": sources.UNREPORTED_JUDGMENTS}),
+        )
+        db.create_run(trigger="legacy", mode="new", csv_version_id=version_id, params_json="{}")
+
+    all_runs = db_reporting.list_recent_runs(10)
+    assert {run["target_source"] for run in all_runs} == {
+        sources.PUBLIC_REGISTERS,
+        sources.UNREPORTED_JUDGMENTS,
+    }
+
+    pr_runs = db_reporting.list_recent_runs(10, source=sources.PUBLIC_REGISTERS)
+    assert len(pr_runs) == 1
+    assert pr_runs[0]["target_source"] == sources.PUBLIC_REGISTERS
+
+    default_runs = db_reporting.list_recent_runs(10, source=sources.DEFAULT_SOURCE)
+    assert len(default_runs) == 2
+    assert all(run["target_source"] == sources.DEFAULT_SOURCE for run in default_runs)
+
+
+def test_api_db_runs_list_filters_by_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_temp_paths(tmp_path, monkeypatch)
+    db.initialize_schema()
+
+    conn = db.get_connection()
+    with conn:
+        version_id = _record_version("2024-01-01T00:00:00Z", "http://example.com/csv", "sha1")
+        db.create_run(
+            trigger="ui",
+            mode="full",
+            csv_version_id=version_id,
+            params_json=json.dumps({"target_source": sources.PUBLIC_REGISTERS}),
+        )
+        db.create_run(
+            trigger="webhook",
+            mode="new",
+            csv_version_id=version_id,
+            params_json=json.dumps({"target_source": sources.UNREPORTED_JUDGMENTS}),
+        )
+
+    main = _reload_main_module()
+    client = main.app.test_client()
+
+    resp = client.get(f"/api/db/runs?source={sources.PUBLIC_REGISTERS}")
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["ok"] is True
+    assert payload["count"] == 1
+    assert payload["runs"][0]["target_source"] == sources.PUBLIC_REGISTERS

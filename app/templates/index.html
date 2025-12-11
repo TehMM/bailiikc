@@ -19,6 +19,14 @@
             </select>
         </label>
         <label>
+            Target Source
+            <select name="target_source">
+                {% for source in available_sources %}
+                <option value="{{ source }}" {% if default_target_source == source %}selected{% endif %}>{{ source }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
             New Rows Limit
             <input type="number" name="new_limit" min="0" value="{{ default_new_limit }}" required>
         </label>
@@ -60,6 +68,14 @@
             Delay Between Downloads (seconds)
             <input type="number" step="0.1" name="per_download_delay" min="0" value="{{ default_delay }}" required>
         </label>
+        <label>
+            Target Source
+            <select name="target_source">
+                {% for source in available_sources %}
+                <option value="{{ source }}" {% if default_target_source == source %}selected{% endif %}>{{ source }}</option>
+                {% endfor %}
+            </select>
+        </label>
         <fieldset class="form-fieldset">
             <legend>Resume Source</legend>
             <label class="radio">
@@ -98,6 +114,7 @@
         <li><strong>Failed:</strong> {{ last_summary.failed }}</li>
         <li><strong>Rows Inspected:</strong> {{ last_summary.inspected_rows | default(last_summary.processed) }}</li>
         <li><strong>Mode:</strong> {{ last_summary.scrape_mode | default('new') }}</li>
+        <li><strong>Source:</strong> {{ last_summary.target_source | default(default_target_source) }}</li>
     </ul>
     <a href="{{ url_for('report') }}" class="button">View Detailed Report</a>
 </section>

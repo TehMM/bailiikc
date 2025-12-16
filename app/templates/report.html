@@ -112,6 +112,17 @@
     </details>
     {% endif %}
     {% endif %}
+    <div class="table-actions">
+        <label for="downloaded-cases-source-filter">
+            Source
+            <select id="downloaded-cases-source-filter">
+                <option value="">All</option>
+                {% for source in available_sources %}
+                <option value="{{ source }}">{{ source }}</option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
     <div class="table-scroll">
         <table id="downloaded-cases" class="display compact" style="width:100%">
             <thead>
@@ -197,31 +208,48 @@ $(function() {
         });
     }
 
-    $('#downloaded-cases').DataTable({
-        ajax: '{{ url_for('api_downloaded_cases') }}',
-        deferRender: true,
-        scrollY: '50vh',
-        scroller: true,
-        order: [[0, 'desc']],
-        columns: [
-            { data: 'judgment_date', title: 'Judgment Date' },
-            { data: 'title', title: 'Title', render: function(data, type, row) {
-                if (type === 'display') {
-                    const href = row.saved_path ? `{{ url_for('download_file', filename='') }}/${row.saved_path}` : '#';
-                    return `<a href="${href}">${data || '—'}</a>`;
-                }
-                return data || '';
-            }},
-            { data: 'subject', title: 'Subject' },
-            { data: 'court', title: 'Court' },
-            { data: 'category', title: 'Category' },
-            { data: 'source', title: 'Source' },
-            { data: 'cause_number', title: 'Cause Number' },
-            { data: 'filename', title: 'Saved File' },
-            { data: 'size_kb', title: 'Size (KB)' },
-            { data: 'actions_token', title: 'Actions Token' }
-        ]
-    });
+    const downloadsTableEl = $('#downloaded-cases');
+    const downloadsSourceFilter = $('#downloaded-cases-source-filter');
+    if (downloadsTableEl.length) {
+        const downloadsApiBase = '{{ url_for('api_downloaded_cases') }}';
+        const downloadsUrl = () => {
+            const source = downloadsSourceFilter.val();
+            if (source) {
+                return `${downloadsApiBase}?source=${encodeURIComponent(source)}`;
+            }
+            return downloadsApiBase;
+        };
+
+        const downloadsTable = downloadsTableEl.DataTable({
+            ajax: downloadsUrl(),
+            deferRender: true,
+            scrollY: '50vh',
+            scroller: true,
+            order: [[0, 'desc']],
+            columns: [
+                { data: 'judgment_date', title: 'Judgment Date' },
+                { data: 'title', title: 'Title', render: function(data, type, row) {
+                    if (type === 'display') {
+                        const href = row.saved_path ? `{{ url_for('download_file', filename='') }}/${row.saved_path}` : '#';
+                        return `<a href="${href}">${data || '—'}</a>`;
+                    }
+                    return data || '';
+                }},
+                { data: 'subject', title: 'Subject' },
+                { data: 'court', title: 'Court' },
+                { data: 'category', title: 'Category' },
+                { data: 'source', title: 'Source' },
+                { data: 'cause_number', title: 'Cause Number' },
+                { data: 'filename', title: 'Saved File' },
+                { data: 'size_kb', title: 'Size (KB)' },
+                { data: 'actions_token', title: 'Actions Token' }
+            ]
+        });
+
+        downloadsSourceFilter.on('change', function() {
+            downloadsTable.ajax.url(downloadsUrl()).load();
+        });
+    }
 });
 </script>
 {% endblock %}

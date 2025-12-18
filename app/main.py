@@ -726,7 +726,8 @@ def api_db_downloaded_cases() -> Response:
 
     run_id_param = request.args.get("run_id")
     status = request.args.get("status", "downloaded")
-    source = request.args.get("source")
+    raw_source = request.args.get("source")
+    source = sources.coerce_source(raw_source) if raw_source else None
 
     run_id: int | None
     if run_id_param is None or run_id_param == "":

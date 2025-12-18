@@ -19,6 +19,7 @@ class ErrorCode:
     MALFORMED_PDF = "malformed_pdf"
     SITE_STRUCTURE = "site_structure_changed"
     INTERNAL = "internal_error"
+    MISSING_DOWNLOAD_URL = "download_url_missing"
 
 
 __all__ = ["ErrorCode"]

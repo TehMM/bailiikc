@@ -1,13 +1,14 @@
-"""Placeholder to satisfy mandated test invocation.
+from __future__ import annotations
 
-This repository currently has no selectors_public_registers suite; we skip to
-avoid false negatives while keeping the command in CI logs.
-"""
-
-import pytest
+from app.scraper import selectors_public_registers
 
 
-@pytest.mark.skip(reason="selectors_public_registers suite not present in this repo")
-def test_selectors_public_registers_placeholder() -> None:
-    assert True
+def test_public_registers_selectors_defaults() -> None:
+    selectors = selectors_public_registers.PUBLIC_REGISTERS_SELECTORS
 
+    assert selectors.table_selector == "#public-registers"
+    assert selectors.row_selector.endswith("tbody tr")
+    assert "Download" in selectors.download_locator
+    assert "data-reference" in selectors.token_attributes
+    assert "data-register-token" in selectors.row_token_attributes
+    assert "href" in selectors.href_attributes

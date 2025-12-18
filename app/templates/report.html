@@ -177,7 +177,6 @@ $(function() {
     const runsSourceFilter = $('#runs-source-filter');
     const runSummaryContent = $('#run-summary-content');
     const downloadsContextLabel = $('#downloads-context-label');
-    let reloadDownloadsForRun = () => {};
     const summaryUrlTemplate = '{{ url_for('api_db_run_summary', run_id=0) }}';
     const summaryUrlForId = (runId) => summaryUrlTemplate.replace('/0/summary', `/${runId}/summary`);
     if (runsTableEl.length) {
@@ -320,7 +319,12 @@ $(function() {
             const rowData = runsTable.row(this).data();
             if (rowData && rowData.id) {
                 fetchRunSummary(rowData.id);
-                reloadDownloadsForRun(rowData.id, rowData.target_source);
+
+                selectedDownloadsRunId = rowData.id;
+                if (downloadsTable) {
+                    downloadsTable.ajax.url(downloadsUrlForSelection()).load();
+                }
+                updateDownloadsContextLabel();
             }
         });
     }
@@ -328,6 +332,21 @@ $(function() {
     const downloadsTableEl = $('#downloaded-cases');
     const downloadsSourceFilter = $('#downloaded-cases-source-filter');
     let selectedDownloadsRunId = null;
+    let downloadsTable = null;
+
+    const downloadsContextLabelEl = downloadsContextLabel && downloadsContextLabel.length ? downloadsContextLabel : $();
+
+    const updateDownloadsContextLabel = () => {
+        if (!downloadsContextLabelEl.length) return;
+
+        const source = downloadsSourceFilter.val();
+        const sourceText = source ? ` (${source})` : '';
+        if (selectedDownloadsRunId) {
+            downloadsContextLabelEl.text(`Showing downloads for run ${selectedDownloadsRunId}${sourceText}.`);
+        } else {
+            downloadsContextLabelEl.text(`Showing downloads from all runs${sourceText}.`);
+        }
+    };
 
     if (downloadsTableEl.length) {
         const downloadsApiBase = '{{ url_for('api_db_downloaded_cases') }}';
@@ -345,19 +364,7 @@ $(function() {
             return `${downloadsApiBase}?${params.toString()}`;
         };
 
-        const updateDownloadsContextLabel = (runId, sourceLabel) => {
-            if (!downloadsContextLabel.length) {
-                return;
-            }
-            if (!runId) {
-                downloadsContextLabel.text('Showing downloads from all runs.');
-            } else {
-                const sourceText = sourceLabel || downloadsSourceFilter.val() || 'default';
-                downloadsContextLabel.text(`Showing downloads for run #${runId}${sourceText ? ` (${sourceText})` : ''}.`);
-            }
-        };
-
-        const downloadsTable = downloadsTableEl.DataTable({
+        downloadsTable = downloadsTableEl.DataTable({
             ajax: downloadsUrlForSelection(),
             deferRender: true,
             scrollY: '50vh',
@@ -384,17 +391,12 @@ $(function() {
         });
 
         downloadsSourceFilter.on('change', function() {
+            if (!downloadsTable) return;
             downloadsTable.ajax.url(downloadsUrlForSelection()).load();
-            updateDownloadsContextLabel(selectedDownloadsRunId, downloadsSourceFilter.val());
+            updateDownloadsContextLabel();
         });
 
-        reloadDownloadsForRun = (runId, sourceLabel) => {
-            selectedDownloadsRunId = runId;
-            downloadsTable.ajax.url(downloadsUrlForSelection()).load();
-            updateDownloadsContextLabel(runId, sourceLabel || downloadsSourceFilter.val());
-        };
-
-        updateDownloadsContextLabel(null, downloadsSourceFilter.val());
+        updateDownloadsContextLabel();
     }
 });
 </script>

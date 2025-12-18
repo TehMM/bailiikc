@@ -289,3 +289,32 @@ footer {
     margin: 0.5rem 0 0;
     padding-left: 1.25rem;
 }
+
+.run-summary-panel {
+    margin-top: 1rem;
+    padding-top: 1rem;
+    border-top: 1px solid #e0e6f2;
+}
+
+.run-summary-grid {
+    display: grid;
+    grid-template-columns: 150px 1fr;
+    gap: 0.4rem 0.75rem;
+    margin: 0;
+}
+
+.run-summary-grid dt {
+    font-weight: 700;
+    color: #2f3c56;
+}
+
+.run-summary-grid dd {
+    margin: 0;
+    color: #1f2937;
+}
+
+.muted-text {
+    color: #6b7280;
+    font-size: 0.9rem;
+    margin: 0.25rem 0 0.75rem;
+}

@@ -147,3 +147,64 @@ def test_run_scrape_uses_source_runtime(monkeypatch: pytest.MonkeyPatch, tmp_pat
     selectors = attempt_calls.get("selectors")
     assert selectors is not None
     assert getattr(selectors, "table_selector") == "#public-registers"
+
+
+def test_run_scrape_passes_normalized_source_to_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, temp_config: None
+) -> None:
+    db.initialize_schema()
+
+    csv_path = tmp_path / "pr_runtime.csv"
+    csv_path.write_text("header1\n", encoding="utf-8")
+    version_id = db.record_csv_version(
+        fetched_at="2024-04-01T00:00:00Z",
+        source_url="http://example.com/csv",
+        sha256="def456",
+        row_count=1,
+        file_path=str(csv_path),
+    )
+
+    runtime = config.SourceRuntime(
+        source=sources.PUBLIC_REGISTERS,
+        base_url="https://example.com/runtime-pr/",
+        csv_url="https://example.com/runtime-pr.csv",
+        enable_ajax_capture=True,
+        enable_box_downloads=True,
+        builds_fname_index=False,
+    )
+
+    runtime_calls: dict[str, str] = {}
+    sync_calls: dict[str, Any] = {}
+    attempt_calls: dict[str, Any] = {}
+
+    def fake_get_source_runtime(source: str | None) -> config.SourceRuntime:
+        runtime_calls["source"] = source or ""
+        return runtime
+
+    def fake_sync_csv(source_url: str, session: Any, *, source: str) -> CsvSyncResult:  # noqa: ARG001
+        sync_calls["source_url"] = source_url
+        sync_calls["source"] = source
+        return _StubSyncResult(version_id=version_id, source=source, csv_path=str(csv_path))
+
+    monkeypatch.setattr(config, "get_source_runtime", fake_get_source_runtime)
+    monkeypatch.setattr(csv_sync, "sync_csv", fake_sync_csv)
+    monkeypatch.setattr(csv_sync, "build_http_session", lambda: SimpleNamespace())
+
+    def fake_run_with_retries(func, max_retries: int):  # noqa: ANN001, D417
+        return func()
+
+    def fake_run_attempt(**kwargs: Any) -> dict[str, Any]:  # noqa: ANN401
+        attempt_calls.update(kwargs)
+        return {"log_file": "dummy"}
+
+    monkeypatch.setattr(run, "run_with_retries", fake_run_with_retries)
+    monkeypatch.setattr(run, "_run_scrape_attempt", fake_run_attempt)
+
+    result = run.run_scrape(target_source="public-registers")
+    assert result
+
+    assert runtime_calls["source"] == sources.PUBLIC_REGISTERS
+    assert sync_calls["source_url"] == runtime.csv_url
+    assert sync_calls["source"] == sources.PUBLIC_REGISTERS
+    assert attempt_calls.get("base_url") == runtime.base_url.strip()
+    assert attempt_calls.get("csv_source") == str(csv_path)

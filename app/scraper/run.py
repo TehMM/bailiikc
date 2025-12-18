@@ -58,6 +58,7 @@ from .csv_sync import normalize_action_token as normalize_action_token_db
 from .download_state import CaseDownloadState
 from .error_codes import ErrorCode
 from .retry_policy import decide_retry
+from .selectors_public_registers import PublicRegistersSelectors
 from .logging_utils import _scraper_event
 from .state import clear_checkpoint, derive_checkpoint_from_logs, load_checkpoint, save_checkpoint
 from .telemetry import RunTelemetry
@@ -169,7 +170,8 @@ class SourceSelectors:
 def _selectors_for_source(source: str) -> SourceSelectors:
     normalized = sources.normalize_source(source)
     if normalized == sources.PUBLIC_REGISTERS:
-        return SourceSelectors(table_selector="#public-registers")
+        selectors = PublicRegistersSelectors()
+        return SourceSelectors(table_selector=selectors.table_selector)
     return SourceSelectors(table_selector="#judgment-registers")
 
 
@@ -3058,4 +3060,3 @@ if __name__ == "__main__":  # pragma: no cover
     _cli_entrypoint()
 
 __all__ = ["run_scrape", "_cli_entrypoint"]
-

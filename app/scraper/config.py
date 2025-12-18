@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import sources
@@ -54,39 +54,79 @@ DEFAULT_SOURCE: str = sources.normalize_source(_DEFAULT_SOURCE_ENV)
 class SourceRuntime:
     """Runtime configuration for a logical source.
 
-    The values here are resolved from environment variables, falling back to
-    the existing global defaults. This keeps source-specific overrides
-    centralised while preserving current behaviour for unreported_judgments.
+    ``source`` is a canonical logical identifier. URLs default to the baked-in
+    constants and may be overridden via the corresponding environment variables
+    (``base_url_env`` / ``csv_url_env``). Boolean flags act as feature toggles
+    for source-specific behaviour; they are intentionally coarse today and can
+    be refined as ``public_registers`` gains parity with ``unreported_judgments``.
     """
 
+    source: str
     base_url: str
     csv_url: str
+    enable_ajax_capture: bool
+    enable_box_downloads: bool
+    builds_fname_index: bool
+    base_url_env: str | None = None
+    csv_url_env: str | None = None
+
+
+UNREPORTED_JUDGMENTS_RUNTIME = SourceRuntime(
+    source=sources.UNREPORTED_JUDGMENTS,
+    base_url=DEFAULT_BASE_URL,
+    csv_url=CSV_URL,
+    enable_ajax_capture=True,
+    enable_box_downloads=True,
+    builds_fname_index=True,
+    base_url_env="BAILIIKC_UJ_BASE_URL",
+    csv_url_env="BAILIIKC_UJ_CSV_URL",
+)
+
+PUBLIC_REGISTERS_RUNTIME = SourceRuntime(
+    source=sources.PUBLIC_REGISTERS,
+    base_url="https://judicial.ky/public-registers/",
+    csv_url="https://judicial.ky/wp-content/uploads/box_files/public-registers.csv",
+    enable_ajax_capture=True,
+    enable_box_downloads=True,
+    builds_fname_index=False,
+    base_url_env="BAILIIKC_PR_BASE_URL",
+    csv_url_env="BAILIIKC_PR_CSV_URL",
+)
+
+SOURCE_RUNTIMES: dict[str, SourceRuntime] = {
+    sources.UNREPORTED_JUDGMENTS: UNREPORTED_JUDGMENTS_RUNTIME,
+    sources.PUBLIC_REGISTERS: PUBLIC_REGISTERS_RUNTIME,
+}
+
+
+def _runtime_with_env_overrides(runtime: SourceRuntime) -> SourceRuntime:
+    base_url = (
+        os.getenv(runtime.base_url_env, runtime.base_url)
+        if runtime.base_url_env
+        else runtime.base_url
+    )
+    csv_url = (
+        os.getenv(runtime.csv_url_env, runtime.csv_url)
+        if runtime.csv_url_env
+        else runtime.csv_url
+    )
+
+    return replace(runtime, base_url=base_url, csv_url=csv_url)
 
 
 def get_source_runtime(source: str | None) -> SourceRuntime:
     """Return the runtime configuration for the given logical source.
 
     ``source`` is normalised via ``sources.normalize_source``. Unknown or empty
-    values safely fall back to the default logical source.
+    values safely fall back to the default logical source while still returning
+    a runtime object with the canonical ``source`` field.
     """
 
     normalized = sources.normalize_source(source)
+    runtime = SOURCE_RUNTIMES.get(normalized, SOURCE_RUNTIMES[sources.DEFAULT_SOURCE])
+    runtime = _runtime_with_env_overrides(runtime)
+    return replace(runtime, source=normalized)
 
-    if normalized == sources.PUBLIC_REGISTERS:
-        base_url = os.getenv(
-            "BAILIIKC_PR_BASE_URL",
-            "https://judicial.ky/public-registers/",
-        )
-        csv_url = os.getenv(
-            "BAILIIKC_PR_CSV_URL",
-            "https://judicial.ky/wp-content/uploads/box_files/public-registers.csv",
-        )
-        return SourceRuntime(base_url=base_url, csv_url=csv_url)
-
-    # Default / fallback: unreported_judgments
-    base_url = os.getenv("BAILIIKC_UJ_BASE_URL", DEFAULT_BASE_URL)
-    csv_url = os.getenv("BAILIIKC_UJ_CSV_URL", CSV_URL)
-    return SourceRuntime(base_url=base_url, csv_url=csv_url)
 
 def _parse_timeout_seconds(env_var: str, default: int, *, minimum: int = 1) -> int:
     """Parse a timeout value in seconds from the environment with bounds."""

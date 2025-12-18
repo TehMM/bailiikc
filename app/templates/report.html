@@ -62,21 +62,27 @@
             <thead>
                 <tr>
                     <th>Run ID</th>
-                    <th>Source</th>
-                    <th>Trigger</th>
-                    <th>Mode</th>
-                    <th>Status</th>
-                    <th>Started At</th>
-                    <th>Ended At</th>
-                    <th>CSV Version</th>
-                    <th>Downloaded</th>
-                    <th>Failed</th>
-                    <th>Skipped</th>
-                    <th>Health</th>
+	                    <th>Source</th>
+	                    <th>Trigger</th>
+	                    <th>Mode</th>
+	                    <th>Status</th>
+	                    <th>Started At</th>
+	                    <th>Ended At</th>
+	                    <th>CSV Version</th>
+	                    <th>Downloaded</th>
+	                    <th>Failed</th>
+	                    <th>Skipped</th>
+	                    <th>Health</th>
                 </tr>
             </thead>
             <tbody></tbody>
         </table>
+    </div>
+    <div id="run-summary-panel" class="run-summary-panel">
+        <h4>Run Details</h4>
+        <div id="run-summary-content">
+            <p>Select a run to view its details.</p>
+        </div>
     </div>
 </section>
 
@@ -113,6 +119,7 @@
     {% endif %}
     {% endif %}
     <div class="table-scroll">
+        <p id="downloads-context-label" class="muted-text">Showing downloads from all runs.</p>
         <table id="downloaded-cases" class="display compact" style="width:100%">
             <thead>
                 <tr>
@@ -157,6 +164,10 @@ if (window.EventSource) {
 $(function() {
     const runsTableEl = $('#run-history');
     const runsSourceFilter = $('#runs-source-filter');
+    const runSummaryContent = $('#run-summary-content');
+    const downloadsContextLabel = $('#downloads-context-label');
+    const summaryUrlTemplate = '{{ url_for('api_db_run_summary', run_id=0) }}';
+    const summaryUrlForId = (runId) => summaryUrlTemplate.replace('/0/summary', `/${runId}/summary`);
     if (runsTableEl.length) {
         const runsApiBase = '{{ url_for('api_db_runs_list') }}';
         const runsUrl = () => {
@@ -165,6 +176,101 @@ $(function() {
                 return `${runsApiBase}?source=${encodeURIComponent(source)}`;
             }
             return runsApiBase;
+        };
+
+        const formatPercent = (value) => {
+            if (value === undefined || value === null) {
+                return '—';
+            }
+            return `${(value * 100).toFixed(1)}%`;
+        };
+
+        const renderRunSummary = (run, coverage, downloads) => {
+            if (!runSummaryContent.length) {
+                return;
+            }
+            if (!run) {
+                runSummaryContent.html('<p>Select a run to view its details.</p>');
+                return;
+            }
+
+            const coverageData = coverage || {};
+            const planned = coverageData.cases_planned ?? run.cases_planned ?? 0;
+            const attempted = coverageData.cases_attempted ?? run.cases_attempted ?? 0;
+            const downloaded = coverageData.cases_downloaded ?? run.cases_downloaded ?? 0;
+            const failed = coverageData.cases_failed ?? run.cases_failed ?? 0;
+            const skipped = coverageData.cases_skipped ?? run.cases_skipped ?? 0;
+            const coverageRatio = coverageData.coverage_ratio ?? run.coverage_ratio ?? 0;
+            const runHealth = coverageData.run_health ?? run.run_health ?? '—';
+            const statusCounts = downloads?.status_counts || {};
+            const failReasons = downloads?.fail_reasons || {};
+            const skipReasons = downloads?.skip_reasons || {};
+
+            const renderReasonList = (label, reasons) => {
+                const entries = Object.entries(reasons || {});
+                if (!entries.length) {
+                    return '';
+                }
+                return `
+                    <details class="reason-panel" open>
+                        <summary>${label}</summary>
+                        <ul>
+                            ${entries.map(([reason, count]) => `<li><strong>${reason}</strong>: ${count}</li>`).join('')}
+                        </ul>
+                    </details>
+                `;
+            };
+
+            runSummaryContent.html(`
+                <div class="summary-badges">
+                    <span class="badge">Run ID: ${run.id}</span>
+                    <span class="badge">Source: ${run.target_source || 'default'}</span>
+                    <span class="badge">Health: ${runHealth}</span>
+                    <span class="badge">Status: ${run.status || '—'}</span>
+                </div>
+                <dl class="run-summary-grid">
+                    <dt>Status</dt><dd>${run.status || '—'}</dd>
+                    <dt>Trigger</dt><dd>${run.trigger || '—'}</dd>
+                    <dt>Mode</dt><dd>${run.mode || '—'}</dd>
+                    <dt>Started</dt><dd>${run.started_at || '—'}</dd>
+                    <dt>Ended</dt><dd>${run.ended_at || '—'}</dd>
+                    <dt>CSV Version</dt><dd>${run.csv_version_id ?? '—'}</dd>
+                    <dt>Planned</dt><dd>${planned}</dd>
+                    <dt>Attempted</dt><dd>${attempted}</dd>
+                    <dt>Downloaded</dt><dd>${downloaded}</dd>
+                    <dt>Failed</dt><dd>${failed}</dd>
+                    <dt>Skipped</dt><dd>${skipped}</dd>
+                    <dt>Coverage</dt><dd>${downloaded} / ${planned || 0} (${formatPercent(coverageRatio)})</dd>
+                    <dt>Statuses</dt><dd>Downloaded: ${statusCounts.downloaded || 0}, Failed: ${statusCounts.failed || 0}, Skipped: ${statusCounts.skipped || 0}</dd>
+                </dl>
+                ${run.error_summary ? `<p><strong>Error:</strong> ${run.error_summary}</p>` : ''}
+                ${renderReasonList('Failure reasons', failReasons)}
+                ${renderReasonList('Skip reasons', skipReasons)}
+            `);
+        };
+
+        const fetchRunSummary = (runId) => {
+            if (!runSummaryContent.length || !runId) {
+                return;
+            }
+            runSummaryContent.html(`<p>Loading run ${runId}…</p>`);
+            fetch(summaryUrlForId(runId))
+                .then((resp) => {
+                    if (!resp.ok) {
+                        throw new Error(`Request failed with status ${resp.status}`);
+                    }
+                    return resp.json();
+                })
+                .then((payload) => {
+                    if (!payload.ok || !payload.run) {
+                        throw new Error('Run not found');
+                    }
+                    renderRunSummary(payload.run, payload.coverage, payload.downloads);
+                    reloadDownloadsForRun(payload.run.id, payload.run.target_source);
+                })
+                .catch((err) => {
+                    runSummaryContent.html(`<p>Unable to load run ${runId}: ${err.message}</p>`);
+                });
         };
 
         const runsTable = runsTableEl.DataTable({
@@ -194,34 +300,79 @@ $(function() {
 
         runsSourceFilter.on('change', function() {
             runsTable.ajax.url(runsUrl()).load();
+            renderRunSummary(null, null, null);
+            reloadDownloadsForRun(null, null);
+        });
+
+        runsTableEl.on('click', 'tbody tr', function() {
+            const rowData = runsTable.row(this).data();
+            if (rowData && rowData.id) {
+                fetchRunSummary(rowData.id);
+            }
         });
     }
 
-    $('#downloaded-cases').DataTable({
-        ajax: '{{ url_for('api_downloaded_cases') }}',
-        deferRender: true,
-        scrollY: '50vh',
-        scroller: true,
-        order: [[0, 'desc']],
-        columns: [
-            { data: 'judgment_date', title: 'Judgment Date' },
-            { data: 'title', title: 'Title', render: function(data, type, row) {
-                if (type === 'display') {
-                    const href = row.saved_path ? `{{ url_for('download_file', filename='') }}/${row.saved_path}` : '#';
-                    return `<a href="${href}">${data || '—'}</a>`;
-                }
-                return data || '';
-            }},
-            { data: 'subject', title: 'Subject' },
-            { data: 'court', title: 'Court' },
-            { data: 'category', title: 'Category' },
-            { data: 'source', title: 'Source' },
-            { data: 'cause_number', title: 'Cause Number' },
-            { data: 'filename', title: 'Saved File' },
-            { data: 'size_kb', title: 'Size (KB)' },
-            { data: 'actions_token', title: 'Actions Token' }
-        ]
-    });
+    const downloadsTableEl = $('#downloaded-cases');
+    const downloadsApiBase = '{{ url_for('api_db_downloaded_cases') }}';
+    const downloadsUrlForRun = (runId, source) => {
+        const params = new URLSearchParams();
+        if (runId) {
+            params.set('run_id', runId);
+        }
+        if (source) {
+            params.set('source', source);
+        }
+        params.set('status', 'downloaded');
+        return `${downloadsApiBase}?${params.toString()}`;
+    };
+
+    const updateDownloadsContextLabel = (runId, source) => {
+        if (!downloadsContextLabel.length) {
+            return;
+        }
+        if (!runId) {
+            downloadsContextLabel.text('Showing downloads from all runs.');
+        } else {
+            downloadsContextLabel.text(`Showing downloads for run #${runId}${source ? ` (${source})` : ''}.`);
+        }
+    };
+
+    let downloadsTable = null;
+    const reloadDownloadsForRun = (runId, source) => {
+        if (!downloadsTable) {
+            return;
+        }
+        downloadsTable.ajax.url(downloadsUrlForRun(runId, source)).load();
+        updateDownloadsContextLabel(runId, source);
+    };
+
+    if (downloadsTableEl.length) {
+        downloadsTable = downloadsTableEl.DataTable({
+            ajax: downloadsUrlForRun(null, null),
+            deferRender: true,
+            scrollY: '50vh',
+            scroller: true,
+            order: [[0, 'desc']],
+            columns: [
+                { data: 'judgment_date', title: 'Judgment Date' },
+                { data: 'title', title: 'Title', render: function(data, type, row) {
+                    if (type === 'display') {
+                        const href = row.saved_path ? `{{ url_for('download_file', filename='') }}/${row.saved_path}` : '#';
+                        return `<a href="${href}">${data || '—'}</a>`;
+                    }
+                    return data || '';
+                }},
+                { data: 'subject', title: 'Subject' },
+                { data: 'court', title: 'Court' },
+                { data: 'category', title: 'Category' },
+                { data: 'source', title: 'Source' },
+                { data: 'cause_number', title: 'Cause Number' },
+                { data: 'filename', title: 'Saved File' },
+                { data: 'size_kb', title: 'Size (KB)' },
+                { data: 'actions_token', title: 'Actions Token' }
+            ]
+        });
+    }
 });
 </script>
 {% endblock %}

@@ -20,20 +20,34 @@ class RunDownloadSummary:
     skip_reasons: Dict[str, int]
 
 
-def summarise_downloads_for_run(run_id: int) -> RunDownloadSummary:
+def summarise_downloads_for_run(run_id: int, *, source: str | None = None) -> RunDownloadSummary:
     """Compute aggregated download status counts and error-code breakdowns."""
 
     conn = db.get_connection()
 
-    run_row = conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone()
+    run_row = conn.execute(
+        "SELECT params_json FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()
     if run_row is None:
         raise RunNotFoundError(f"Run {run_id} does not exist")
 
-    status_counts: Dict[str, int] = {}
-    status_cursor = conn.execute(
-        "SELECT status, COUNT(*) AS n FROM downloads WHERE run_id = ? GROUP BY status",
-        (run_id,),
+    normalized_source = (
+        sources.coerce_source(source)
+        if source is not None
+        else _infer_run_source(run_row["params_json"] or "")
     )
+
+    status_counts: Dict[str, int] = {}
+    status_params: list[Any] = []
+    status_query = ["SELECT status, COUNT(*) AS n FROM downloads"]
+
+    if normalized_source:
+        status_query.append("JOIN cases c ON c.id = downloads.case_id AND c.source = ?")
+        status_params.append(normalized_source)
+
+    status_query.append("WHERE run_id = ? GROUP BY status")
+    status_params.append(run_id)
+    status_cursor = conn.execute("\n".join(status_query), status_params)
     for row in status_cursor.fetchall():
         status = row["status"] or ""
         status_counts[status] = int(row["n"])
@@ -41,18 +55,26 @@ def summarise_downloads_for_run(run_id: int) -> RunDownloadSummary:
     fail_reasons: Dict[str, int] = {}
     skip_reasons: Dict[str, int] = {}
 
-    error_cursor = conn.execute(
+    error_params: list[Any] = []
+    error_query = [
         """
         SELECT status,
                COALESCE(error_code, '') AS error_code,
                COUNT(*) AS n
         FROM downloads
-        WHERE run_id = ?
-          AND status IN ('failed', 'skipped')
-        GROUP BY status, error_code
-        """,
-        (run_id,),
+        """
+    ]
+
+    if normalized_source:
+        error_query.append("JOIN cases c ON c.id = downloads.case_id AND c.source = ?")
+        error_params.append(normalized_source)
+
+    error_query.append(
+        "WHERE run_id = ?\n          AND status IN ('failed', 'skipped')\n        GROUP BY status, error_code"
     )
+    error_params.append(run_id)
+
+    error_cursor = conn.execute("\n".join(error_query), error_params)
 
     for row in error_cursor.fetchall():
         status = row["status"]
@@ -95,8 +117,8 @@ class CsvVersionNotFoundError(Exception):
 
 
 
-def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
-    """Return a summary dict for the given run_id, or None if not found."""
+def get_run_summary(run_id: int) -> Dict[str, Any]:
+    """Return a summary dict for the given run_id or raise RunNotFoundError."""
 
     conn = db.get_connection()
     cursor = conn.execute(
@@ -125,7 +147,7 @@ def get_run_summary(run_id: int) -> Optional[Dict[str, Any]]:
     )
     row = cursor.fetchone()
     if not row:
-        return None
+        raise RunNotFoundError(f"Run {run_id} does not exist")
 
     return {
         "id": int(row["id"]),
@@ -251,6 +273,7 @@ def _infer_run_source(params_json: str) -> str:
 
 
 def _count_cases_total(csv_version_id: int, source: str) -> int:
+    normalized_source = sources.coerce_source(source)
     conn = db.get_connection()
     cursor = conn.execute(
         """
@@ -261,7 +284,7 @@ def _count_cases_total(csv_version_id: int, source: str) -> int:
           AND first_seen_version_id <= ?
           AND last_seen_version_id >= ?
         """,
-        (source, csv_version_id, csv_version_id),
+        (normalized_source, csv_version_id, csv_version_id),
     )
     row = cursor.fetchone()
     return int(row["count"]) if row else 0
@@ -271,16 +294,19 @@ def _count_planned_cases(
     run_id: int, mode: str, csv_version_id: int, source: str
 ) -> Optional[int]:
     normalized_mode = (mode or "").strip().lower()
+    normalized_source = sources.coerce_source(source)
     if normalized_mode == "new" and config.use_db_worklist_for_new():
-        return len(worklist.build_new_worklist(csv_version_id, source=source))
+        return len(worklist.build_new_worklist(csv_version_id, source=normalized_source))
     if normalized_mode == "full" and config.use_db_worklist_for_full():
-        return len(worklist.build_full_worklist(csv_version_id, source=source))
+        return len(worklist.build_full_worklist(csv_version_id, source=normalized_source))
     if normalized_mode == "resume" and config.use_db_worklist_for_resume():
-        return len(worklist.build_resume_worklist_for_run(run_id, source=source))
+        return len(
+            worklist.build_resume_worklist_for_run(run_id, source=normalized_source)
+        )
     return None
 
 
-def get_run_coverage(run_id: int) -> Dict[str, Any]:
+def get_run_coverage(run_id: int, *, source: str | None = None) -> Dict[str, Any]:
     """Return coverage metrics for a run, including a derived health flag."""
 
     conn = db.get_connection()
@@ -294,7 +320,11 @@ def get_run_coverage(run_id: int) -> Dict[str, Any]:
 
     mode = (run_row["mode"] or "").strip().lower()
     params_json = run_row["params_json"] or ""
-    source = _infer_run_source(params_json)
+    source_for_run = (
+        sources.coerce_source(source)
+        if source
+        else _infer_run_source(params_json)
+    )
     csv_version_value = run_row["csv_version_id"]
     csv_version_id: Optional[int] = (
         int(csv_version_value) if csv_version_value is not None else None
@@ -302,8 +332,8 @@ def get_run_coverage(run_id: int) -> Dict[str, Any]:
     cases_total = 0
     planned: Optional[int] = None
     if csv_version_id is not None:
-        cases_total = _count_cases_total(csv_version_id, source)
-        planned = _count_planned_cases(run_id, mode, csv_version_id, source)
+        cases_total = _count_cases_total(csv_version_id, source_for_run)
+        planned = _count_planned_cases(run_id, mode, csv_version_id, source_for_run)
 
     download_params: List[Any] = []
     download_query: List[str] = [
@@ -315,10 +345,10 @@ def get_run_coverage(run_id: int) -> Dict[str, Any]:
         download_query.append(
             "JOIN cases c ON c.id = d.case_id AND c.source = ? AND c.first_seen_version_id <= ? AND c.last_seen_version_id >= ?"
         )
-        download_params.extend([source, csv_version_id, csv_version_id])
+        download_params.extend([source_for_run, csv_version_id, csv_version_id])
     else:
         download_query.append("JOIN cases c ON c.id = d.case_id AND c.source = ?")
-        download_params.append(source)
+        download_params.append(source_for_run)
 
     download_query.append("WHERE d.run_id = ?")
     download_params.append(run_id)
@@ -355,9 +385,14 @@ def get_run_coverage(run_id: int) -> Dict[str, Any]:
         planned_query.append("WHERE d.run_id = ?")
         planned_query_str = "\n".join(planned_query)
         if csv_version_id is not None:
-            planned_params: List[Any] = [source, csv_version_id, csv_version_id, run_id]
+            planned_params: List[Any] = [
+                source_for_run,
+                csv_version_id,
+                csv_version_id,
+                run_id,
+            ]
         else:
-            planned_params = [source, run_id]
+            planned_params = [source_for_run, run_id]
         planned_cursor = conn.execute(planned_query_str, planned_params)
         planned_row = planned_cursor.fetchone()
         planned = int(planned_row["count"]) if planned_row else 0
@@ -513,9 +548,12 @@ def get_run_download_stats(run_id: int) -> Dict[str, int]:
 
 
 def get_download_rows_for_run(
-    run_id: Optional[int] = None, status_filter: Optional[str] = None
+    run_id: Optional[int] = None,
+    status_filter: Optional[str] = None,
+    *,
+    source: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Return download rows for the given run, optionally filtered by status."""
+    """Return download rows for the given run, optionally filtered by status/source."""
 
     resolved_run_id = run_id or get_latest_run_id()
     if resolved_run_id is None:
@@ -523,6 +561,19 @@ def get_download_rows_for_run(
         return []
 
     conn = db.get_connection()
+    normalized_source = sources.coerce_source(source) if source else None
+
+    if normalized_source is None and run_id:
+        run_row = conn.execute(
+            "SELECT params_json FROM runs WHERE id = ? LIMIT 1", (resolved_run_id,)
+        ).fetchone()
+        if run_row is None:
+            log_line(
+                f"[DB_REPORTING] Requested download rows for missing run_id={resolved_run_id}"
+            )
+            return []
+        normalized_source = _infer_run_source(run_row["params_json"] or "")
+
     query = [
         """
         SELECT
@@ -547,6 +598,10 @@ def get_download_rows_for_run(
         """
     ]
     params: list[Any] = [resolved_run_id]
+
+    if normalized_source:
+        query.append("AND c.source = ?")
+        params.append(normalized_source)
 
     if status_filter:
         query.append("AND d.status = ?")

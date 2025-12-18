@@ -43,6 +43,7 @@ from playwright.sync_api import (
 )
 
 from . import box_client, config, csv_sync, db, db_reporting, sources
+from . import selectors_public_registers
 from .run_creation import create_run_with_source
 from .download_executor import DownloadExecutor
 from .config import is_full_mode, is_new_mode
@@ -165,14 +166,33 @@ class SourceSelectors:
     """Source-specific selectors for Playwright interactions."""
 
     table_selector: str
+    row_selector: str
+    download_locator: str
+    token_attributes: tuple[str, ...]
+    row_token_attributes: tuple[str, ...] = ()
+    href_attributes: tuple[str, ...] = ("href",)
 
 
 def _selectors_for_source(source: str) -> SourceSelectors:
     normalized = sources.normalize_source(source)
     if normalized == sources.PUBLIC_REGISTERS:
-        selectors = PublicRegistersSelectors()
-        return SourceSelectors(table_selector=selectors.table_selector)
-    return SourceSelectors(table_selector="#judgment-registers")
+        pr = selectors_public_registers.PUBLIC_REGISTERS_SELECTORS
+        return SourceSelectors(
+            table_selector=pr.table_selector,
+            row_selector=pr.row_selector,
+            download_locator=pr.download_locator,
+            token_attributes=pr.token_attributes,
+            row_token_attributes=pr.row_token_attributes,
+            href_attributes=pr.href_attributes,
+        )
+    return SourceSelectors(
+        table_selector="#judgment-registers",
+        row_selector="#judgment-registers tbody tr",
+        download_locator="button[data-dl], button:has(i.icon-dl), a:has(i.icon-dl)",
+        token_attributes=("data-dl", "data-fname", "data-filename", "data-target"),
+        row_token_attributes=("data-dl", "data-fname"),
+        href_attributes=("data-dl", "data-url", "href"),
+    )
 
 
 def _now_iso() -> str:
@@ -805,6 +825,105 @@ def _guess_download_locators() -> List[str]:
     ]
 
 
+def _first_locator(parent, selector: str):
+    try:
+        loc = parent.locator(selector)
+        return loc.nth(0) if loc.count() else None
+    except PWError as exc:
+        if _is_target_closed_error(exc):
+            raise
+        log_line(f"[RUN][WARN] Locator error for {selector!r}: {exc}")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log_line(f"[RUN][WARN] Locator error for {selector!r}: {exc}")
+        return None
+
+
+def _extract_attr(locator, names: Iterable[str]) -> Optional[str]:
+    for name in names:
+        try:
+            raw_value = locator.get_attribute(name)
+        except PWError as exc:
+            if _is_target_closed_error(exc):
+                raise
+            raw_value = None
+        except Exception:
+            raw_value = None
+        if raw_value and str(raw_value).strip():
+            return str(raw_value).strip()
+    return None
+
+
+def _locate_download_element(row, selectors: SourceSelectors):
+    if selectors.download_locator:
+        loc = _first_locator(row, selectors.download_locator)
+        if loc is not None:
+            return loc
+
+    for selector in _guess_download_locators():
+        loc = _first_locator(row, selector)
+        if loc is not None:
+            return loc
+    return None
+
+
+def _extract_token_from_locator(locator, selectors: SourceSelectors) -> Optional[str]:
+    token = _extract_attr(locator, selectors.token_attributes)
+    if token:
+        return token
+
+    try:
+        onclick_raw = locator.get_attribute("onclick") or ""
+    except Exception:
+        onclick_raw = ""
+    if onclick_raw:
+        match = _ONCLICK_FNAME_RE.search(onclick_raw)
+        if match:
+            return match.group(1).strip()
+
+    try:
+        text_content = locator.text_content() or ""
+    except Exception:
+        text_content = ""
+    cleaned = (text_content or "").strip()
+    return cleaned or None
+
+
+def _extract_token_from_row(row, selectors: SourceSelectors) -> Optional[str]:
+    token = _extract_attr(row, selectors.row_token_attributes)
+    if token:
+        return token
+    return None
+
+
+def _extract_download_url(locator, selectors: SourceSelectors, row=None) -> Optional[str]:
+    url = _extract_attr(locator, selectors.href_attributes)
+    if url:
+        return url
+    if row is not None:
+        url = _extract_attr(row, selectors.href_attributes)
+        if url:
+            return url
+    return None
+
+
+def _normalize_url(raw: str, *, page_url: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    if lowered.startswith("javascript:") or raw == "#":
+        return ""
+    if raw.startswith("//"):
+        return "https:" + raw
+    if raw.startswith("/"):
+        try:
+            return urllib.parse.urljoin(page_url, raw)
+        except Exception:
+            return raw
+    return raw
+
+
 def _screenshot(page: Page, name: str = "unreported_judgments.png") -> None:
     """Save a screenshot under PDF_DIR for debugging."""
     path = config.PDF_DIR / name
@@ -1316,6 +1435,7 @@ def retry_failed_downloads(
     pending_by_fname: Dict[str, Dict[str, Any]],
     processed_this_run: Set[str],
     checkpoint: Optional[Checkpoint],
+    selectors: SourceSelectors,
     run_id: Optional[int] = None,
     download_executor: Optional[DownloadExecutor] = None,
 ) -> None:
@@ -1423,20 +1543,37 @@ def retry_failed_downloads(
         wait_seconds(page, config.PLAYWRIGHT_RETRY_PAGE_SETTLE_SECONDS)
 
         locator = None
-        for selector in _guess_download_locators():
-            try:
-                candidates = page.locator(selector)
-                if candidates.count() > button_index:
-                    locator = candidates.nth(button_index)
-                    break
-            except PWError as exc:
-                if _is_target_closed_error(exc):
-                    log_line("[RETRY] Target closed while locating button; aborting retries.")
-                    locator = None
-                    break
-                log_line(f"[RETRY] Locator error for selector {selector!r}: {exc}")
-            except Exception as exc:
-                log_line(f"[RETRY] Unexpected locator error for selector {selector!r}: {exc}")
+        try:
+            rows = page.locator(selectors.row_selector)
+            if rows.count() > button_index:
+                row = rows.nth(button_index)
+                locator = _locate_download_element(row, selectors)
+        except PWError as exc:
+            if _is_target_closed_error(exc):
+                log_line("[RETRY] Target closed while locating button; aborting retries.")
+                locator = None
+            else:
+                log_line(f"[RETRY] Locator error for selector {selectors.row_selector!r}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"[RETRY] Unexpected locator error for selector {selectors.row_selector!r}: {exc}")
+
+        if locator is None:
+            for selector in (selectors.download_locator, *_guess_download_locators()):
+                if not selector:
+                    continue
+                try:
+                    candidates = page.locator(selector)
+                    if candidates.count() > button_index:
+                        locator = candidates.nth(button_index)
+                        break
+                except PWError as exc:
+                    if _is_target_closed_error(exc):
+                        log_line("[RETRY] Target closed while locating button; aborting retries.")
+                        locator = None
+                        break
+                    log_line(f"[RETRY] Locator error for selector {selector!r}: {exc}")
+                except Exception as exc:
+                    log_line(f"[RETRY] Unexpected locator error for selector {selector!r}: {exc}")
 
         if locator is None:
             log_line(
@@ -1694,6 +1831,24 @@ def _run_scrape_attempt(
         if not reason:
             return
         target[reason] = int(target.get(reason, 0)) + 1
+
+    def _apply_result_to_summary(summary: Dict[str, Any], result: str, *, error_code: Optional[str] = None) -> Optional[str]:
+        if result == "downloaded":
+            summary["downloaded"] += 1
+            return None
+        if result == "failed":
+            summary["failed"] += 1
+            _bump_reason(summary["fail_reasons"], error_code or ErrorCode.INTERNAL)
+            return None
+        summary["skipped"] += 1
+        skip_reason_map = {
+            "existing_file": "exists_ok",
+            "checkpoint_skip": "seen_history",
+            "duplicate_in_run": "in_run_dup",
+        }
+        reason = skip_reason_map.get(result, result)
+        _bump_reason(summary["skip_reasons"], reason)
+        return reason
 
     download_executor = DownloadExecutor(config.MAX_PARALLEL_DOWNLOADS)
     # NOTE: submit() currently blocks; this is a bounded wrapper and telemetry hook
@@ -2226,28 +2381,29 @@ def _run_scrape_attempt(
                                         checkpoint.mark_page(page_index_zero, reset_row=False, mode=scrape_mode)
                                     _persist_state(page_index_zero, -1)
     
-                                    try:
-                                        buttons = page.locator("button:has(i.icon-dl)")
-                                        count = buttons.count()
-                                        _scraper_event(
-                                            "table",
-                                            page_index=page_index_zero,
-                                            page_number=page_number,
-                                            rows_found=count,
+                                try:
+                                    row_locator = page.locator(selectors.row_selector)
+                                    count = row_locator.count()
+                                    _scraper_event(
+                                        "table",
+                                        page_index=page_index_zero,
+                                        page_number=page_number,
+                                        rows_found=count,
+                                        source=target_source,
+                                    )
+                                except PWError as exc:
+                                    if _is_target_closed_error(exc):
+                                        log_line(
+                                            "[RUN] Browser target crashed while enumerating rows; stopping scrape gracefully."
                                         )
-                                    except PWError as exc:
-                                        if _is_target_closed_error(exc):
-                                            log_line(
-                                                "[RUN] Browser target crashed while enumerating download buttons; stopping scrape gracefully."
-                                            )
-                                            crash_stop = True
-                                            active = False
-                                            break
-                                        log_line(f"Failed to enumerate download buttons: {exc}")
+                                        crash_stop = True
+                                        active = False
                                         break
-                                    except Exception as exc:
-                                        log_line(f"Failed to enumerate download buttons: {exc}")
-                                        break
+                                    log_line(f"Failed to enumerate rows: {exc}")
+                                    break
+                                except Exception as exc:
+                                    log_line(f"Failed to enumerate rows: {exc}")
+                                    break
     
                                 if crash_stop:
                                     break
@@ -2280,7 +2436,7 @@ def _run_scrape_attempt(
                                 for i in range(start_row, count):
                                     if crash_stop:
                                         break
-    
+
                                     if (
                                         scrape_mode == "new"
                                         and row_limit is not None
@@ -2304,68 +2460,36 @@ def _run_scrape_attempt(
                                     summary["inspected_rows"] = rows_evaluated
     
                                     try:
-                                        el = page.locator("button:has(i.icon-dl)").nth(i)
+                                        row = row_locator.nth(i)
                                     except PWError as exc:
                                         if _is_target_closed_error(exc):
                                             log_line(
-                                                "[RUN] Browser target crashed while accessing a download button; stopping scrape gracefully."
+                                                "[RUN] Browser target crashed while accessing a row; stopping scrape gracefully."
                                             )
                                             crash_stop = True
                                             active = False
                                             break
-                                        log_line(f"Failed to access button index {i}: {exc}")
+                                        log_line(f"Failed to access row index {i}: {exc}")
                                         continue
                                     except Exception as exc:
-                                        log_line(f"Failed to access button index {i}: {exc}")
+                                        log_line(f"Failed to access row index {i}: {exc}")
                                         continue
-    
+
+                                    el = _locate_download_element(row, selectors)
+                                    if el is None:
+                                        log_line(
+                                            f"[RUN][WARN] No download element found in row {i} on page {page_number}; skipping."
+                                        )
+                                        if checkpoint is not None:
+                                            checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
+                                        summary["skipped"] += 1
+                                        _bump_reason(summary["skip_reasons"], "missing_download")
+                                        continue
+
                                     fname_token: Optional[str] = None
-                                    for attr_name in (
-                                        "data-dl",
-                                        "data-fname",
-                                        "data-filename",
-                                        "data-target",
-                                    ):
-                                        try:
-                                            raw_value = el.get_attribute(attr_name)
-                                        except PWError as exc_attr:
-                                            if _is_target_closed_error(exc_attr):
-                                                log_line(
-                                                    "[RUN] Browser target crashed while reading button attributes; stopping scrape gracefully."
-                                                )
-                                                crash_stop = True
-                                                active = False
-                                                break
-                                            raw_value = None
-                                        except Exception:
-                                            raw_value = None
-                                        if raw_value and raw_value.strip():
-                                            fname_token = raw_value.strip()
-                                            break
-                                    if crash_stop:
-                                        break
-    
+                                    fname_token = _extract_token_from_locator(el, selectors)
                                     if not fname_token:
-                                        try:
-                                            onclick_raw = el.get_attribute("onclick") or ""
-                                        except PWError as exc_attr:
-                                            if _is_target_closed_error(exc_attr):
-                                                log_line(
-                                                    "[RUN] Browser target crashed while reading onclick attribute; stopping scrape gracefully."
-                                                )
-                                                crash_stop = True
-                                                active = False
-                                                onclick_raw = ""
-                                            else:
-                                                onclick_raw = ""
-                                        except Exception:
-                                            onclick_raw = ""
-                                        if crash_stop:
-                                            break
-                                        if onclick_raw:
-                                            match = _ONCLICK_FNAME_RE.search(onclick_raw)
-                                            if match:
-                                                fname_token = match.group(1).strip()
+                                        fname_token = _extract_token_from_row(row, selectors)
     
                                     if crash_stop:
                                         break
@@ -2565,8 +2689,202 @@ def _run_scrape_attempt(
                                                 row_limit_reached = True
                                                 break
                                         continue
-    
+
                                     slug_value = case_for_fname.action if case_for_fname else fname_key
+                                    raw_url = _extract_download_url(el, selectors, row=row)
+                                    box_url = _normalize_url(raw_url, page_url=page.url) if raw_url else None
+
+                                    if target_source == sources.PUBLIC_REGISTERS:
+                                        case_context = {
+                                            "case": case_for_fname,
+                                            "metadata_entry": metadata_entry,
+                                            "slug": slug_value,
+                                            "raw": fname_token,
+                                            "page_index": page_index_zero,
+                                            "row_index": i,
+                                            "canonical": canonical_token,
+                                        }
+
+                                        state: Optional[CaseDownloadState] = None
+                                        if run_id is not None and isinstance(case_id_for_logging, int):
+                                            try:
+                                                state = CaseDownloadState.start(
+                                                    run_id=run_id,
+                                                    case_id=case_id_for_logging,
+                                                    box_url=box_url,
+                                                )
+                                            except Exception as exc:  # noqa: BLE001
+                                                log_line(
+                                                    f"[DB][WARN] Unable to start download attempt for case_id={case_id_for_logging}: {exc}"
+                                                )
+
+                                        if dedupe_key:
+                                            clicked_on_page.add(dedupe_key)
+
+                                        total_clicks += 1
+                                        summary["processed"] = total_clicks
+
+                                        if not box_url:
+                                            log_line(
+                                                f"[RUN][WARN] No download URL found for fname={fname_token}; marking as failed."
+                                            )
+                                            summary["failed"] += 1
+                                            _bump_reason(summary["fail_reasons"], ErrorCode.SITE_STRUCTURE)
+                                            if state is not None:
+                                                try:
+                                                    state.mark_failed(
+                                                        error_code=ErrorCode.SITE_STRUCTURE,
+                                                        error_message="download_link_missing",
+                                                    )
+                                                except Exception as exc:  # noqa: BLE001
+                                                    log_line(
+                                                        f"[DB][WARN] Unable to record missing download URL for case_id={case_id_for_logging}: {exc}"
+                                                    )
+                                            _persist_state(
+                                                page_index_zero,
+                                                i,
+                                                last_fname=fname_token or fname_key,
+                                                last_title=getattr(case_for_fname, "title", None),
+                                            )
+                                            if checkpoint is not None:
+                                                checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
+                                            continue
+
+                                        _scraper_event(
+                                            "decision",
+                                            token=fname_key,
+                                            raw_token=fname_token,
+                                            decision="direct_download",
+                                            case_id=case_id_for_logging,
+                                            run_id=run_id,
+                                            source=target_source,
+                                        )
+
+                                        result, download_info = handle_dl_bfile_from_ajax(
+                                            mode=scrape_mode,
+                                            fname=fname_token or fname_key,
+                                            box_url=box_url,
+                                            downloads_dir=config.PDF_DIR,
+                                            cases_by_action=CASES_BY_ACTION,
+                                            processed_this_run=processed_this_run,
+                                            checkpoint=checkpoint if is_new_mode(scrape_mode) else None,
+                                            metadata=meta,
+                                            http_client=None,
+                                            case_context=case_context,
+                                            fid=None,
+                                            run_id=run_id,
+                                            download_executor=download_executor,
+                                            source=target_source,
+                                        )
+
+                                        error_message = download_info.get("error_message") if isinstance(download_info, dict) else None
+                                        error_code = download_info.get("error_code") if isinstance(download_info, dict) else None
+                                        file_path = download_info.get("file_path") if isinstance(download_info, dict) else None
+                                        file_size_bytes = download_info.get("file_size_bytes") if isinstance(download_info, dict) else None
+                                        box_url_last = download_info.get("box_url") if isinstance(download_info, dict) else box_url
+
+                                        if state is not None:
+                                            try:
+                                                if result == "downloaded":
+                                                    state.mark_downloaded(
+                                                        file_path=file_path,
+                                                        file_size_bytes=file_size_bytes,
+                                                        box_url=box_url_last,
+                                                    )
+                                                elif result in {"existing_file", "checkpoint_skip", "duplicate_in_run"}:
+                                                    state.mark_skipped(reason=result)
+                                                elif result == "disk_full":
+                                                    state.mark_failed(
+                                                        error_code="disk_full",
+                                                        error_message=error_message,
+                                                    )
+                                                elif result == "failed":
+                                                    state.mark_failed(
+                                                        error_code=error_code or ErrorCode.INTERNAL,
+                                                        error_message=error_message,
+                                                    )
+                                            except Exception as exc:  # noqa: BLE001
+                                                log_line(
+                                                    f"[DB][WARN] Unable to update download status for case_id={case_id_for_logging}: {exc}"
+                                                )
+
+                                        skip_reason = _apply_result_to_summary(
+                                            summary, result, error_code=error_code or ErrorCode.INTERNAL
+                                        )
+                                        if result == "downloaded":
+                                            consecutive_existing = 0
+                                        elif result in {"existing_file", "checkpoint_skip"}:
+                                            consecutive_existing += 1
+                                        elif result == "disk_full":
+                                            summary.setdefault("stop_reason", "disk_full")
+                                            active = False
+                                            crash_stop = True
+
+                                        last_title = getattr(case_for_fname, "title", None)
+                                        if last_title is None and isinstance(case_for_fname, dict):
+                                            last_title = case_for_fname.get("title")
+
+                                        meta_payload = {
+                                            "fname": fname_token or fname_key,
+                                            "title": last_title or (metadata_entry or {}).get("title") or "",
+                                            "subject": getattr(case_for_fname, "subject", None)
+                                            or (metadata_entry or {}).get("subject")
+                                            or "",
+                                            "court": getattr(case_for_fname, "court", None)
+                                            or (metadata_entry or {}).get("court")
+                                            or "",
+                                            "category": getattr(case_for_fname, "category", None)
+                                            or (metadata_entry or {}).get("category")
+                                            or "",
+                                            "cause_no": getattr(case_for_fname, "cause_number", None)
+                                            or (metadata_entry or {}).get("cause_number")
+                                            or "",
+                                            "judgment_date": getattr(case_for_fname, "judgment_date", None)
+                                            or (metadata_entry or {}).get("judgment_date")
+                                            or "",
+                                            "page": page_index_zero,
+                                            "idx": i,
+                                            "file_path": (metadata_entry or {}).get("local_path")
+                                            or (metadata_entry or {}).get("saved_path")
+                                            or "",
+                                            "size": (metadata_entry or {}).get("bytes") or 0,
+                                        }
+
+                                        if result == "downloaded":
+                                            telemetry.add("downloaded", "ok", meta_payload)
+                                        elif result == "failed":
+                                            telemetry.add("failed", "download_other", meta_payload)
+                                        elif result in {"existing_file", "checkpoint_skip"}:
+                                            telemetry.add("skipped", "exists", meta_payload)
+                                        elif result == "duplicate_in_run":
+                                            telemetry.add("skipped", "in_run_dup", meta_payload)
+
+                                        _persist_state(page_index_zero, i + 1, last_fname=fname_token or fname_key, last_title=last_title)
+
+                                        if (
+                                            is_new_mode(scrape_mode)
+                                            and consecutive_existing >= config.SCRAPE_NEW_CONSECUTIVE_LIMIT
+                                        ):
+                                            log_line(
+                                                "[RUN] Consecutive already-downloaded threshold reached; halting NEW mode run."
+                                            )
+                                            _scraper_event(
+                                                "table",
+                                                reason="consecutive_existing_limit",
+                                                mode="new",
+                                                consecutive_existing=consecutive_existing,
+                                                limit=config.SCRAPE_NEW_CONSECUTIVE_LIMIT,
+                                            )
+                                            row_limit_reached = True
+                                            break
+
+                                        if checkpoint is not None:
+                                            checkpoint.mark_position(page_index_zero, i, mode=scrape_mode)
+
+                                        if crash_stop or not active:
+                                            break
+
+                                        continue
     
                                     pending_by_fname[fname_key] = {
                                         "case": case_for_fname,
@@ -2704,6 +3022,7 @@ def _run_scrape_attempt(
                                 pending_by_fname=pending_by_fname,
                                 processed_this_run=processed_this_run,
                                 checkpoint=checkpoint if is_new_mode(scrape_mode) else None,
+                                selectors=selectors,
                                 run_id=run_id,
                                 download_executor=download_executor,
                             )

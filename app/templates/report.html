@@ -118,6 +118,17 @@
     </details>
     {% endif %}
     {% endif %}
+    <div class="table-actions">
+        <label for="downloaded-cases-source-filter">
+            Source
+            <select id="downloaded-cases-source-filter">
+                <option value="">All</option>
+                {% for source in available_sources %}
+                <option value="{{ source }}">{{ source }}</option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
     <div class="table-scroll">
         <p id="downloads-context-label" class="muted-text">Showing downloads from all runs.</p>
         <table id="downloaded-cases" class="display compact" style="width:100%">
@@ -166,6 +177,7 @@ $(function() {
     const runsSourceFilter = $('#runs-source-filter');
     const runSummaryContent = $('#run-summary-content');
     const downloadsContextLabel = $('#downloads-context-label');
+    let reloadDownloadsForRun = () => {};
     const summaryUrlTemplate = '{{ url_for('api_db_run_summary', run_id=0) }}';
     const summaryUrlForId = (runId) => summaryUrlTemplate.replace('/0/summary', `/${runId}/summary`);
     if (runsTableEl.length) {
@@ -308,47 +320,45 @@ $(function() {
             const rowData = runsTable.row(this).data();
             if (rowData && rowData.id) {
                 fetchRunSummary(rowData.id);
+                reloadDownloadsForRun(rowData.id, rowData.target_source);
             }
         });
     }
 
     const downloadsTableEl = $('#downloaded-cases');
-    const downloadsApiBase = '{{ url_for('api_db_downloaded_cases') }}';
-    const downloadsUrlForRun = (runId, source) => {
-        const params = new URLSearchParams();
-        if (runId) {
-            params.set('run_id', runId);
-        }
-        if (source) {
-            params.set('source', source);
-        }
-        params.set('status', 'downloaded');
-        return `${downloadsApiBase}?${params.toString()}`;
-    };
-
-    const updateDownloadsContextLabel = (runId, source) => {
-        if (!downloadsContextLabel.length) {
-            return;
-        }
-        if (!runId) {
-            downloadsContextLabel.text('Showing downloads from all runs.');
-        } else {
-            downloadsContextLabel.text(`Showing downloads for run #${runId}${source ? ` (${source})` : ''}.`);
-        }
-    };
-
-    let downloadsTable = null;
-    const reloadDownloadsForRun = (runId, source) => {
-        if (!downloadsTable) {
-            return;
-        }
-        downloadsTable.ajax.url(downloadsUrlForRun(runId, source)).load();
-        updateDownloadsContextLabel(runId, source);
-    };
+    const downloadsSourceFilter = $('#downloaded-cases-source-filter');
+    let selectedDownloadsRunId = null;
 
     if (downloadsTableEl.length) {
-        downloadsTable = downloadsTableEl.DataTable({
-            ajax: downloadsUrlForRun(null, null),
+        const downloadsApiBase = '{{ url_for('api_db_downloaded_cases') }}';
+
+        const downloadsUrlForSelection = () => {
+            const params = new URLSearchParams();
+            if (selectedDownloadsRunId) {
+                params.set('run_id', selectedDownloadsRunId);
+            }
+            const source = downloadsSourceFilter.val();
+            if (source) {
+                params.set('source', source);
+            }
+            params.set('status', 'downloaded');
+            return `${downloadsApiBase}?${params.toString()}`;
+        };
+
+        const updateDownloadsContextLabel = (runId, sourceLabel) => {
+            if (!downloadsContextLabel.length) {
+                return;
+            }
+            if (!runId) {
+                downloadsContextLabel.text('Showing downloads from all runs.');
+            } else {
+                const sourceText = sourceLabel || downloadsSourceFilter.val() || 'default';
+                downloadsContextLabel.text(`Showing downloads for run #${runId}${sourceText ? ` (${sourceText})` : ''}.`);
+            }
+        };
+
+        const downloadsTable = downloadsTableEl.DataTable({
+            ajax: downloadsUrlForSelection(),
             deferRender: true,
             scrollY: '50vh',
             scroller: true,
@@ -372,6 +382,19 @@ $(function() {
                 { data: 'actions_token', title: 'Actions Token' }
             ]
         });
+
+        downloadsSourceFilter.on('change', function() {
+            downloadsTable.ajax.url(downloadsUrlForSelection()).load();
+            updateDownloadsContextLabel(selectedDownloadsRunId, downloadsSourceFilter.val());
+        });
+
+        reloadDownloadsForRun = (runId, sourceLabel) => {
+            selectedDownloadsRunId = runId;
+            downloadsTable.ajax.url(downloadsUrlForSelection()).load();
+            updateDownloadsContextLabel(runId, sourceLabel || downloadsSourceFilter.val());
+        };
+
+        updateDownloadsContextLabel(null, downloadsSourceFilter.val());
     }
 });
 </script>

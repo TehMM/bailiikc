@@ -551,7 +551,7 @@ def get_download_rows_for_run(
     run_id: Optional[int] = None,
     status_filter: Optional[str] = None,
     *,
-    source: Optional[str] = None,
+    source: str | None = None,
 ) -> List[Dict[str, Any]]:
     """Return download rows for the given run, optionally filtered by status/source."""
 

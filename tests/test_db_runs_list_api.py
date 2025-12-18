@@ -22,6 +22,57 @@ def _record_version(fetched_at: str, source_url: str, sha256: str) -> int:
     )
 
 
+def _insert_case(
+    conn,
+    csv_version_id: int,
+    *,
+    source: str,
+    token_suffix: str,
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO cases (
+            action_token_raw, action_token_norm, title, cause_number, court, category,
+            judgment_date, is_criminal, is_active, source, first_seen_version_id,
+            last_seen_version_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?)
+        """,
+        (
+            f"RAW-{token_suffix}",
+            f"NORM-{token_suffix}",
+            f"Title {token_suffix}",
+            f"Cause {token_suffix}",
+            "Court",
+            "Category",
+            "2024-01-01",
+            source,
+            csv_version_id,
+            csv_version_id,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def _insert_download(
+    conn,
+    *,
+    run_id: int,
+    case_id: int,
+    status: str,
+    ts: str = "2024-01-02T00:00:00Z",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO downloads (
+            run_id, case_id, status, attempt_count, last_attempt_at, file_path,
+            file_size_bytes, box_url_last, error_code, error_message, created_at,
+            updated_at
+        ) VALUES (?, ?, ?, 1, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
+        """,
+        (run_id, case_id, status, ts, ts, ts),
+    )
+
+
 def test_list_recent_runs_orders_by_started_at_desc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_temp_paths(tmp_path, monkeypatch)
     db.initialize_schema()
@@ -160,3 +211,76 @@ def test_api_db_runs_list_filters_by_source(
     assert payload["ok"] is True
     assert payload["count"] == 1
     assert payload["runs"][0]["target_source"] == sources.PUBLIC_REGISTERS
+
+
+def test_api_db_run_summary_returns_coverage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_temp_paths(tmp_path, monkeypatch)
+    monkeypatch.setenv("BAILIIKC_USE_DB_REPORTING", "1")
+    db.initialize_schema()
+
+    conn = db.get_connection()
+    with conn:
+        version_id = _record_version("2024-01-01T00:00:00Z", "http://example.com/csv", "sha1")
+        run_id = db.create_run(
+            trigger="ui",
+            mode="new",
+            csv_version_id=version_id,
+            params_json=json.dumps({"target_source": sources.PUBLIC_REGISTERS}),
+        )
+
+        pr_one = _insert_case(
+            conn, version_id, source=sources.PUBLIC_REGISTERS, token_suffix="PR-ONE"
+        )
+        pr_two = _insert_case(
+            conn, version_id, source=sources.PUBLIC_REGISTERS, token_suffix="PR-TWO"
+        )
+        uj_case = _insert_case(
+            conn, version_id, source=sources.UNREPORTED_JUDGMENTS, token_suffix="UJ-ONE"
+        )
+
+        _insert_download(conn, run_id=run_id, case_id=pr_one, status="downloaded")
+        _insert_download(conn, run_id=run_id, case_id=pr_two, status="failed")
+        _insert_download(conn, run_id=run_id, case_id=uj_case, status="downloaded")
+
+    main = _reload_main_module()
+    client = main.app.test_client()
+
+    resp = client.get(f"/api/db/runs/{run_id}/summary")
+    assert resp.status_code == 200
+
+    payload = resp.get_json()
+    assert payload["ok"] is True
+    run_payload = payload["run"]
+    coverage = payload["coverage"]
+
+    assert run_payload["id"] == run_id
+    assert run_payload["target_source"] == sources.PUBLIC_REGISTERS
+    assert coverage["cases_total"] == 2
+    assert coverage["cases_planned"] == 2
+    assert coverage["cases_attempted"] == 2
+    assert coverage["cases_downloaded"] == 1
+    assert coverage["cases_failed"] == 1
+    assert coverage["cases_skipped"] == 0
+    assert coverage["coverage_ratio"] == pytest.approx(0.5)
+    assert coverage["run_health"] == "partial"
+
+    downloads = payload["downloads"]
+    assert downloads["status_counts"]["downloaded"] == 1
+    assert downloads["status_counts"]["failed"] == 1
+    assert downloads["status_counts"].get("skipped", 0) == 0
+    assert downloads["fail_reasons"]["unknown"] == 1
+    assert downloads["skip_reasons"] == {}
+
+
+def test_api_db_run_summary_not_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_temp_paths(tmp_path, monkeypatch)
+    db.initialize_schema()
+
+    main = _reload_main_module()
+    client = main.app.test_client()
+
+    resp = client.get("/api/db/runs/999/summary")
+    assert resp.status_code == 404
+    payload = resp.get_json()
+    assert payload["ok"] is False
+    assert payload["error"] == "run_not_found"

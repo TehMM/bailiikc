@@ -315,57 +315,20 @@ $(function() {
             reloadDownloadsForRun(null, null);
         });
 
-        runsTableEl.on('click', 'tbody tr', function() {
-            const rowData = runsTable.row(this).data();
-            if (rowData && rowData.id) {
-                fetchRunSummary(rowData.id);
-
-                selectedDownloadsRunId = rowData.id;
-                if (downloadsTable) {
-                    downloadsTable.ajax.url(downloadsUrlForSelection()).load();
-                }
-                updateDownloadsContextLabel();
-            }
-        });
-    }
-
     const downloadsTableEl = $('#downloaded-cases');
     const downloadsSourceFilter = $('#downloaded-cases-source-filter');
-    let selectedDownloadsRunId = null;
-    let downloadsTable = null;
-
-    const downloadsContextLabelEl = downloadsContextLabel && downloadsContextLabel.length ? downloadsContextLabel : $();
-
-    const updateDownloadsContextLabel = () => {
-        if (!downloadsContextLabelEl.length) return;
-
-        const source = downloadsSourceFilter.val();
-        const sourceText = source ? ` (${source})` : '';
-        if (selectedDownloadsRunId) {
-            downloadsContextLabelEl.text(`Showing downloads for run ${selectedDownloadsRunId}${sourceText}.`);
-        } else {
-            downloadsContextLabelEl.text(`Showing downloads from all runs${sourceText}.`);
-        }
-    };
-
     if (downloadsTableEl.length) {
-        const downloadsApiBase = '{{ url_for('api_db_downloaded_cases') }}';
-
-        const downloadsUrlForSelection = () => {
-            const params = new URLSearchParams();
-            if (selectedDownloadsRunId) {
-                params.set('run_id', selectedDownloadsRunId);
-            }
+        const downloadsApiBase = '{{ url_for('api_downloaded_cases') }}';
+        const downloadsUrl = () => {
             const source = downloadsSourceFilter.val();
             if (source) {
-                params.set('source', source);
+                return `${downloadsApiBase}?source=${encodeURIComponent(source)}`;
             }
-            params.set('status', 'downloaded');
-            return `${downloadsApiBase}?${params.toString()}`;
+            return downloadsApiBase;
         };
 
-        downloadsTable = downloadsTableEl.DataTable({
-            ajax: downloadsUrlForSelection(),
+        const downloadsTable = downloadsTableEl.DataTable({
+            ajax: downloadsUrl(),
             deferRender: true,
             scrollY: '50vh',
             scroller: true,
@@ -391,12 +354,8 @@ $(function() {
         });
 
         downloadsSourceFilter.on('change', function() {
-            if (!downloadsTable) return;
-            downloadsTable.ajax.url(downloadsUrlForSelection()).load();
-            updateDownloadsContextLabel();
+            downloadsTable.ajax.url(downloadsUrl()).load();
         });
-
-        updateDownloadsContextLabel();
     }
 });
 </script>

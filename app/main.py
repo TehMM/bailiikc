@@ -136,17 +136,22 @@ def _load_download_records() -> list[dict[str, object]]:
     return load_download_records()
 
 
-def _get_download_rows_for_ui() -> list[dict[str, object]]:
+def _get_download_rows_for_ui(source: str | None = None) -> list[dict[str, object]]:
     """Return download rows for the UI (report + JSON API)."""
+
+    normalized_source = sources.coerce_source(source) if source else None
 
     if use_db_reporting():
         rows_from_db = db_reporting.get_download_rows_for_run(
-            status_filter="downloaded"
+            status_filter="downloaded", source=normalized_source
         )
         return [dict(row) for row in rows_from_db]
 
     records = _load_download_records()
-    return build_download_rows(records)
+    rows = build_download_rows(records)
+    if normalized_source:
+        return [row for row in rows if row.get("source") == normalized_source]
+    return rows
 
 
 def _get_webhook_token() -> str | None:
@@ -571,7 +576,10 @@ def webhook_changedetection() -> Response:
 def api_downloaded_cases() -> Response:
     """Return the downloaded cases in a JSON payload suitable for DataTables."""
 
-    rows = _get_download_rows_for_ui()
+    raw_source = request.args.get("source")
+    source = sources.coerce_source(raw_source) if raw_source else None
+
+    rows = _get_download_rows_for_ui(source=source)
     return jsonify({"data": rows})
 
 

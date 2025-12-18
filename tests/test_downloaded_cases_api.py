@@ -61,9 +61,9 @@ def _insert_download(
     )
 
 
-def test_api_downloaded_cases_includes_source(
+def _setup_downloaded_cases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+):
     _configure_temp_paths(tmp_path, monkeypatch)
     # Ensure we exercise the DB-backed reporting path rather than JSONL.
     monkeypatch.setenv("BAILIIKC_USE_DB_REPORTING", "1")
@@ -91,6 +91,18 @@ def test_api_downloaded_cases_includes_source(
     main = _reload_main_module()
     client = main.app.test_client()
 
+    return client, {
+        "unreported": "NORM-UJ",
+        "public": "NORM-PR",
+        "unknown": "NORM-UNK",
+    }
+
+
+def test_api_downloaded_cases_includes_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _tokens = _setup_downloaded_cases(tmp_path, monkeypatch)
+
     resp = client.get("/api/downloaded-cases")
     assert resp.status_code == 200
 
@@ -104,3 +116,35 @@ def test_api_downloaded_cases_includes_source(
     assert sources_by_token["NORM-PR"] == sources.PUBLIC_REGISTERS
     assert sources_by_token["NORM-UNK"] == sources.DEFAULT_SOURCE
     assert all("source" in row for row in payload["data"])
+
+
+def test_api_downloaded_cases_filters_by_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, tokens = _setup_downloaded_cases(tmp_path, monkeypatch)
+
+    resp = client.get("/api/downloaded-cases?source=unreported_judgments")
+    assert resp.status_code == 200
+    data = resp.get_json()["data"]
+    assert {row["actions_token"] for row in data} == {
+        tokens["unreported"],
+        tokens["unknown"],
+    }
+    assert all(row["source"] == sources.UNREPORTED_JUDGMENTS for row in data)
+
+    resp_public = client.get("/api/downloaded-cases?source=public_registers")
+    assert resp_public.status_code == 200
+    public_data = resp_public.get_json()["data"]
+    assert {row["actions_token"] for row in public_data} == {
+        tokens["public"]
+    }
+    assert all(row["source"] == sources.PUBLIC_REGISTERS for row in public_data)
+
+    resp_unknown = client.get("/api/downloaded-cases?source=made-up-source")
+    assert resp_unknown.status_code == 200
+    unknown_data = resp_unknown.get_json()["data"]
+    assert {row["actions_token"] for row in unknown_data} == {
+        tokens["unreported"],
+        tokens["unknown"],
+    }
+    assert all(row["source"] == sources.UNREPORTED_JUDGMENTS for row in unknown_data)

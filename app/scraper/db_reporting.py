@@ -560,6 +560,8 @@ def get_download_rows_for_run(
         log_line("[DB_REPORTING] No runs found when building download rows")
         return []
 
+    normalized_source = sources.coerce_source(source) if source else None
+
     conn = db.get_connection()
     normalized_source = sources.coerce_source(source) if source else None
 
@@ -627,6 +629,10 @@ def get_download_rows_for_run(
         else:
             size_kb = 0
 
+        row_source = sources.coerce_source(row["source"])
+        if normalized_source and row_source != normalized_source:
+            continue
+
         rows.append(
             {
                 "actions_token": actions_token,
@@ -641,7 +647,7 @@ def get_download_rows_for_run(
                 "saved_path": saved_path,
                 "filename": filename,
                 "size_kb": size_kb,
-                "source": sources.coerce_source(row["source"]),
+                "source": row_source,
             }
         )
 

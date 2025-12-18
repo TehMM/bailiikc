@@ -8,6 +8,11 @@ from tests.test_download_state import _configure_temp_paths
 
 def _prepare_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _configure_temp_paths(tmp_path, monkeypatch)
+    data_dir = config.DATA_DIR
+    monkeypatch.setattr(config, "METADATA_FILE", data_dir / "metadata.json")
+    monkeypatch.setattr(config, "CONFIG_FILE", data_dir / "config.txt")
+    monkeypatch.setattr(config, "CHECKPOINT_PATH", data_dir / "state.json")
+    monkeypatch.setattr(config, "RUN_STATE_FILE", data_dir / "run_state.json")
     monkeypatch.setattr(run, "validate_runtime_config", lambda *_, **__: None)
 
 
@@ -43,4 +48,3 @@ def test_cli_accepts_public_registers_source(
     )
 
     assert captured["target_source"] == sources.PUBLIC_REGISTERS
-
